@@ -10,7 +10,7 @@ built — see the scaling conversation). Once it exists, this becomes a
 scheduled periodic task instead of a manually-triggered command.
 
 Suggested cron entry (daily at 3am):
-    0 3 * * * cd /path/to/backend && /path/to/venv/bin/python manage.py cleanup_old_documents
+    0 3 * * * cd /path/to/backend && /path/to/venv/bin/python manage.py cleanup_old_documents...
 """
 from datetime import timedelta
 from django.core.management.base import BaseCommand
