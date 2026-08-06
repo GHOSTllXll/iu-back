@@ -21,6 +21,7 @@ from .excel_generator import generate_underwriting_excel, ExcelGenerationError
 from .rent_roll_utils import detect_rent_roll_columns, compute_ground_truth, RentRollColumnError
 from .reconciliation import run_reconciliation
 from .document_history import record_processed_documents
+from .analysis_cache import store_analysis, get_cached_analysis
 
 
 # ==========================================
@@ -621,27 +622,29 @@ class UnderwritePropertyView(APIView):
         if error:
             return error
 
-        return Response({'metrics': metrics, 'tier': tier})
+        # Cache this result so a follow-up "Download Excel" click (which lives
+        # inside the modal this response populates) can reuse it instead of
+        # re-parsing files and re-calling the AI. See analysis_cache.py.
+        analysis_id = store_analysis(metrics, rent_roll_df)
+
+        return Response({'metrics': metrics, 'tier': tier, 'analysis_id': analysis_id})
 
 
 class UnderwritePropertyDownloadView(APIView):
     """
     ENDPOINT 2: Returns Excel file download
     URL: /api/ai/underwrite/download/
+
+    Prefers reusing a cached analysis result (via analysis_id, from a prior
+    call to UnderwritePropertyView) over re-parsing files and re-calling the
+    AI — this is what prevents "Analyze then Download" from doing the same
+    expensive work twice. Falls back to full reprocessing if no analysis_id
+    is given, or if it's expired/unknown — so this endpoint still works fine
+    called on its own, just without the caching benefit in that case.
     """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        om_file = request.FILES.get('om_file')
-        t12_file = request.FILES.get('t12_file')
-        rent_roll_file = request.FILES.get('rent_roll_file')
-
-        if not all([om_file, t12_file, rent_roll_file]):
-            return Response(
-                {'error': 'All three files (om_file, t12_file, rent_roll_file) are required.'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
         # Financing assumptions — user-entered on the frontend, re-entered per
         # upload (org-level saved defaults were considered and deliberately not
         # built; see conversation history). These are raw numbers, not derived
@@ -651,14 +654,38 @@ class UnderwritePropertyDownloadView(APIView):
         if debt_error:
             return debt_error
 
-        tier = get_user_tier(request)
-        metrics, rent_roll_df, error = process_underwriting_files(
-            om_file, t12_file, rent_roll_file, tier=tier,
-            organization=get_user_organization(request), uploaded_by=request.user
-        )
+        analysis_id = request.data.get('analysis_id')
+        cached = get_cached_analysis(analysis_id) if analysis_id else None
 
-        if error:
-            return error
+        if cached:
+            metrics, rent_roll_df = cached
+        else:
+            om_file = request.FILES.get('om_file')
+            t12_file = request.FILES.get('t12_file')
+            rent_roll_file = request.FILES.get('rent_roll_file')
+
+            if not all([om_file, t12_file, rent_roll_file]):
+                if analysis_id:
+                    # An analysis_id was given but the cache had expired/missed,
+                    # AND no files were provided to fall back on — nothing we
+                    # can do but ask the user to re-analyze.
+                    return Response(
+                        {'error': 'Your analysis has expired. Please click "Analyze Documents" again before downloading.'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                return Response(
+                    {'error': 'All three files (om_file, t12_file, rent_roll_file) are required.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            tier = get_user_tier(request)
+            metrics, rent_roll_df, error = process_underwriting_files(
+                om_file, t12_file, rent_roll_file, tier=tier,
+                organization=get_user_organization(request), uploaded_by=request.user
+            )
+
+            if error:
+                return error
 
         try:
             excel_bytes = generate_underwriting_excel(metrics, rent_roll_df, debt_assumptions=debt_assumptions)
