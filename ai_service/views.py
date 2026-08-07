@@ -15,12 +15,13 @@ from .parsers import (
     extract_document_text,
     extract_t12_text,
     extract_data_from_excel,
+    read_excel_with_header_detection,
     FileValidationError,
 )
 from .excel_generator import generate_underwriting_excel, ExcelGenerationError
 from .rent_roll_utils import detect_rent_roll_columns, compute_ground_truth, RentRollColumnError
 from .reconciliation import run_reconciliation
-from .document_history import record_processed_documents
+from .document_history import record_processed_documents, record_analysis_report
 from .analysis_cache import store_analysis, get_cached_analysis
 
 
@@ -322,8 +323,10 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         t12_text = extract_t12_text(t12_file)
         rent_roll_text = extract_data_from_excel(rent_roll_file)
 
-        # 2. Parse Excel into DataFrame
-        rent_roll_df = pd.read_excel(rent_roll_file, sheet_name=0)
+        # 2. Parse Excel into DataFrame — uses header-row detection instead of
+        #    blindly assuming row 0 (real rent rolls often have a title row
+        #    above the actual column headers).
+        rent_roll_df = read_excel_with_header_detection(rent_roll_file)
         rent_roll_df = rent_roll_df.dropna(how='all').dropna(axis=1, how='all')
 
         if rent_roll_df.empty:
@@ -421,6 +424,7 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         metrics = enforce_tier_entitlements(metrics, tier)
 
         record_processed_documents(organization, uploaded_by, om_file, t12_file, rent_roll_file, status='completed')
+        record_analysis_report(organization, uploaded_by, metrics, tier)
 
         return metrics, rent_roll_df, None
 
@@ -819,3 +823,64 @@ class DocumentHistoryView(APIView):
         ]
 
         return Response({'stats': stats, 'documents': documents})
+
+
+class AnalysisReportListView(APIView):
+    """
+    Powers the Outputs page card grid: one card per completed analysis.
+    URL: GET /api/ai/reports/?search=<optional>
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .models import AnalysisReport
+
+        organization = get_user_organization(request)
+        if organization is None:
+            return Response({'reports': []})
+
+        queryset = AnalysisReport.objects.filter(organization=organization)
+
+        search = request.query_params.get('search', '').strip()
+        if search:
+            queryset = queryset.filter(property_name__icontains=search)
+
+        reports = [
+            {
+                'id': report.id,
+                'title': report.property_name or 'Untitled Property',
+                'company': organization.name,
+                'date': report.created_at.isoformat(),
+                'status': report.get_status_display(),
+            }
+            for report in queryset[:200]
+        ]
+
+        return Response({'reports': reports})
+
+
+class AnalysisReportDetailView(APIView):
+    """
+    Returns the full stored metrics JSON for one report, for the Preview modal.
+    URL: GET /api/ai/reports/<id>/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, report_id):
+        from .models import AnalysisReport
+
+        organization = get_user_organization(request)
+        if organization is None:
+            return Response({'error': 'No organization associated with this account.'}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            report = AnalysisReport.objects.get(id=report_id, organization=organization)
+        except AnalysisReport.DoesNotExist:
+            return Response({'error': 'Report not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response({
+            'id': report.id,
+            'title': report.property_name or 'Untitled Property',
+            'metrics': report.metrics,
+            'created_at': report.created_at.isoformat(),
+        })

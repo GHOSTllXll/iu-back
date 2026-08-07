@@ -1,6 +1,7 @@
 # backend/ai_service/models.py
 from django.db import models
 
+
 class ProcessedDocument(models.Model):
     """
     A record of a single source document (OM, T12, or Rent Roll) that has been
@@ -56,3 +57,96 @@ class ProcessedDocument(models.Model):
 
     def __str__(self):
         return f"{self.file_name} ({self.status}) — {self.organization.name}"
+
+
+class AnalysisReport(models.Model):
+    """
+    Stores the ANALYSIS RESULT (metrics JSON) after a successful "Analyze
+    Documents" run, so users can reference past outputs without re-running
+    anything. Deliberately does NOT store the generated Excel file — only the
+    JSON metrics. If you want the Excel file itself retrievable later too,
+    that's a different, bigger feature (needs actual file storage, e.g. S3),
+    not just a DB row — flag it if you want that built.
+
+    NOTE on 'status': there is no persisted "Generating" state — a row is
+    only ever created once analysis has already succeeded, so every report
+    that exists is, by definition, ready. No status field needed.
+    """
+    organization = models.ForeignKey(
+        'users.Organization',
+        on_delete=models.CASCADE,
+        related_name='analysis_reports'
+    )
+    uploaded_by = models.ForeignKey(
+        'users.CustomUser',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='analysis_reports'
+    )
+
+    property_name = models.CharField(max_length=255, blank=True, default='')
+    tier = models.CharField(max_length=20)
+    metrics = models.JSONField()
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['organization', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.property_name or 'Untitled'} — {self.organization.name} ({self.created_at:%Y-%m-%d})"
+
+
+class AnalysisReport(models.Model):
+    """
+    Stores the RESULT of a completed analysis (the metrics JSON) so a user can
+    come back and review it later — this is the "Outputs" page. This is
+    distinct from ProcessedDocument (which tracks source file metadata only).
+
+    Deliberately does NOT store the generated Excel file — only Preview is
+    supported on the Outputs page (no Download), so there's no need for file
+    storage infrastructure here, just the JSON result itself.
+
+    NOTE on 'status': like ProcessedDocument, this system currently processes
+    synchronously, so a report row is only ever created after a request has
+    already finished successfully. 'generating' is kept as a valid choice for
+    when background processing exists, but in practice today every row lands
+    as 'ready'.
+    """
+    STATUS_CHOICES = [
+        ('ready', 'Ready'),
+        ('generating', 'Generating'),
+    ]
+
+    organization = models.ForeignKey(
+        'users.Organization',
+        on_delete=models.CASCADE,
+        related_name='analysis_reports'
+    )
+    uploaded_by = models.ForeignKey(
+        'users.CustomUser',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='analysis_reports'
+    )
+
+    property_name = models.CharField(max_length=255, blank=True, default='')
+    tier = models.CharField(max_length=20)
+    metrics = models.JSONField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ready')
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['organization', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f"{self.property_name or 'Untitled'} ({self.status}) — {self.organization.name}"

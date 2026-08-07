@@ -6,6 +6,8 @@ from .views import (
     UnderwritePropertyView,
     UnderwritePropertyDownloadView,
     DocumentHistoryView,
+    AnalysisReportListView,
+    AnalysisReportDetailView,
 )
 
 urlpatterns = [
@@ -14,4 +16,6 @@ urlpatterns = [
     path('underwrite/', UnderwritePropertyView.as_view(), name='underwrite_property'),  # Returns JSON
     path('underwrite/download/', UnderwritePropertyDownloadView.as_view(), name='underwrite_download'),  # Returns Excel
     path('documents/', DocumentHistoryView.as_view(), name='document_history'),  # Documents page: stats + list
+    path('reports/', AnalysisReportListView.as_view(), name='report_list'),  # Outputs page: card list
+    path('reports/<int:report_id>/', AnalysisReportDetailView.as_view(), name='report_detail'),  # Outputs page: Preview
 ]

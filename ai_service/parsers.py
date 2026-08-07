@@ -134,6 +134,52 @@ def extract_t12_text(t12_file) -> str:
         )
 
 
+def detect_header_row(excel_file, max_scan_rows: int = 15) -> int:
+    """
+    Real-world spreadsheets often have a title row (e.g. a merged "Rent Roll"
+    heading) above the actual column headers, which fools pandas' default
+    assumption that row 0 is the header — resulting in a DataFrame full of
+    'Unnamed: N' columns and one real column name from the title text.
+
+    Heuristic: scan the first few rows and pick whichever has the most
+    non-empty cells. A genuine header row has most/all columns populated with
+    short labels; a title row typically has just one or two cells filled in.
+    This isn't foolproof (a very sparse real header, or a data row that
+    happens to be fuller than the header, could still confuse it), but it
+    correctly handles the common "title row above real headers" case.
+
+    Returns the 0-indexed row number to use as the header.
+    """
+    excel_file.seek(0)
+    raw = pd.read_excel(excel_file, sheet_name=0, header=None, nrows=max_scan_rows)
+    excel_file.seek(0)
+
+    best_row_idx = 0
+    best_non_null_count = -1
+
+    for i in range(len(raw)):
+        non_null_count = raw.iloc[i].notna().sum()
+        if non_null_count > best_non_null_count:
+            best_non_null_count = non_null_count
+            best_row_idx = i
+
+    return best_row_idx
+
+
+def read_excel_with_header_detection(excel_file) -> pd.DataFrame:
+    """
+    Reads an Excel file into a DataFrame using a detected header row instead
+    of blindly assuming row 0. CSV files don't have this problem (no merged
+    title rows in practice), so this is Excel-only; callers should use
+    pd.read_csv directly for .csv files.
+    """
+    header_row = detect_header_row(excel_file)
+    excel_file.seek(0)
+    df = pd.read_excel(excel_file, sheet_name=0, header=header_row)
+    excel_file.seek(0)
+    return df
+
+
 def extract_data_from_excel(excel_file) -> str:
     """
     Extracts data from an Excel/CSV file and formats it as a clean string.
@@ -147,7 +193,7 @@ def extract_data_from_excel(excel_file) -> str:
         if ext == '.csv':
             df = pd.read_csv(excel_file)
         else:
-            df = pd.read_excel(excel_file, sheet_name=0)
+            df = read_excel_with_header_detection(excel_file)
 
         df = df.dropna(how='all').dropna(axis=1, how='all')
 

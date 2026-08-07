@@ -61,3 +61,26 @@ def record_processed_documents(organization, uploaded_by, om_file, t12_file, ren
 
     if records:
         ProcessedDocument.objects.bulk_create(records)
+
+
+def record_analysis_report(organization, uploaded_by, metrics: dict, tier: str):
+    """
+    Saves a completed analysis result for later review on the Outputs page.
+    organization may be None (user with no org attached) — in that case,
+    nothing is recorded.
+    """
+    from .models import AnalysisReport
+
+    if organization is None:
+        return
+
+    property_name = (metrics.get('property_metadata') or {}).get('property_name') or ''
+
+    AnalysisReport.objects.create(
+        organization=organization,
+        uploaded_by=uploaded_by,
+        property_name=property_name,
+        tier=tier,
+        metrics=metrics,
+        status='ready',
+    )
