@@ -19,7 +19,14 @@ from .parsers import (
     FileValidationError,
 )
 from .excel_generator import generate_underwriting_excel, ExcelGenerationError
-from .rent_roll_utils import detect_rent_roll_columns, compute_ground_truth, RentRollColumnError
+from .rent_roll_utils import (
+    detect_rent_column,
+    strip_rent_outlier_rows,
+    detect_rent_roll_columns,
+    ensure_status_column,
+    compute_ground_truth,
+    RentRollColumnError,
+)
 from .reconciliation import run_reconciliation
 from .document_history import record_processed_documents, record_analysis_report
 from .analysis_cache import store_analysis, get_cached_analysis
@@ -332,6 +339,20 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         if rent_roll_df.empty:
             raise FileValidationError("Rent roll has no usable rows after cleaning.")
 
+        # 2b. Strip likely totals/summary rows (e.g. a trailing "Totals" row
+        # with a SUM-of-all-units rent value that would otherwise corrupt
+        # AVERAGE()-based metrics). Applied for every tier, not just
+        # Enterprise — this is a data-integrity fix, not a premium feature.
+        rent_col_for_cleanup = detect_rent_column(rent_roll_df)
+        rent_roll_df, excluded_rows = strip_rent_outlier_rows(rent_roll_df, rent_col_for_cleanup)
+        rent_roll_cleanup_note = None
+        if excluded_rows:
+            rent_roll_cleanup_note = (
+                f"{len(excluded_rows)} row(s) were excluded from the rent roll as likely "
+                f"totals/summary rows (rent value far above the median of other rows) — "
+                f"not counted as real units."
+            )
+
         combined_context = f"""
         OFFERING MEMORANDUM (OM) EXTRACT:
         {om_text}
@@ -357,10 +378,21 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         #    a real document mismatch, not the AI disagreeing with itself.
         if tier in TIERS_WITH_RECONCILIATION:
             try:
-                rent_col, status_col = detect_rent_roll_columns(rent_roll_df)
+                rent_col, status_col, tenant_col = detect_rent_roll_columns(rent_roll_df)
+                status_col, was_inferred = ensure_status_column(rent_roll_df, status_col, tenant_col)
                 ground_truth = compute_ground_truth(rent_roll_df, rent_col, status_col)
                 flags = run_reconciliation(metrics, rent_roll_df, ground_truth)
                 metrics["reconciliation"] = {"flags": flags}
+                if was_inferred:
+                    # Occupancy wasn't explicitly stated in the rent roll — it was
+                    # inferred from whether the Tenant field was populated. Real,
+                    # but a genuine inference rather than a stated fact, so the
+                    # user should know the ground truth carries that caveat.
+                    metrics["reconciliation"]["note"] = (
+                        "Occupancy was inferred from the Tenant column (no explicit "
+                        "Status column found in the rent roll) — populated tenant name "
+                        "= occupied, blank/vacant = vacant."
+                    )
             except RentRollColumnError as e:
                 # Don't fail the whole request over reconciliation specifically —
                 # the core extraction still succeeded. Surface it as a soft note
@@ -422,6 +454,11 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
 
         # 8. Hard-enforce tier entitlements regardless of what the AI returned
         metrics = enforce_tier_entitlements(metrics, tier)
+
+        # Surface the outlier-row cleanup note (if any) to every tier — this
+        # is transparency about data quality, not a gated feature.
+        if rent_roll_cleanup_note:
+            metrics["data_quality_note"] = rent_roll_cleanup_note
 
         record_processed_documents(organization, uploaded_by, om_file, t12_file, rent_roll_file, status='completed')
         record_analysis_report(organization, uploaded_by, metrics, tier)

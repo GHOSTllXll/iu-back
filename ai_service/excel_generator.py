@@ -8,7 +8,7 @@ from openpyxl.styles import Font, PatternFill
 from openpyxl.comments import Comment
 from openpyxl.utils import get_column_letter
 
-from .rent_roll_utils import detect_rent_roll_columns, RentRollColumnError
+from .rent_roll_utils import detect_rent_roll_columns, ensure_status_column, RentRollColumnError
 
 
 class ExcelGenerationError(Exception):
@@ -114,7 +114,8 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
     # file and the reconciliation flags must agree on which columns are which.)
     # ==========================================
     try:
-        rent_col, status_col = detect_rent_roll_columns(rent_roll_df)
+        rent_col, status_col, tenant_col = detect_rent_roll_columns(rent_roll_df)
+        status_col, status_was_inferred = ensure_status_column(rent_roll_df, status_col, tenant_col)
     except RentRollColumnError as e:
         raise ExcelGenerationError(str(e))
 
@@ -134,6 +135,14 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
     for col_idx, col_name in enumerate(rent_roll_df.columns, 1):
         cell = ws_rr.cell(row=1, column=col_idx, value=col_name)
         cell.font = Font(bold=True)
+        if status_was_inferred and col_name == status_col:
+            cell.comment = Comment(
+                "This rent roll had no explicit Status column. Occupancy was "
+                "INFERRED from the Tenant column: a populated tenant name = "
+                "Occupied, blank/vacant = Vacant. Verify against the source "
+                "rent roll before relying on this.",
+                "Underwriting AI"
+            )
 
     rent_col_idx = rent_roll_df.columns.get_loc(rent_col) + 1
 
