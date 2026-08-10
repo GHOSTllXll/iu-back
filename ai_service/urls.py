@@ -8,6 +8,7 @@ from .views import (
     DocumentHistoryView,
     AnalysisReportListView,
     AnalysisReportDetailView,
+    DashboardStatsView,
 )
 
 urlpatterns = [
@@ -18,4 +19,5 @@ urlpatterns = [
     path('documents/', DocumentHistoryView.as_view(), name='document_history'),  # Documents page: stats + list
     path('reports/', AnalysisReportListView.as_view(), name='report_list'),  # Outputs page: card list
     path('reports/<int:report_id>/', AnalysisReportDetailView.as_view(), name='report_detail'),  # Outputs page: Preview
+    path('dashboard-stats/', DashboardStatsView.as_view(), name='dashboard_stats'),  # Dashboard: 4 live stat cards + quota
 ]

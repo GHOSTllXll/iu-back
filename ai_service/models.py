@@ -61,51 +61,11 @@ class ProcessedDocument(models.Model):
 
 class AnalysisReport(models.Model):
     """
-    Stores the ANALYSIS RESULT (metrics JSON) after a successful "Analyze
-    Documents" run, so users can reference past outputs without re-running
-    anything. Deliberately does NOT store the generated Excel file — only the
-    JSON metrics. If you want the Excel file itself retrievable later too,
-    that's a different, bigger feature (needs actual file storage, e.g. S3),
-    not just a DB row — flag it if you want that built.
-
-    NOTE on 'status': there is no persisted "Generating" state — a row is
-    only ever created once analysis has already succeeded, so every report
-    that exists is, by definition, ready. No status field needed.
-    """
-    organization = models.ForeignKey(
-        'users.Organization',
-        on_delete=models.CASCADE,
-        related_name='analysis_reports'
-    )
-    uploaded_by = models.ForeignKey(
-        'users.CustomUser',
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name='analysis_reports'
-    )
-
-    property_name = models.CharField(max_length=255, blank=True, default='')
-    tier = models.CharField(max_length=20)
-    metrics = models.JSONField()
-
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        ordering = ['-created_at']
-        indexes = [
-            models.Index(fields=['organization', '-created_at']),
-        ]
-
-    def __str__(self):
-        return f"{self.property_name or 'Untitled'} — {self.organization.name} ({self.created_at:%Y-%m-%d})"
-
-
-class AnalysisReport(models.Model):
-    """
     Stores the RESULT of a completed analysis (the metrics JSON) so a user can
-    come back and review it later — this is the "Outputs" page. This is
-    distinct from ProcessedDocument (which tracks source file metadata only).
+    come back and review it later — this is the "Outputs" page. Also doubles
+    as the source of truth for upload-quota counting (see views.py) — one row
+    per successful analysis, so counting rows in a time window == counting
+    "uploads used", with no separate counter field needed.
 
     Deliberately does NOT store the generated Excel file — only Preview is
     supported on the Outputs page (no Download), so there's no need for file
@@ -139,6 +99,11 @@ class AnalysisReport(models.Model):
     tier = models.CharField(max_length=20)
     metrics = models.JSONField()
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ready')
+
+    # How long the actual analysis pipeline took (parsing + AI call + Enterprise
+    # modules), in seconds. Real, measured data — used to power the "Avg.
+    # Processing" dashboard stat honestly instead of a fabricated number.
+    processing_seconds = models.FloatField(null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
 

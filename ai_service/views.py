@@ -3,8 +3,11 @@ import io
 import re
 import json
 import os
+import time
 import pandas as pd
+from datetime import timedelta
 from django.http import FileResponse
+from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -55,6 +58,84 @@ TIERS_WITH_STANDARDIZATION = {TIER_ENTERPRISE}
 # per-metric provenance was deliberately not built (redundant for
 # formula-backed T12/Rent Roll numbers, and increases hallucination risk).
 TIERS_WITH_PROVENANCE = {TIER_ENTERPRISE}
+
+
+# ==========================================
+# UPLOAD QUOTA CONFIGURATION
+# ==========================================
+# "Upload" = one analysis (3 source documents = 1 upload). Enforced against
+# AnalysisReport rows rather than a separate counter — one row per successful
+# analysis already exists (see document_history.py), so counting rows in a
+# window IS counting usage, with no risk of a counter drifting out of sync.
+#
+# Window: rolling 30 days anchored to each Organization's own date_created —
+# NOT a shared calendar month. Confirmed with the person building this system.
+# Only successful analyses count against quota — a failed upload (bad file,
+# parsing error) does not consume quota, also confirmed.
+TIER_UPLOAD_LIMITS = {
+    TIER_BASIC: 50,
+    TIER_PROFESSIONAL: 150,
+    TIER_ENTERPRISE: 500,
+}
+
+QUOTA_WINDOW_DAYS = 30
+
+
+def get_quota_window_start(organization):
+    """
+    Returns the start of the CURRENT 30-day billing-style cycle for this org,
+    anchored to organization.date_created. E.g. if the org was created on
+    Jan 1st, cycles are [Jan 1 - Jan 31), [Jan 31 - Mar 2), etc. — not simply
+    "the last 30 days from right now" (that would be a plain rolling window,
+    not a cycle), and not a shared calendar month across all orgs.
+    """
+    anchor = organization.date_created
+    now = timezone.now()
+    days_elapsed = (now - anchor).days
+    cycles_elapsed = days_elapsed // QUOTA_WINDOW_DAYS
+    return anchor + timedelta(days=cycles_elapsed * QUOTA_WINDOW_DAYS)
+
+
+def get_quota_window_end(organization):
+    """The end (exclusive) of the current cycle — i.e. when quota resets."""
+    return get_quota_window_start(organization) + timedelta(days=QUOTA_WINDOW_DAYS)
+
+
+def get_period_usage(organization) -> int:
+    """Successful analyses recorded within the CURRENT quota cycle."""
+    from .models import AnalysisReport
+    window_start = get_quota_window_start(organization)
+    return AnalysisReport.objects.filter(organization=organization, created_at__gte=window_start).count()
+
+
+def check_upload_quota(organization, tier):
+    """
+    Returns an error Response if the org has hit its plan's upload limit for
+    the current cycle, else None. organization=None (user with no org) skips
+    quota enforcement entirely — matches the existing "no org, no tracking"
+    pattern used elsewhere (History recording, reports).
+    """
+    if organization is None:
+        return None
+
+    limit = TIER_UPLOAD_LIMITS.get(tier, TIER_UPLOAD_LIMITS[TIER_BASIC])
+    used = get_period_usage(organization)
+
+    if used >= limit:
+        resets_at = get_quota_window_end(organization)
+        return Response({
+            'error': (
+                f"You've reached your plan's limit of {limit} uploads for this cycle. "
+                f"Your quota resets on {resets_at.strftime('%B %d, %Y')}, or you can "
+                f"upgrade your plan to continue sooner."
+            ),
+            'quota_exceeded': True,
+            'used': used,
+            'limit': limit,
+            'resets_at': resets_at.isoformat(),
+        }, status=status.HTTP_402_PAYMENT_REQUIRED)
+
+    return None
 
 
 # Sensible bounds — not enforcing "correctness", just catching obvious garbage
@@ -324,6 +405,15 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
     document_history.py. Passing organization=None skips recording entirely
     (e.g. a user with no org attached).
     """
+    # Quota check happens BEFORE any parsing/AI work — an org over their limit
+    # gets rejected immediately rather than wasting processing on files that
+    # were never going to be allowed through.
+    quota_error = check_upload_quota(organization, tier)
+    if quota_error:
+        return None, None, quota_error
+
+    pipeline_start_time = time.perf_counter()
+
     try:
         # 1. Parse documents
         om_text = extract_document_text(om_file)
@@ -460,8 +550,10 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         if rent_roll_cleanup_note:
             metrics["data_quality_note"] = rent_roll_cleanup_note
 
+        elapsed_seconds = time.perf_counter() - pipeline_start_time
+
         record_processed_documents(organization, uploaded_by, om_file, t12_file, rent_roll_file, status='completed')
-        record_analysis_report(organization, uploaded_by, metrics, tier)
+        record_analysis_report(organization, uploaded_by, metrics, tier, processing_seconds=elapsed_seconds)
 
         return metrics, rent_roll_df, None
 
@@ -920,4 +1012,76 @@ class AnalysisReportDetailView(APIView):
             'title': report.property_name or 'Untitled Property',
             'metrics': report.metrics,
             'created_at': report.created_at.isoformat(),
+        })
+
+
+class DashboardStatsView(APIView):
+    """
+    Powers the 4 stat cards at the top of the dashboard. Every number here is
+    computed from real data — no fabricated stats. Also surfaces the org's
+    current upload-quota usage, since giving people visibility into their own
+    usage is part of preventing accidental overage, not just hard-blocking it
+    after the fact.
+    URL: GET /api/ai/dashboard-stats/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .models import ProcessedDocument, AnalysisReport
+        from django.db.models import Avg
+
+        organization = get_user_organization(request)
+        tier = get_user_tier(request)
+
+        if organization is None:
+            return Response({
+                'documents_processed_total': 0,
+                'processed_today': 0,
+                'processed_yesterday': 0,
+                'extraction_success_rate': None,
+                'avg_processing_seconds': None,
+                'quota': None,
+            })
+
+        now = timezone.now()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        yesterday_start = today_start - timedelta(days=1)
+
+        all_docs = ProcessedDocument.objects.filter(organization=organization)
+        completed_docs = all_docs.filter(status='completed')
+        failed_docs = all_docs.filter(status='failed')
+
+        documents_processed_total = completed_docs.count()
+        processed_today = completed_docs.filter(uploaded_at__gte=today_start).count()
+        processed_yesterday = completed_docs.filter(
+            uploaded_at__gte=yesterday_start, uploaded_at__lt=today_start
+        ).count()
+
+        total_attempts = completed_docs.count() + failed_docs.count()
+        extraction_success_rate = (
+            round(completed_docs.count() / total_attempts * 100, 1)
+            if total_attempts > 0 else None
+        )
+
+        avg_processing_seconds = AnalysisReport.objects.filter(
+            organization=organization,
+            processing_seconds__isnull=False
+        ).aggregate(avg=Avg('processing_seconds'))['avg']
+
+        limit = TIER_UPLOAD_LIMITS.get(tier, TIER_UPLOAD_LIMITS[TIER_BASIC])
+        used = get_period_usage(organization)
+        resets_at = get_quota_window_end(organization)
+
+        return Response({
+            'documents_processed_total': documents_processed_total,
+            'processed_today': processed_today,
+            'processed_yesterday': processed_yesterday,
+            'extraction_success_rate': extraction_success_rate,
+            'avg_processing_seconds': round(avg_processing_seconds, 1) if avg_processing_seconds else None,
+            'quota': {
+                'used': used,
+                'limit': limit,
+                'tier': tier,
+                'resets_at': resets_at.isoformat(),
+            },
         })

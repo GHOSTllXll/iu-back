@@ -108,10 +108,33 @@ class AdminCreateUserView(APIView):
             details=f"Added to {request.data.get('company_name', 'Unknown Company')}",
             ip_address=request.META.get('REMOTE_ADDR')
         )
-            return Response({
+
+            response_data = {
                 'detail': f'User {user.email} created successfully.',
-                'user': UserSerializer(user).data
-            }, status=status.HTTP_201_CREATED)
+                'user': UserSerializer(user).data,
+                'org_was_created': serializer.org_was_created,
+            }
+
+            # SAFETY NET: only warn when (a) the org already existed, AND
+            # (b) a subscription_plan was ACTUALLY present in the raw request
+            # (not just DRF's field default kicking in silently), AND (c) it
+            # doesn't match the org's real current plan. This keeps the
+            # warning from firing on account/[id].vue's "Add Team Member"
+            # flow, which never offers a plan choice and no longer sends the
+            # field at all.
+            plan_was_explicitly_sent = 'subscription_plan' in request.data
+            if (not serializer.org_was_created
+                    and plan_was_explicitly_sent
+                    and serializer.requested_plan != serializer.org_actual_plan):
+                response_data['warning'] = (
+                    f"'{request.data.get('company_name')}' already exists — the plan you "
+                    f"selected was NOT applied. This organization's current plan is "
+                    f"'{serializer.org_actual_plan}'. To change it, use the plan dropdown "
+                    f"on that organization's account page."
+                )
+                response_data['org_actual_plan'] = serializer.org_actual_plan
+
+            return Response(response_data, status=status.HTTP_201_CREATED)
             
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     

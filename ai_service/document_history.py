@@ -63,9 +63,11 @@ def record_processed_documents(organization, uploaded_by, om_file, t12_file, ren
         ProcessedDocument.objects.bulk_create(records)
 
 
-def record_analysis_report(organization, uploaded_by, metrics: dict, tier: str):
+def record_analysis_report(organization, uploaded_by, metrics: dict, tier: str, processing_seconds: float = None):
     """
     Saves a completed analysis result for later review on the Outputs page.
+    Also the source of truth for upload-quota counting (see views.py) — one
+    row per successful analysis.
     organization may be None (user with no org attached) — in that case,
     nothing is recorded.
     """
@@ -82,5 +84,6 @@ def record_analysis_report(organization, uploaded_by, metrics: dict, tier: str):
         property_name=property_name,
         tier=tier,
         metrics=metrics,
+        processing_seconds=processing_seconds,
         status='ready',
     )

@@ -74,6 +74,15 @@ class AdminCreateUserSerializer(serializers.ModelSerializer):
             }
         )
 
+        # SAFETY NET: get_or_create's `defaults` only applies when a NEW org is
+        # being created. If `company_name` matched an EXISTING organization,
+        # whatever plan was selected on this form is silently ignored — the
+        # org keeps its current plan. Stash what actually happened here so
+        # the view can warn the admin instead of that being invisible.
+        self.org_was_created = created
+        self.org_actual_plan = org.subscription_plan
+        self.requested_plan = plan
+
         # Create the user (password is automatically hashed by the model's manager)
         user = CustomUser.objects.create_user(
             password=password,
