@@ -23,6 +23,8 @@ from .parsers import (
 )
 from .excel_generator import generate_underwriting_excel, ExcelGenerationError
 from .rent_roll_utils import (
+    detect_charge_ledger_columns,
+    reshape_charge_ledger,
     detect_rent_column,
     strip_rent_outlier_rows,
     detect_rent_roll_columns,
@@ -428,6 +430,21 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
 
         if rent_roll_df.empty:
             raise FileValidationError("Rent roll has no usable rows after cleaning.")
+
+        # 2a. Detect + reshape "charge ledger" format rent rolls (multiple
+        # rows per unit, one per charge type) into the standard one-row-
+        # per-unit shape. Applies to all tiers — this is format support,
+        # not a premium feature. If the file isn't in this format,
+        # detect_charge_ledger_columns returns None and nothing changes.
+        ledger_cols = detect_charge_ledger_columns(rent_roll_df)
+        if ledger_cols and 'rent' not in [str(c).lower() for c in rent_roll_df.columns]:
+            # Only reshape if there's no ALREADY-simple rent column — a file
+            # that has both a real "Rent" column AND coincidentally a
+            # "Charge"/"Amount" pair (unlikely, but possible) shouldn't be
+            # reshaped unnecessarily.
+            reshaped = reshape_charge_ledger(rent_roll_df, ledger_cols)
+            if not reshaped.empty:
+                rent_roll_df = reshaped
 
         # 2b. Strip likely totals/summary rows (e.g. a trailing "Totals" row
         # with a SUM-of-all-units rent value that would otherwise corrupt

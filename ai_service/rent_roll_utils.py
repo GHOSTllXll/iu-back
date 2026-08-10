@@ -1,13 +1,11 @@
 # backend/ai_service/rent_roll_utils.py
 """
-Shared rent roll column detection and ground-truth computation.
+Shared rent roll column detection, ground-truth computation, and format
+normalization (including charge-ledger reshaping — see reshape_charge_ledger).
 
 Extracted into its own module so excel_generator.py and reconciliation.py
 (Module 1) both use the EXACT same column-detection logic and the EXACT same
-ground-truth math. If these ever drifted apart, the Excel file and the
-reconciliation flags could disagree with each other about what the rent roll
-actually says — which would be a real problem for a feature whose entire
-purpose is catching inconsistencies.
+ground-truth math.
 """
 import pandas as pd
 
@@ -15,6 +13,127 @@ import pandas as pd
 class RentRollColumnError(Exception):
     """Raised when the rent roll doesn't have columns we can confidently map."""
     pass
+
+
+def detect_charge_ledger_columns(rent_roll_df: pd.DataFrame):
+    """
+    Detects the "charge ledger" rent roll format: multiple rows per unit, one
+    per charge type (rent, utilities, deposits, etc.), rather than one row
+    per unit with a single rent figure. Common in property-management-system
+    exports (e.g. ResAnalytics-style exports).
+
+    Returns a dict of column names if detected, else None. Detection requires
+    finding columns for: charge type, charge amount, and unit identifier —
+    without those three, there's no ledger structure to reshape.
+    """
+    charge_col = None
+    amount_col = None
+    unit_col = None
+    resident_col = None
+    name_col = None
+
+    for col in rent_roll_df.columns:
+        col_str = str(col).lower().strip()
+        if 'charge' in col_str:
+            charge_col = col
+        if col_str == 'amount' or col_str.startswith('amount'):
+            amount_col = col
+        if col_str == 'unit':
+            unit_col = col
+        if col_str == 'resident':
+            resident_col = col
+        if col_str == 'name':
+            name_col = col
+
+    if charge_col is None or amount_col is None or unit_col is None:
+        return None
+
+    return {
+        'charge_col': charge_col,
+        'amount_col': amount_col,
+        'unit_col': unit_col,
+        'resident_col': resident_col,
+        'name_col': name_col,
+    }
+
+
+def reshape_charge_ledger(rent_roll_df: pd.DataFrame, ledger_cols: dict) -> pd.DataFrame:
+    """
+    Collapses a charge-ledger rent roll (multiple rows per unit, one per
+    charge type, in contiguous row blocks) into the standard one-row-per-unit
+    shape — Unit / Tenant / Rent / Status — that everything else in this
+    system (Excel formulas, reconciliation ground truth) already expects.
+
+    Assumptions about the source format (verified against a real export, but
+    a heuristic nonetheless — see conversation history):
+    - Each unit occupies a contiguous block of rows. The first row of a
+      block has the Unit/resident info filled in; continuation rows (more
+      charges for the same unit) have those fields blank.
+    - The base rent charge is identified by a Charge Code value of
+      literally "rent" (case-insensitive) — confirmed against real data,
+      but a property using a different literal code (e.g. "base rent",
+      "rnt") would not be matched by this and would show $0 rent instead.
+    - "DOWN" or a blank resident name means vacant — also confirmed against
+      real data; other systems may use different vacancy markers.
+    - "Total" rows and blank separator rows are not real charge lines and
+      are dropped before grouping.
+    """
+    unit_col = ledger_cols['unit_col']
+    resident_col = ledger_cols['resident_col']
+    name_col = ledger_cols['name_col']
+    charge_col = ledger_cols['charge_col']
+    amount_col = ledger_cols['amount_col']
+
+    display_name_col = name_col or resident_col
+
+    df = rent_roll_df.reset_index(drop=True).copy()
+
+    # Forward-fill unit-identifying columns down through each block's
+    # continuation rows (blank Unit/resident on rows after the first).
+    id_cols = [c for c in [unit_col, resident_col, name_col] if c is not None]
+    df[id_cols] = df[id_cols].ffill()
+
+    # Drop "Total" summary rows and fully-blank charge rows — neither is a
+    # real charge line to inspect.
+    charge_clean = df[charge_col].astype(str).str.strip().str.lower()
+    df = df[~charge_clean.isin(['total', 'nan', ''])]
+    df = df[df[unit_col].notna()]
+
+    records = []
+    for unit_id, group in df.groupby(unit_col, sort=False):
+        charges = group[charge_col].astype(str).str.strip().str.lower()
+        rent_rows = group[charges == 'rent']
+        rent_amount = (
+            pd.to_numeric(rent_rows[amount_col], errors='coerce').sum()
+            if not rent_rows.empty else 0
+        )
+
+        resident_val = group[display_name_col].iloc[0] if display_name_col else None
+        resident_str = str(resident_val).strip().lower() if pd.notna(resident_val) else ''
+        is_vacant = resident_str in ('', 'nan', 'down') or 'vacant' in resident_str
+
+        records.append({
+            'Unit': unit_id,
+            'Tenant': resident_val if pd.notna(resident_val) else '',
+            'Rent': rent_amount,
+            'Status': 'Vacant' if is_vacant else 'Occupied',
+        })
+
+    result = pd.DataFrame(records)
+
+    if result.empty:
+        return result
+
+    # Filter out stray section-header rows that leak into the "unit" grouping
+    # (e.g. a literal row of text like "Current/Notice/Vacant Residents"
+    # sitting in the source sheet as a section divider, not a real unit) —
+    # same statistical-outlier approach already used for rent totals-row
+    # stripping: a real unit ID is short, a stray label is much longer.
+    unit_id_lengths = result['Unit'].astype(str).str.len()
+    median_len = unit_id_lengths.median()
+    result = result[unit_id_lengths <= max(median_len * 4, 10)].reset_index(drop=True)
+
+    return result
 
 
 def detect_rent_column(rent_roll_df: pd.DataFrame):
@@ -38,19 +157,13 @@ def detect_rent_column(rent_roll_df: pd.DataFrame):
 def strip_rent_outlier_rows(rent_roll_df: pd.DataFrame, rent_col, outlier_multiplier: float = 5.0):
     """
     Some rent rolls include a trailing "Totals" or summary row that isn't a
-    real unit — blank tenant/unit-type/square-footage, but a rent value that's
-    actually the SUM across every unit, not one unit's rent. Left in, this
-    silently corrupts AVERAGE()-based metrics like Avg In-Place Rent (one
-    absurdly large "rent" value drags the whole average way up).
+    real unit — blank tenant/unit-type/square-footage, but a rent value
+    that's actually the SUM across every unit, not one unit's rent. Left in,
+    this silently corrupts AVERAGE()-based metrics like Avg In-Place Rent.
 
     Heuristic: flag any row whose rent value exceeds `outlier_multiplier`
     times the MEDIAN of all nonzero rent values in the column, and exclude
-    it. Deliberately simple and format-agnostic — doesn't need to guess
-    column names for unit type / square footage, which vary a lot between
-    rent rolls. This is a heuristic, not a certainty: a real property with
-    one dramatically higher-rent unit (e.g. a penthouse) could in theory be
-    caught by this too, though 5x the median is a generous threshold for
-    that to be likely in practice.
+    it.
 
     Returns (cleaned_df, excluded_rows: list of dicts) so callers can surface
     what was excluded rather than silently dropping data.
@@ -79,13 +192,11 @@ def detect_rent_roll_columns(rent_roll_df: pd.DataFrame):
     Returns (rent_col, status_col, tenant_col). status_col and tenant_col may
     individually be None (but not both), depending on what the rent roll
     actually has. Callers should pass the result to ensure_status_column()
-    before using it for ground truth / Excel formulas — that function
-    guarantees a real Occupied/Vacant column exists one way or another.
+    before using it for ground truth / Excel formulas.
 
     Raises RentRollColumnError if:
     - no rent amount column can be found, or
-    - NEITHER a status column NOR a tenant name column can be found (no
-      reasonable way to determine occupancy by any method).
+    - NEITHER a status column NOR a tenant name column can be found.
     """
     rent_col = detect_rent_column(rent_roll_df)
     status_col = None
@@ -112,25 +223,10 @@ def detect_rent_roll_columns(rent_roll_df: pd.DataFrame):
 def ensure_status_column(rent_roll_df: pd.DataFrame, status_col, tenant_col):
     """
     Guarantees the DataFrame has a real column containing literal 'Occupied' /
-    'Vacant' text — the form every downstream consumer (Excel COUNTIF formulas,
-    ground-truth math, reconciliation) actually needs. Two cases:
-
-    1. An explicit status column already exists — normalize its values to
-       exact 'Occupied'/'Vacant' casing (source data is often inconsistently
-       cased) and use it as-is.
-    2. No status column, but a Tenant column does — INFER occupancy: a blank/
-       empty tenant name, or one literally containing "vacant", means vacant;
-       anything else means occupied. This is a genuine inference, not a fact
-       stated by the source document, so callers displaying this to the user
-       (e.g. Module 1 reconciliation messages) should note it was inferred
-       rather than presenting it with the same certainty as an explicit
-       status column.
-
-    Either way, this MATERIALIZES real values onto the DataFrame (mutates it
-    in place, matching the pattern already used elsewhere for rent/status
-    cleanup) — not just an in-memory calculation — so the exact same values
-    end up in both the Excel export and the reconciliation engine's ground
-    truth, with no risk of the two disagreeing.
+    'Vacant' text. Two cases:
+    1. An explicit status column already exists — normalize its values.
+    2. No status column, but a Tenant column does — infer occupancy from
+       blank/vacant-containing tenant names.
 
     Returns (status_col_name, was_inferred: bool).
     """
@@ -139,10 +235,9 @@ def ensure_status_column(rent_roll_df: pd.DataFrame, status_col, tenant_col):
         rent_roll_df[status_col] = normalized.map({
             'occupied': 'Occupied',
             'vacant': 'Vacant',
-        }).fillna(rent_roll_df[status_col])  # leave unrecognized values as-is rather than blanking them
+        }).fillna(rent_roll_df[status_col])
         return status_col, False
 
-    # Infer from tenant column
     tenant_clean = rent_roll_df[tenant_col].astype(str).str.strip().str.lower()
     is_vacant = tenant_clean.isin(['', 'nan', 'none']) | tenant_clean.str.contains('vacant', na=False)
     rent_roll_df['Status'] = is_vacant.map({True: 'Vacant', False: 'Occupied'})
@@ -152,13 +247,8 @@ def ensure_status_column(rent_roll_df: pd.DataFrame, status_col, tenant_col):
 def compute_ground_truth(rent_roll_df: pd.DataFrame, rent_col, status_col) -> dict:
     """
     Computes real occupancy and revenue figures directly from the rent roll
-    DataFrame — the same "ground truth" your Excel COUNTIF/AVERAGE formulas
-    compute, just done in Python so it can also feed the reconciliation engine
-    (Module 1) before the Excel file even exists.
-
-    Expects status_col to already contain literal 'Occupied'/'Vacant' text —
-    i.e. this should be called AFTER ensure_status_column(), not on a raw
-    tenant-name column.
+    DataFrame. Expects status_col to already contain literal 'Occupied'/
+    'Vacant' text — i.e. this should be called AFTER ensure_status_column().
     """
     numeric_rent = pd.to_numeric(rent_roll_df[rent_col], errors='coerce').fillna(0)
     status_clean = rent_roll_df[status_col].astype(str).str.strip()

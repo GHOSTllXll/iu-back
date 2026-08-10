@@ -1,7 +1,5 @@
 from django.shortcuts import render
 
-# Create your views here.
-
 # users/views.py
 import urllib.parse
 from rest_framework.views import APIView
@@ -17,6 +15,20 @@ from .utils import log_activity
 from .models import CustomUser, Organization, ActivityLog
 from .serializers import LoginSerializer, UserSerializer, AdminCreateUserSerializer, OrganizationSerializer, ActivityLogSerializer
 
+from django.contrib.auth.tokens import PasswordResetTokenGenerator
+from django.utils.encoding import force_bytes, force_str
+from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
+from django.core.mail import send_mail
+from django.conf import settings
+
+# Add this near the top level (module scope), alongside the other module-level
+# objects — reused across both views below.
+password_reset_token_generator = PasswordResetTokenGenerator()
+
+# Replace the existing LoginView class in users/views.py with this version.
+# Only the authentication logic changed — cookie-setting and activity
+# logging at the bottom are untouched.
+
 class LoginView(APIView):
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
@@ -25,44 +37,57 @@ class LoginView(APIView):
 
         email = serializer.validated_data['email']
         password = serializer.validated_data['password']
-        
-        # authenticate() checks the email and password against the database
-        user = authenticate(email=email, password=password)
-        
-        if user is None:
+
+        # NOTE: deliberately NOT using Django's authenticate() here. It calls
+        # ModelBackend.authenticate() under the hood, which silently refuses
+        # to authenticate an inactive user — it returns None for them, making
+        # a deactivated account indistinguishable from a wrong password. That
+        # meant the "account is inactive" branch below could never actually
+        # fire. Looking the user up manually and checking the password
+        # ourselves lets us tell the two cases apart and return the right
+        # message for each.
+        try:
+            user = CustomUser.objects.get(email=email)
+        except CustomUser.DoesNotExist:
             return Response({'detail': 'Invalid email or password.'}, status=status.HTTP_401_UNAUTHORIZED)
-            
+
+        if not user.check_password(password):
+            return Response({'detail': 'Invalid email or password.'}, status=status.HTTP_401_UNAUTHORIZED)
+
         if not user.is_active:
-            return Response({'detail': 'This account is inactive. Please contact support.'}, status=status.HTTP_403_FORBIDDEN)
+            return Response(
+                {'detail': 'Your account has been deactivated. Please contact support.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
 
         # Generate JWT tokens
         refresh = RefreshToken.for_user(user)
-        
+
         # Prepare the response
         response = Response({
             'detail': 'Login successful',
             'user': UserSerializer(user).data
         })
-        
+
         # SECURITY: Set tokens in HttpOnly cookies
         # secure=False is for local dev. Change to True in production (requires HTTPS).
         cookie_kwargs = {
             'httponly': True,
-            'secure': False, 
+            'secure': False,
             'samesite': 'Lax',
             'path': '/'
         }
-        
+
         response.set_cookie(key='access_token', value=str(refresh.access_token), **cookie_kwargs)
         response.set_cookie(key='refresh_token', value=str(refresh), **cookie_kwargs)
 
         log_activity(
-            user=user, 
-            action='LOGIN', 
-            target=user.email, 
+            user=user,
+            action='LOGIN',
+            target=user.email,
             ip_address=request.META.get('REMOTE_ADDR')
         )
-        
+
         return response
 
 class LogoutView(APIView):
@@ -361,3 +386,112 @@ class AdminUpdateOrganizationPlanView(APIView):
         
         serializer = OrganizationSerializer(org)
         return Response(serializer.data)
+
+class PasswordResetRequestView(APIView):
+    """
+    Public endpoint (no auth required) — the "Forgot password?" flow's first
+    step. Takes an email, and IF a matching active user exists, emails them a
+    reset link containing a signed token.
+
+    SECURITY: always returns the same generic success message regardless of
+    whether the email actually exists in the system. This is deliberate — it
+    stops someone from using this endpoint to check which email addresses
+    are registered on the platform.
+    """
+    def post(self, request):
+        email = request.data.get('email', '').strip()
+
+        if not email:
+            return Response({'detail': 'Email is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        generic_response = Response({
+            'detail': 'If an account exists with that email, a password reset link has been sent.'
+        })
+
+        try:
+            user = CustomUser.objects.get(email=email)
+        except CustomUser.DoesNotExist:
+            return generic_response  # don't reveal whether the email exists
+
+        if not user.is_active:
+            # Deliberately still returns the generic message — same reasoning
+            # as above, don't leak account status through this endpoint either.
+            return generic_response
+
+        uid = urlsafe_base64_encode(force_bytes(user.pk))
+        token = password_reset_token_generator.make_token(user)
+        reset_link = f"{settings.FRONTEND_BASE_URL}/reset-password?uid={uid}&token={token}"
+
+        # NOTE: requires EMAIL_BACKEND to be configured in settings.py. For
+        # local dev, Django's console backend prints the email to your
+        # terminal instead of actually sending it — zero config needed:
+        #     EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+        # For production, you'll need a real provider (SendGrid, AWS SES,
+        # Mailgun, etc.) with SMTP credentials in settings.py / .env.
+        send_mail(
+            subject="Reset your Inbound Underwriting password",
+            message=(
+                f"Hi {user.first_name},\n\n"
+                f"Click the link below to reset your password:\n\n"
+                f"{reset_link}\n\n"
+                f"This link expires in {settings.PASSWORD_RESET_TIMEOUT // 3600 if hasattr(settings, 'PASSWORD_RESET_TIMEOUT') else 24} hour(s). "
+                f"If you didn't request this, you can safely ignore this email."
+            ),
+            from_email=getattr(settings, 'DEFAULT_FROM_EMAIL', 'noreply@inboundunderwriting.com'),
+            recipient_list=[user.email],
+            fail_silently=False,
+        )
+
+        return generic_response
+
+
+class PasswordResetConfirmView(APIView):
+    """
+    Public endpoint (no auth required) — the "Forgot password?" flow's second
+    step. Takes the uid/token from the emailed link plus a new password, and
+    actually sets it.
+    """
+    def post(self, request):
+        uid = request.data.get('uid', '')
+        token = request.data.get('token', '')
+        new_password = request.data.get('new_password', '')
+
+        if not all([uid, token, new_password]):
+            return Response(
+                {'detail': 'uid, token, and new_password are all required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if len(new_password) < 8:
+            return Response(
+                {'detail': 'Password must be at least 8 characters long.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            user_pk = force_str(urlsafe_base64_decode(uid))
+            user = CustomUser.objects.get(pk=user_pk)
+        except (TypeError, ValueError, OverflowError, CustomUser.DoesNotExist):
+            return Response({'detail': 'Invalid reset link.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not password_reset_token_generator.check_token(user, token):
+            # Covers both a wrong/tampered token AND an expired one (the
+            # token generator encodes a timestamp check internally, governed
+            # by settings.PASSWORD_RESET_TIMEOUT, default 3 days).
+            return Response(
+                {'detail': 'This reset link is invalid or has expired. Please request a new one.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        user.set_password(new_password)
+        user.save()
+
+        log_activity(
+            user=user,
+            action='LOGIN',  # no dedicated action type exists for this yet — reuses closest existing one
+            target=user.email,
+            details="Password reset via forgot-password flow",
+            ip_address=request.META.get('REMOTE_ADDR')
+        )
+
+        return Response({'detail': 'Password reset successfully. You can now log in with your new password.'})

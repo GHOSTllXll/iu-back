@@ -144,9 +144,8 @@ def detect_header_row(excel_file, max_scan_rows: int = 15) -> int:
     Heuristic: scan the first few rows and pick whichever has the most
     non-empty cells. A genuine header row has most/all columns populated with
     short labels; a title row typically has just one or two cells filled in.
-    This isn't foolproof (a very sparse real header, or a data row that
-    happens to be fuller than the header, could still confuse it), but it
-    correctly handles the common "title row above real headers" case.
+    This isn't foolproof, but it correctly handles the common "title row
+    above real headers" case.
 
     Returns the 0-indexed row number to use as the header.
     """
@@ -166,17 +165,100 @@ def detect_header_row(excel_file, max_scan_rows: int = 15) -> int:
     return best_row_idx
 
 
+def _dedupe_columns(columns):
+    """
+    Mimics pandas' own behavior for duplicate column names (e.g. two columns
+    both literally named 'Unit' become 'Unit' and 'Unit.1') — needed because
+    we're building column names manually here rather than letting pandas'
+    header= parameter handle it for us.
+    """
+    seen = {}
+    result = []
+    for col in columns:
+        if col not in seen:
+            seen[col] = 0
+            result.append(col)
+        else:
+            seen[col] += 1
+            result.append(f"{col}.{seen[col]}")
+    return result
+
+
+def _build_column_names(raw: pd.DataFrame, header_row_idx: int):
+    """
+    Builds column names from the detected header row, merging in a sub-header
+    row directly below it if one looks present. Handles the common
+    "grouped header" pattern in real-world rent rolls, e.g. a cell reading
+    "Market" with "Rent" directly beneath it in the next row — meaning
+    "Market Rent" — which a single-row header read would otherwise split
+    apart, losing the "Rent" qualifier entirely (and potentially causing a
+    genuine rent column to go undetected downstream).
+
+    Returns (column_names, used_subheader: bool).
+    """
+    header_row = raw.iloc[header_row_idx]
+    next_row_idx = header_row_idx + 1
+    has_next_row = next_row_idx < len(raw)
+    next_row = raw.iloc[next_row_idx] if has_next_row else None
+
+    # Heuristic: the row below only counts as a sub-header if it has a
+    # modest number of populated cells (at least 2, but not the majority of
+    # the row) — a real data row is usually either much fuller (many
+    # populated fields) or, for a blank/vacant row, much sparser than this.
+    subheader_count = next_row.notna().sum() if has_next_row else 0
+    looks_like_subheader = has_next_row and 2 <= subheader_count <= max(2, len(next_row) * 0.6)
+
+    columns = []
+    for i in range(len(header_row)):
+        top_val = header_row.iloc[i]
+        top_str = str(top_val).strip() if pd.notna(top_val) else ''
+
+        if looks_like_subheader:
+            bottom_val = next_row.iloc[i]
+            bottom_str = str(bottom_val).strip() if pd.notna(bottom_val) else ''
+            if top_str and bottom_str:
+                columns.append(f"{top_str} {bottom_str}")
+            elif top_str:
+                columns.append(top_str)
+            elif bottom_str:
+                columns.append(bottom_str)
+            else:
+                columns.append(f"Unnamed: {i}")
+        else:
+            columns.append(top_str if top_str else f"Unnamed: {i}")
+
+    return _dedupe_columns(columns), looks_like_subheader
+
+
 def read_excel_with_header_detection(excel_file) -> pd.DataFrame:
     """
     Reads an Excel file into a DataFrame using a detected header row instead
-    of blindly assuming row 0. CSV files don't have this problem (no merged
-    title rows in practice), so this is Excel-only; callers should use
-    pd.read_csv directly for .csv files.
+    of blindly assuming row 0 — and, where present, merges a directly-below
+    sub-header row into the column names (see _build_column_names). CSV files
+    don't have either problem in practice, so this is Excel-only; callers
+    should use pd.read_csv directly for .csv files.
     """
-    header_row = detect_header_row(excel_file)
+    header_row_idx = detect_header_row(excel_file)
+
+    # Read just enough rows raw (no header) to inspect the header + potential
+    # sub-header row and build correct column names.
     excel_file.seek(0)
-    df = pd.read_excel(excel_file, sheet_name=0, header=header_row)
+    header_probe = pd.read_excel(excel_file, sheet_name=0, header=None, nrows=header_row_idx + 2)
     excel_file.seek(0)
+
+    columns, used_subheader = _build_column_names(header_probe, header_row_idx)
+
+    data_start_row = header_row_idx + (2 if used_subheader else 1)
+    df = pd.read_excel(excel_file, sheet_name=0, header=None, skiprows=data_start_row)
+    excel_file.seek(0)
+
+    # Guard against a width mismatch (shouldn't normally happen, but a
+    # malformed sheet with inconsistent row widths could theoretically cause
+    # one) rather than crashing with a confusing pandas error.
+    if len(df.columns) != len(columns):
+        columns = columns[:len(df.columns)] + [f"Unnamed: {i}" for i in range(len(columns), len(df.columns))]
+
+    df.columns = columns
     return df
 
 
