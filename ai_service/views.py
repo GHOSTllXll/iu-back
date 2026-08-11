@@ -43,6 +43,7 @@ from .analysis_cache import store_analysis, get_cached_analysis
 TIER_BASIC = 'basic'
 TIER_PROFESSIONAL = 'professional'
 TIER_ENTERPRISE = 'enterprise'
+TIER_TRIAL = 'trial'
 
 # Tiers entitled to the 33rd metric (DST / Capex Budget). Basic stays at 32.
 TIERS_WITH_DST_CAPEX = {TIER_PROFESSIONAL, TIER_ENTERPRISE}
@@ -78,6 +79,7 @@ TIER_UPLOAD_LIMITS = {
     TIER_BASIC: 50,
     TIER_PROFESSIONAL: 150,
     TIER_ENTERPRISE: 500,
+    TIER_TRIAL: 1,
 }
 
 QUOTA_WINDOW_DAYS = 30

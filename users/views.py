@@ -12,7 +12,7 @@ from django.utils import timezone
 from datetime import timedelta
 
 from .utils import log_activity
-from .models import CustomUser, Organization, ActivityLog
+from .models import CustomUser, Organization, ActivityLog, SystemMessage
 from .serializers import LoginSerializer, UserSerializer, AdminCreateUserSerializer, OrganizationSerializer, ActivityLogSerializer
 
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
@@ -20,6 +20,11 @@ from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.core.mail import send_mail
 from django.conf import settings
+
+from rest_framework.throttling import AnonRateThrottle, SimpleRateThrottle
+
+import secrets
+import string
 
 # Add this near the top level (module scope), alongside the other module-level
 # objects — reused across both views below.
@@ -387,7 +392,48 @@ class AdminUpdateOrganizationPlanView(APIView):
         serializer = OrganizationSerializer(org)
         return Response(serializer.data)
 
+class PasswordResetIPThrottle(AnonRateThrottle):
+    """
+    Caps how many reset REQUESTS a single IP can make, regardless of which
+    email(s) they're targeting. Stops one source from hammering the endpoint.
+    """
+    scope = 'password_reset_ip'
+ 
+ 
+class PasswordResetEmailThrottle(SimpleRateThrottle):
+    """
+    Caps how many reset requests can be made FOR A GIVEN EMAIL, regardless of
+    which IP they come from. This is the layer that matters most here — an
+    attacker rotating IPs (or using a botnet) could bypass IP-based throttling
+    entirely, but flooding one specific person's inbox with reset emails
+    still gets capped by this, since it's keyed on the target email itself.
+    """
+    scope = 'password_reset_email'
+ 
+    def get_cache_key(self, request, view):
+        email = request.data.get('email', '').strip().lower()
+        if not email:
+            # No email in the request — nothing to throttle on. The view's
+            # own validation (email is required) handles this case; this
+            # throttle just has nothing to key against.
+            return None
+        return self.cache_format % {
+            'scope': self.scope,
+            'ident': email,
+        }
+ 
+ 
+class PasswordResetConfirmThrottle(AnonRateThrottle):
+    """
+    Caps how many CONFIRM attempts (the uid/token/new_password step) a single
+    IP can make. Tokens are cryptographically infeasible to brute-force, so
+    this is defense-in-depth against automated retry spam, not a load-bearing
+    security control on its own.
+    """
+    scope = 'password_reset_confirm_ip'
+
 class PasswordResetRequestView(APIView):
+    throttle_classes = [PasswordResetIPThrottle, PasswordResetEmailThrottle]
     """
     Public endpoint (no auth required) — the "Forgot password?" flow's first
     step. Takes an email, and IF a matching active user exists, emails them a
@@ -446,6 +492,7 @@ class PasswordResetRequestView(APIView):
 
 
 class PasswordResetConfirmView(APIView):
+    throttle_classes = [PasswordResetConfirmThrottle]
     """
     Public endpoint (no auth required) — the "Forgot password?" flow's second
     step. Takes the uid/token from the emailed link plus a new password, and
@@ -495,3 +542,203 @@ class PasswordResetConfirmView(APIView):
         )
 
         return Response({'detail': 'Password reset successfully. You can now log in with your new password.'})
+
+class AdminCreateMessageView(APIView):
+    """
+    Admin posts a new announcement. Auto-expires 30 days from now
+    (SystemMessage.save() sets expires_at automatically).
+    URL: POST /api/admin/messages/
+    """
+    permission_classes = [IsAuthenticated]
+ 
+    def post(self, request):
+        if not request.user.is_admin:
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+ 
+        message_text = request.data.get('message', '').strip()
+        message_type = request.data.get('message_type', 'info')
+ 
+        if not message_text:
+            return Response({'detail': 'Message text is required.'}, status=status.HTTP_400_BAD_REQUEST)
+ 
+        if message_type not in dict(SystemMessage.MESSAGE_TYPE_CHOICES):
+            return Response({'detail': 'Invalid message type.'}, status=status.HTTP_400_BAD_REQUEST)
+ 
+        msg = SystemMessage.objects.create(
+            message=message_text,
+            message_type=message_type,
+            created_by=request.user,
+        )
+ 
+        return Response({
+            'id': msg.id,
+            'message': msg.message,
+            'message_type': msg.message_type,
+            'created_at': msg.created_at.isoformat(),
+            'expires_at': msg.expires_at.isoformat(),
+        }, status=status.HTTP_201_CREATED)
+ 
+ 
+class AdminMessageListView(APIView):
+    """
+    Admin's own management view — ALL messages (active, inactive, expired),
+    newest first, so the admin can see history and take early action.
+    URL: GET /api/admin/messages/
+    """
+    permission_classes = [IsAuthenticated]
+ 
+    def get(self, request):
+        if not request.user.is_admin:
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+ 
+        now = timezone.now()
+        messages = SystemMessage.objects.all()[:100]  # reasonable cap
+ 
+        return Response([
+            {
+                'id': m.id,
+                'message': m.message,
+                'message_type': m.message_type,
+                'created_at': m.created_at.isoformat(),
+                'expires_at': m.expires_at.isoformat(),
+                'is_active': m.is_active,
+                'is_expired': m.expires_at <= now,
+                'posted_by': m.created_by.email if m.created_by else 'Unknown',
+            }
+            for m in messages
+        ])
+ 
+ 
+class AdminDeactivateMessageView(APIView):
+    """
+    Admin takes a message down early, before its natural 30-day expiry.
+    Soft-deactivation (is_active=False), not a hard delete — keeps the
+    record around for the admin's own history view.
+    URL: PATCH /api/admin/messages/<id>/deactivate/
+    """
+    permission_classes = [IsAuthenticated]
+ 
+    def patch(self, request, message_id):
+        if not request.user.is_admin:
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+ 
+        try:
+            msg = SystemMessage.objects.get(id=message_id)
+        except SystemMessage.DoesNotExist:
+            return Response({'detail': 'Message not found.'}, status=status.HTTP_404_NOT_FOUND)
+ 
+        msg.is_active = False
+        msg.save(update_fields=['is_active'])
+ 
+        return Response({'detail': 'Message removed.'})
+ 
+ 
+class ActiveMessagesView(APIView):
+    """
+    Any authenticated user (not just admins) — the messages actually shown
+    in the sidebar. Only active, unexpired messages, newest first.
+    URL: GET /api/messages/active/
+    """
+    permission_classes = [IsAuthenticated]
+ 
+    def get(self, request):
+        now = timezone.now()
+        messages = SystemMessage.objects.filter(is_active=True, expires_at__gt=now)[:10]
+ 
+        return Response([
+            {
+                'id': m.id,
+                'message': m.message,
+                'message_type': m.message_type,
+                'created_at': m.created_at.isoformat(),
+            }
+            for m in messages
+        ])
+
+def generate_temp_password(length: int = 12) -> str:
+    """Generates a random, readable temp password for trial account handoff."""
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+ 
+ 
+class AdminCreateTrialAccountView(APIView):
+    """
+    Creates a temporary trial account: a dedicated Organization (is_trial=True,
+    subscription_plan='trial') plus one CustomUser under it. The user is
+    capped to exactly 1 analysis via TIER_UPLOAD_LIMITS in ai_service/views.py
+    (trial org still needs to exist for quota enforcement to apply — a user
+    with organization=None bypasses quota checks entirely, which is how the
+    system admin account works, so trial users need their own org).
+ 
+    The whole org+user gets hard-deleted once trial_expires_at passes,
+    regardless of usage — see cleanup_expired_trials management command.
+ 
+    Returns the generated password ONCE, in this response — it is never
+    stored in plaintext or retrievable again afterward. Share it with the
+    prospective client directly (call, email, etc.) — this endpoint does not
+    email it automatically.
+    URL: POST /api/admin/create-trial/
+    """
+    permission_classes = [IsAuthenticated]
+ 
+    TRIAL_DURATION_HOURS = 24
+ 
+    def post(self, request):
+        if not request.user.is_admin:
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+ 
+        email = request.data.get('email', '').strip()
+        first_name = request.data.get('first_name', '').strip()
+        last_name = request.data.get('last_name', '').strip()
+ 
+        if not all([email, first_name, last_name]):
+            return Response(
+                {'detail': 'first_name, last_name, and email are all required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+ 
+        if CustomUser.objects.filter(email=email).exists():
+            return Response({'detail': 'A user with this email already exists.'}, status=status.HTTP_400_BAD_REQUEST)
+ 
+        org_name = f"Trial - {first_name} {last_name}"
+        expires_at = timezone.now() + timedelta(hours=self.TRIAL_DURATION_HOURS)
+ 
+        org = Organization.objects.create(
+            name=org_name,
+            primary_contact_name=first_name,
+            primary_contact_surname=last_name,
+            primary_email=email,
+            subscription_plan='trial',
+            team_size_limit=1,
+            account_status='active',
+            is_paid=False,
+            is_trial=True,
+            trial_expires_at=expires_at,
+        )
+ 
+        temp_password = generate_temp_password()
+ 
+        user = CustomUser.objects.create_user(
+            email=email,
+            first_name=first_name,
+            last_name=last_name,
+            password=temp_password,
+            organization=org,
+            role='member',
+        )
+ 
+        log_activity(
+            user=request.user,
+            action='CREATE_USER',
+            target=user.email,
+            details=f"Created trial account, expires {expires_at.isoformat()}",
+            ip_address=request.META.get('REMOTE_ADDR')
+        )
+ 
+        return Response({
+            'detail': f'Trial account created for {email}.',
+            'email': user.email,
+            'temp_password': temp_password,
+            'expires_at': expires_at.isoformat(),
+            'organization_id': org.id,
+        }, status=status.HTTP_201_CREATED)

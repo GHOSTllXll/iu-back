@@ -3,7 +3,9 @@ from django.urls import path, include
 from .views import (LoginView, LogoutView, CurrentUserView, AdminCreateUserView, AdminOrganizationsView,
                     AdminOrganizationUsersView, AdminToggleUserStatusView, AdminToggleOrganizationStatusView, AdminDeleteOrganizationView,
                     AdminDeleteUserView, AdminActiveUsersCountView, AdminActivityLogView, AdminUpdateOrganizationPlanView,
-                    PasswordResetRequestView, PasswordResetConfirmView)
+                    PasswordResetRequestView, PasswordResetConfirmView,
+                    AdminCreateMessageView, AdminMessageListView, AdminDeactivateMessageView, ActiveMessagesView,
+                    AdminCreateTrialAccountView)
 from ai_service.urls import urlpatterns as ai_urls
 
 urlpatterns = [
@@ -12,11 +14,11 @@ urlpatterns = [
 
     path('auth/user/', CurrentUserView.as_view(), name='current_user'),
 
-    # Forgot password flow — both public, no auth required
     path('auth/password-reset/request/', PasswordResetRequestView.as_view(), name='password_reset_request'),
     path('auth/password-reset/confirm/', PasswordResetConfirmView.as_view(), name='password_reset_confirm'),
 
     path('admin/create-user/', AdminCreateUserView.as_view(), name='admin_create_user'),
+    path('admin/create-trial/', AdminCreateTrialAccountView.as_view(), name='admin_create_trial'),
     path('admin/organizations/', AdminOrganizationsView.as_view(), name='admin_organizations'),
 
     path('admin/organizations/<int:org_id>/users/', AdminOrganizationUsersView.as_view(), name='admin_org_users'),
@@ -33,6 +35,11 @@ urlpatterns = [
 
     path('admin/organizations/<int:org_id>/update-plan/', AdminUpdateOrganizationPlanView.as_view(), name='admin_update_org_plan'),
 
-    path('ai/', include(ai_urls)),  # Include AI service URLs
+    path('admin/messages/', AdminMessageListView.as_view(), name='admin_message_list'),
+    path('admin/messages/create/', AdminCreateMessageView.as_view(), name='admin_message_create'),
+    path('admin/messages/<int:message_id>/deactivate/', AdminDeactivateMessageView.as_view(), name='admin_message_deactivate'),
+    path('messages/active/', ActiveMessagesView.as_view(), name='active_messages'),
+
+    path('ai/', include(ai_urls)),
 
 ]

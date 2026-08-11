@@ -142,6 +142,11 @@ REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'users.authentication.CookieJWTAuthentication',
     ),
+        'DEFAULT_THROTTLE_RATES': {
+        'password_reset_ip': '5/hour',
+        'password_reset_email': '3/hour',
+        'password_reset_confirm_ip': '10/hour',
+    }
 }
 
 from datetime import timedelta

@@ -1,6 +1,8 @@
 # users/models.py
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
 from django.db import models
+from django.utils import timezone
+from datetime import timedelta
 
 class OrganizationManager(models.Manager):
     pass
@@ -10,12 +12,21 @@ class Organization(models.Model):
         ('basic', 'Basic'),
         ('professional', 'Professional'),
         ('enterprise', 'Enterprise'),
+        ('trial', 'Trial')
     ]
     STATUS_CHOICES = [
         ('active', 'Active'),
         ('pending', 'Pending'),
         ('inactive', 'Inactive'),
     ]
+
+    is_trial = models.BooleanField(default=False)
+    trial_expires_at = models.DateTimeField(null=True, blank=True)
+    # is_trial + trial_expires_at together drive the temp-account lifecycle:
+    # a trial org's user gets exactly 1 analysis (via TIER_UPLOAD_LIMITS —
+    # see ai_service/views.py), and the whole org+user gets hard-deleted by
+    # the cleanup_expired_trials management command once trial_expires_at
+    # passes, regardless of whether they ever used their one analysis.
 
     name = models.CharField(max_length=255, unique=True)
     primary_contact_name = models.CharField(max_length=100)
@@ -122,3 +133,49 @@ class ActivityLog(models.Model):
 
     def __str__(self):
         return f"{self.action} - {self.target} by {self.user.email if self.user else 'System'}"
+
+class SystemMessage(models.Model):
+    """
+    Admin-posted announcements shown to every user (e.g. maintenance
+    windows, upcoming changes). Displayed in the dashboard sidebar, per the
+    design decision — not a dismissible top banner.
+ 
+    Lifecycle: auto-expires 30 days after posting (expires_at is set once,
+    at creation, and never changes), but an admin can also take a message
+    down early via is_active — e.g. once the maintenance window has already
+    passed. A message is only shown to users when BOTH is_active=True AND
+    expires_at is still in the future.
+    """
+    MESSAGE_TYPE_CHOICES = [
+        ('info', 'Info'),
+        ('warning', 'Warning'),
+        ('critical', 'Critical'),
+    ]
+ 
+    MESSAGE_LIFETIME_DAYS = 30
+ 
+    message = models.TextField()
+    message_type = models.CharField(max_length=20, choices=MESSAGE_TYPE_CHOICES, default='info')
+ 
+    created_by = models.ForeignKey(
+        CustomUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='posted_messages'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(editable=False)
+ 
+    is_active = models.BooleanField(default=True)  # lets an admin remove it before natural expiry
+ 
+    class Meta:
+        ordering = ['-created_at']
+ 
+    def save(self, *args, **kwargs):
+        if not self.expires_at:
+            self.expires_at = timezone.now() + timedelta(days=self.MESSAGE_LIFETIME_DAYS)
+        super().save(*args, **kwargs)
+ 
+    def __str__(self):
+        return f"[{self.message_type}] {self.message[:50]} (posted {self.created_at.date()})"
