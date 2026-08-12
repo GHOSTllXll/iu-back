@@ -106,7 +106,15 @@ def get_quota_window_end(organization):
 
 
 def get_period_usage(organization) -> int:
-    """Successful analyses recorded within the CURRENT quota cycle."""
+    """
+    Successful analyses recorded within the CURRENT quota cycle.
+ 
+    DELIBERATELY does not filter is_deleted — a report a user has since
+    "deleted" (soft-deleted, hidden from their own Outputs page) still
+    permanently counts against the quota cycle it was created in. Filtering
+    this would let a user delete a report to immediately regain an upload,
+    which defeats the entire purpose of quota enforcement.
+    """
     from .models import AnalysisReport
     window_start = get_quota_window_start(organization)
     return AnalysisReport.objects.filter(organization=organization, created_at__gte=window_start).count()
@@ -924,39 +932,36 @@ class DocumentUploadView(APIView):
 class DocumentHistoryView(APIView):
     """
     Powers the Documents page: live stats + the list of processed documents
-    for the requesting user's organization. Files themselves are never stored
-    — this is metadata only (name, type, status, size, timestamp).
+    for the requesting user's organization. Excludes soft-deleted records —
+    see ProcessedDocumentDeleteView / is_deleted field notes.
     URL: GET /api/ai/documents/?search=<optional>
     """
     permission_classes = [IsAuthenticated]
-
+ 
     def get(self, request):
         from .models import ProcessedDocument
-
+ 
         organization = get_user_organization(request)
         if organization is None:
             return Response({
                 'stats': {'total': 0, 'completed': 0, 'processing': 0, 'failed': 0},
                 'documents': []
             })
-
-        queryset = ProcessedDocument.objects.filter(organization=organization)
-
+ 
+        queryset = ProcessedDocument.objects.filter(organization=organization, is_deleted=False)
+ 
         search = request.query_params.get('search', '').strip()
         if search:
             queryset = queryset.filter(file_name__icontains=search)
-
-        # Stats are computed from the FULL org history (not filtered by search),
-        # so the stat cards reflect the org's overall state regardless of what
-        # the user is currently searching for.
-        all_docs = ProcessedDocument.objects.filter(organization=organization)
+ 
+        all_docs = ProcessedDocument.objects.filter(organization=organization, is_deleted=False)
         stats = {
             'total': all_docs.count(),
             'completed': all_docs.filter(status='completed').count(),
             'processing': all_docs.filter(status='processing').count(),
             'failed': all_docs.filter(status='failed').count(),
         }
-
+ 
         documents = [
             {
                 'id': doc.id,
@@ -967,32 +972,34 @@ class DocumentHistoryView(APIView):
                 'uploaded_at': doc.uploaded_at.isoformat(),
                 'size_bytes': doc.file_size_bytes,
             }
-            for doc in queryset[:200]  # reasonable cap — pagination can be added later if needed
+            for doc in queryset[:200]
         ]
-
+ 
         return Response({'stats': stats, 'documents': documents})
 
 
 class AnalysisReportListView(APIView):
     """
-    Powers the Outputs page card grid: one card per completed analysis.
+    Powers the Outputs page card grid. Excludes soft-deleted reports — but
+    note this is DISPLAY only. Quota counting (get_period_usage) deliberately
+    does NOT use this same filtering — see is_deleted field notes.
     URL: GET /api/ai/reports/?search=<optional>
     """
     permission_classes = [IsAuthenticated]
-
+ 
     def get(self, request):
         from .models import AnalysisReport
-
+ 
         organization = get_user_organization(request)
         if organization is None:
             return Response({'reports': []})
-
-        queryset = AnalysisReport.objects.filter(organization=organization)
-
+ 
+        queryset = AnalysisReport.objects.filter(organization=organization, is_deleted=False)
+ 
         search = request.query_params.get('search', '').strip()
         if search:
             queryset = queryset.filter(property_name__icontains=search)
-
+ 
         reports = [
             {
                 'id': report.id,
@@ -1003,35 +1010,56 @@ class AnalysisReportListView(APIView):
             }
             for report in queryset[:200]
         ]
-
+ 
         return Response({'reports': reports})
 
 
 class AnalysisReportDetailView(APIView):
     """
-    Returns the full stored metrics JSON for one report, for the Preview modal.
-    URL: GET /api/ai/reports/<id>/
+    GET returns the full stored metrics JSON for Preview — 404s if the report
+    doesn't exist OR has been soft-deleted (deleted = fully gone from the
+    user's perspective, even via direct ID).
+    DELETE soft-deletes (is_deleted=True) rather than removing the row —
+    CRITICAL: this row still counts toward upload quota for its cycle
+    regardless of this flag. See get_period_usage() and is_deleted notes.
+    URL: GET/DELETE /api/ai/reports/<id>/
     """
     permission_classes = [IsAuthenticated]
-
+ 
     def get(self, request, report_id):
         from .models import AnalysisReport
-
+ 
         organization = get_user_organization(request)
         if organization is None:
             return Response({'error': 'No organization associated with this account.'}, status=status.HTTP_404_NOT_FOUND)
-
+ 
         try:
-            report = AnalysisReport.objects.get(id=report_id, organization=organization)
+            report = AnalysisReport.objects.get(id=report_id, organization=organization, is_deleted=False)
         except AnalysisReport.DoesNotExist:
             return Response({'error': 'Report not found.'}, status=status.HTTP_404_NOT_FOUND)
-
+ 
         return Response({
             'id': report.id,
             'title': report.property_name or 'Untitled Property',
             'metrics': report.metrics,
             'created_at': report.created_at.isoformat(),
         })
+ 
+    def delete(self, request, report_id):
+        from .models import AnalysisReport
+ 
+        organization = get_user_organization(request)
+        if organization is None:
+            return Response({'error': 'No organization associated with this account.'}, status=status.HTTP_403_FORBIDDEN)
+ 
+        try:
+            report = AnalysisReport.objects.get(id=report_id, organization=organization, is_deleted=False)
+        except AnalysisReport.DoesNotExist:
+            return Response({'error': 'Report not found.'}, status=status.HTTP_404_NOT_FOUND)
+ 
+        report.is_deleted = True
+        report.save(update_fields=['is_deleted'])
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class DashboardStatsView(APIView):
@@ -1066,7 +1094,7 @@ class DashboardStatsView(APIView):
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         yesterday_start = today_start - timedelta(days=1)
 
-        all_docs = ProcessedDocument.objects.filter(organization=organization)
+        all_docs = ProcessedDocument.objects.filter(organization=organization, is_deleted=False)
         completed_docs = all_docs.filter(status='completed')
         failed_docs = all_docs.filter(status='failed')
 
@@ -1084,7 +1112,8 @@ class DashboardStatsView(APIView):
 
         avg_processing_seconds = AnalysisReport.objects.filter(
             organization=organization,
-            processing_seconds__isnull=False
+            processing_seconds__isnull=False,
+            is_deleted=False
         ).aggregate(avg=Avg('processing_seconds'))['avg']
 
         limit = TIER_UPLOAD_LIMITS.get(tier, TIER_UPLOAD_LIMITS[TIER_BASIC])
@@ -1104,3 +1133,31 @@ class DashboardStatsView(APIView):
                 'resets_at': resets_at.isoformat(),
             },
         })
+
+class ProcessedDocumentDeleteView(APIView):
+    """
+    Soft-deletes a document-history record (sets is_deleted=True, does not
+    actually remove the row). Purely cosmetic/informational — ProcessedDocument
+    has no quota implication, unlike AnalysisReport — but kept consistent
+    with the same pattern for predictability and so "Documents Processed"
+    stats don't shrink confusingly out from under a user's own actions in a
+    way that looks like real historical data was lost.
+    URL: DELETE /api/ai/documents/<id>/
+    """
+    permission_classes = [IsAuthenticated]
+ 
+    def delete(self, request, document_id):
+        from .models import ProcessedDocument
+ 
+        organization = get_user_organization(request)
+        if organization is None:
+            return Response({'error': 'No organization associated with this account.'}, status=status.HTTP_403_FORBIDDEN)
+ 
+        try:
+            doc = ProcessedDocument.objects.get(id=document_id, organization=organization, is_deleted=False)
+        except ProcessedDocument.DoesNotExist:
+            return Response({'error': 'Document not found.'}, status=status.HTTP_404_NOT_FOUND)
+ 
+        doc.is_deleted = True
+        doc.save(update_fields=['is_deleted'])
+        return Response(status=status.HTTP_204_NO_CONTENT)

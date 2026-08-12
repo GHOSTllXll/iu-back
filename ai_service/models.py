@@ -41,6 +41,7 @@ class ProcessedDocument(models.Model):
         related_name='processed_documents'
     )
 
+    is_deleted = models.BooleanField(default=False)
     file_name = models.CharField(max_length=255)
     document_type = models.CharField(max_length=20, choices=DOCUMENT_TYPE_CHOICES)
     file_format = models.CharField(max_length=10)  # e.g. 'PDF', 'Excel', 'Word', 'CSV'
@@ -95,6 +96,7 @@ class AnalysisReport(models.Model):
         related_name='analysis_reports'
     )
 
+    is_deleted = models.BooleanField(default=False)
     property_name = models.CharField(max_length=255, blank=True, default='')
     tier = models.CharField(max_length=20)
     metrics = models.JSONField()

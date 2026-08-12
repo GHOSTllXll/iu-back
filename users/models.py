@@ -179,3 +179,55 @@ class SystemMessage(models.Model):
  
     def __str__(self):
         return f"[{self.message_type}] {self.message[:50]} (posted {self.created_at.date()})"
+
+class IssueReport(models.Model):
+    """
+    User-submitted issue reports, reviewed by the admin on a dedicated
+    /admin/issues page. Mirror image of SystemMessage (that's admin -> users,
+    this is users -> admin).
+ 
+    v1 scope: submit + admin views + admin marks resolved. No in-app reply/
+    threading — if the admin needs to respond, that happens outside the
+    platform (email, call, etc.), same as trial account credential handoff.
+    """
+    CATEGORY_CHOICES = [
+        ('bug', 'Bug'),
+        ('question', 'Question'),
+        ('feature_request', 'Feature Request'),
+    ]
+ 
+    STATUS_CHOICES = [
+        ('open', 'Open'),
+        ('resolved', 'Resolved'),
+    ]
+ 
+    reported_by = models.ForeignKey(
+        CustomUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='issue_reports'
+    )
+    # Denormalized (not just derived via reported_by.organization) so the
+    # report still shows which org it came from even if the user is later
+    # deleted — same reasoning as ProcessedDocument/AnalysisReport.
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='issue_reports'
+    )
+ 
+    category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, default='bug')
+    description = models.TextField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='open')
+ 
+    created_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+ 
+    class Meta:
+        ordering = ['-created_at']
+ 
+    def __str__(self):
+        return f"[{self.category}] {self.description[:50]} ({self.status})"

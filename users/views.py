@@ -12,7 +12,7 @@ from django.utils import timezone
 from datetime import timedelta
 
 from .utils import log_activity
-from .models import CustomUser, Organization, ActivityLog, SystemMessage
+from .models import CustomUser, Organization, ActivityLog, SystemMessage, IssueReport
 from .serializers import LoginSerializer, UserSerializer, AdminCreateUserSerializer, OrganizationSerializer, ActivityLogSerializer
 
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
@@ -96,22 +96,33 @@ class LoginView(APIView):
         return response
 
 class LogoutView(APIView):
-    permission_classes = [IsAuthenticated]
-    
+    # Deliberately NOT IsAuthenticated. Logout's entire job is clearing
+    # cookies — it shouldn't require a still-valid token to do that. If it
+    # did, an expired-token session could never successfully log out at all
+    # (the 401 from the auth check would block the request before it ever
+    # reached this view), leaving the user stuck with dead cookies and no
+    # way to clear them except manually.
+    permission_classes = []
+ 
     def post(self, request):
         response = Response({'detail': 'Logged out successfully'})
-        # Delete the cookies
         response.delete_cookie('access_token', path='/')
         response.delete_cookie('refresh_token', path='/')
-
-        log_activity(
-            user=request.user, 
-            action='LOGOUT', 
-            target=request.user.email,
-            ip_address=request.META.get('REMOTE_ADDR')
-        )
-
+ 
+        # Only log the activity if we actually have a valid, authenticated
+        # user — with permission_classes=[] this endpoint can now be hit
+        # with an expired/missing token too, in which case request.user is
+        # AnonymousUser and there's nothing meaningful to log.
+        if request.user and request.user.is_authenticated:
+            log_activity(
+                user=request.user,
+                action='LOGOUT',
+                target=request.user.email,
+                ip_address=request.META.get('REMOTE_ADDR')
+            )
+ 
         return response
+ 
 
 class CurrentUserView(APIView):
     permission_classes = [IsAuthenticated]
@@ -742,3 +753,90 @@ class AdminCreateTrialAccountView(APIView):
             'expires_at': expires_at.isoformat(),
             'organization_id': org.id,
         }, status=status.HTTP_201_CREATED)
+
+class UserReportIssueView(APIView):
+    """
+    Any authenticated user submits an issue report.
+    URL: POST /api/issues/report/
+    """
+    permission_classes = [IsAuthenticated]
+ 
+    def post(self, request):
+        category = request.data.get('category', 'bug')
+        description = request.data.get('description', '').strip()
+ 
+        if not description:
+            return Response({'detail': 'Description is required.'}, status=status.HTTP_400_BAD_REQUEST)
+ 
+        if category not in dict(IssueReport.CATEGORY_CHOICES):
+            return Response({'detail': 'Invalid category.'}, status=status.HTTP_400_BAD_REQUEST)
+ 
+        IssueReport.objects.create(
+            reported_by=request.user,
+            organization=getattr(request.user, 'organization', None),
+            category=category,
+            description=description,
+        )
+ 
+        return Response({'detail': "Thanks — your report has been received."}, status=status.HTTP_201_CREATED)
+ 
+ 
+class AdminIssueListView(APIView):
+    """
+    Admin's issue review page — all reports, newest first.
+    URL: GET /api/admin/issues/
+    """
+    permission_classes = [IsAuthenticated]
+ 
+    def get(self, request):
+        if not request.user.is_admin:
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+ 
+        issues = IssueReport.objects.all()[:200]
+ 
+        return Response([
+            {
+                'id': i.id,
+                'category': i.category,
+                'category_display': i.get_category_display(),
+                'description': i.description,
+                'status': i.status,
+                'reported_by': i.reported_by.email if i.reported_by else 'Unknown (deleted)',
+                'organization': i.organization.name if i.organization else 'Unknown',
+                'created_at': i.created_at.isoformat(),
+                'resolved_at': i.resolved_at.isoformat() if i.resolved_at else None,
+            }
+            for i in issues
+        ])
+ 
+ 
+class AdminToggleIssueStatusView(APIView):
+    """
+    Toggles an issue between open and resolved.
+    URL: PATCH /api/admin/issues/<id>/toggle-status/
+    """
+    permission_classes = [IsAuthenticated]
+ 
+    def patch(self, request, issue_id):
+        if not request.user.is_admin:
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+ 
+        try:
+            issue = IssueReport.objects.get(id=issue_id)
+        except IssueReport.DoesNotExist:
+            return Response({'detail': 'Issue not found.'}, status=status.HTTP_404_NOT_FOUND)
+ 
+        if issue.status == 'open':
+            issue.status = 'resolved'
+            issue.resolved_at = timezone.now()
+        else:
+            issue.status = 'open'
+            issue.resolved_at = None
+ 
+        issue.save(update_fields=['status', 'resolved_at'])
+ 
+        return Response({
+            'id': issue.id,
+            'status': issue.status,
+            'resolved_at': issue.resolved_at.isoformat() if issue.resolved_at else None,
+        })

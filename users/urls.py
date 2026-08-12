@@ -5,7 +5,8 @@ from .views import (LoginView, LogoutView, CurrentUserView, AdminCreateUserView,
                     AdminDeleteUserView, AdminActiveUsersCountView, AdminActivityLogView, AdminUpdateOrganizationPlanView,
                     PasswordResetRequestView, PasswordResetConfirmView,
                     AdminCreateMessageView, AdminMessageListView, AdminDeactivateMessageView, ActiveMessagesView,
-                    AdminCreateTrialAccountView)
+                    AdminCreateTrialAccountView,
+                    UserReportIssueView, AdminIssueListView, AdminToggleIssueStatusView)
 from ai_service.urls import urlpatterns as ai_urls
 
 urlpatterns = [
@@ -39,6 +40,11 @@ urlpatterns = [
     path('admin/messages/create/', AdminCreateMessageView.as_view(), name='admin_message_create'),
     path('admin/messages/<int:message_id>/deactivate/', AdminDeactivateMessageView.as_view(), name='admin_message_deactivate'),
     path('messages/active/', ActiveMessagesView.as_view(), name='active_messages'),
+
+    # Issue reports
+    path('issues/report/', UserReportIssueView.as_view(), name='user_report_issue'),
+    path('admin/issues/', AdminIssueListView.as_view(), name='admin_issue_list'),
+    path('admin/issues/<int:issue_id>/toggle-status/', AdminToggleIssueStatusView.as_view(), name='admin_toggle_issue_status'),
 
     path('ai/', include(ai_urls)),
 
