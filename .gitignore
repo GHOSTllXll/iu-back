@@ -1,0 +1,25 @@
+# Python / Django backend
+__pycache__/
+*.pyc
+*.pyo
+venv/
+env/
+.venv/
+*.sqlite3
+db.sqlite3
+staticfiles/
+media/
+
+# Logs
+logs
+*.log
+
+# Misc
+.DS_Store
+.fleet
+.idea
+
+# Local env files
+.env
+.env.*
+!.env.example

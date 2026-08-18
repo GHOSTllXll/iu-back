@@ -156,6 +156,9 @@ DEBT_ASSUMPTION_BOUNDS = {
     'ltv_pct': (0, 100),
     'interest_rate_pct': (0, 30),
     'amortization_years': (1, 50),
+    # purchase_price intentionally has NO upper bound here — just a sanity
+    # floor (must be positive). Handled separately below since it's required,
+    # not defaulted.
 }
 
 # Defaults if a field is somehow omitted (frontend pre-fills these, but don't
@@ -164,26 +167,31 @@ DEBT_ASSUMPTION_DEFAULTS = {
     'ltv_pct': 75.0,
     'interest_rate_pct': 7.0,
     'amortization_years': 30,
+    # No entry for purchase_price — it's required, not defaulted.
 }
 
 
 def _parse_debt_assumptions(request):
     """
-    Reads ltv_pct, interest_rate_pct, amortization_years from the request body,
-    validates they're sane numbers within reasonable bounds, and falls back to
-    defaults for anything missing or invalid.
+    Reads ltv_pct, interest_rate_pct, amortization_years, and purchase_price
+    from the request body. The first three fall back to sensible defaults if
+    omitted; purchase_price does NOT — it's required, since there's no safe
+    default for a deal-specific number. If the OM stated a price, the
+    frontend pre-fills this field with the AI's extracted value; if the user
+    edited it (or the OM stated none at all), whatever's in the field is
+    what's used here — no merging with the AI's original figure.
     Returns (assumptions_dict, error_response). error_response is None on success.
     """
     assumptions = {}
-
+ 
     for field, (low, high) in DEBT_ASSUMPTION_BOUNDS.items():
         raw_value = request.data.get(field)
         default = DEBT_ASSUMPTION_DEFAULTS[field]
-
+ 
         if raw_value is None or raw_value == '':
             assumptions[field] = default
             continue
-
+ 
         try:
             value = float(raw_value)
         except (TypeError, ValueError):
@@ -191,15 +199,44 @@ def _parse_debt_assumptions(request):
                 {'error': f"'{field}' must be a number, got '{raw_value}'."},
                 status=status.HTTP_400_BAD_REQUEST
             )
-
+ 
         if not (low <= value <= high):
             return None, Response(
                 {'error': f"'{field}' must be between {low} and {high}, got {value}."},
                 status=status.HTTP_400_BAD_REQUEST
             )
-
+ 
         assumptions[field] = value
-
+ 
+    # purchase_price: required, no default, no upper bound (just sanity floor)
+    raw_price = request.data.get('purchase_price')
+    if raw_price is None or raw_price == '':
+        return None, Response(
+            {
+                'error': "Target Purchase Price is required. The source documents "
+                         "didn't state one, or it wasn't confirmed — please enter "
+                         "your assumed purchase price before downloading.",
+                'missing_purchase_price': True,
+            },
+            status=status.HTTP_400_BAD_REQUEST
+        )
+ 
+    try:
+        price = float(raw_price)
+    except (TypeError, ValueError):
+        return None, Response(
+            {'error': f"'purchase_price' must be a number, got '{raw_price}'."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+ 
+    if price <= 0:
+        return None, Response(
+            {'error': "'purchase_price' must be greater than 0."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+ 
+    assumptions['purchase_price'] = price
+ 
     return assumptions, None
 
 
@@ -383,6 +420,12 @@ def enforce_tier_entitlements(metrics: dict, tier: str) -> dict:
 
 
 def extract_json_from_ai_response(ai_response: str) -> dict:
+    if not ai_response or not ai_response.strip():
+        raise FileValidationError(
+            "The AI returned an empty response. This can happen if the model's "
+            "thinking/reasoning consumed the entire token budget, or if the "
+            "request was refused. Try again, or check the AI provider's status."
+        )
     """
     Strips markdown fences if present, then extracts the first {...} block.
     """

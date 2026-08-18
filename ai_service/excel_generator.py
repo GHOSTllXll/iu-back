@@ -267,14 +267,19 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
     ws_t12.cell(row=capital_header_row, column=1, value="CAPITAL STRUCTURE").font = Font(bold=True, size=12)
 
     deal_valuation = metrics.get("deal_valuation", {})
-    purchase_price = deal_valuation.get("target_purchase_price")
+    purchase_price = debt_assumptions.get('purchase_price') 
     dst_capex = deal_valuation.get("dst_capex_budget")  # None for Basic tier — already stripped upstream
 
     purchase_price_row = capital_header_row + 1
     ws_t12.cell(row=purchase_price_row, column=1, value="Target Purchase Price")
-    pp_cell = ws_t12.cell(row=purchase_price_row, column=2, value=purchase_price if purchase_price is not None else "")
-    if isinstance(purchase_price, (int, float)):
-        pp_cell.number_format = '$#,##0.00'
+    pp_cell = ws_t12.cell(row=purchase_price_row, column=2, value=purchase_price)
+    pp_cell.number_format = '$#,##0.00'
+    pp_cell.comment = Comment(
+        "Confirmed purchase price used for this analysis — either extracted "
+        "from the Offering Memorandum, or manually entered/adjusted before "
+        "download if the source documents didn't state one.",
+        "Underwriting AI"
+    )
 
     total_acq_cost_row = purchase_price_row + 1
 

@@ -24,12 +24,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-88_=hj_cb02q!oaa+5o$6w0*9--vrj-unl2f00od=$*r11n1wd'
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-CHANGE-ME-IN-ENV')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.getenv('DJANGO_DEBUG', 'True') == 'True'
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [h.strip() for h in os.getenv('DJANGO_ALLOWED_HOSTS', '').split(',') if h.strip()]
 
 
 # Application definition
@@ -87,13 +87,32 @@ WSGI_APPLICATION = 'config.wsgi.application'
 
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
-
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+#
+# CHANGED: driven by env var. Local dev with no DB_ENGINE set keeps using
+# SQLite exactly as before — nothing changes for you locally unless you set
+# these. Production .env sets DB_ENGINE=mysql plus the connection details
+# from the database you create in cPanel.
+if os.getenv('DB_ENGINE') == 'mysql':
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.mysql',
+            'NAME': os.getenv('DB_NAME'),
+            'USER': os.getenv('DB_USER'),
+            'PASSWORD': os.getenv('DB_PASSWORD'),
+            'HOST': os.getenv('DB_HOST', 'localhost'),
+            'PORT': os.getenv('DB_PORT', '3306'),
+            'OPTIONS': {
+                'charset': 'utf8mb4',  # needed for full JSONField / emoji / special-char support
+            },
+        }
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
 
 
 # Password validation
@@ -131,10 +150,12 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
+_extra_cors_origins = [o.strip() for o in os.getenv('DJANGO_CORS_ORIGINS', '').split(',') if o.strip()]
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
-]
+] + _extra_cors_origins
 
 CORS_ALLOW_CREDENTIALS = True #for HttpOnly cookies
 
@@ -164,8 +185,8 @@ SIMPLE_JWT = {
 AUTH_USER_MODEL = 'users.CustomUser'
 
 # Security setting for cookies (Crucial for production)
-# SESSION_COOKIE_SECURE = True  # Uncomment in production (requires HTTPS)
-# CSRF_COOKIE_SECURE = True     # Uncomment in production (requires HTTPS)
+SESSION_COOKIE_SECURE = not DEBUG  # Uncomment in production (requires HTTPS)
+CSRF_COOKIE_SECURE = not DEBUG     # Uncomment in production (requires HTTPS)
 
 EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
 
@@ -175,9 +196,9 @@ EMAIL_PORT = 587
 
 EMAIL_USE_TLS = True
 
-EMAIL_HOST_USER = 'donovan@inboundunderwriting.com'
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', 'donovan@inboundunderwriting.com')
 
-EMAIL_HOST_PASSWORD = "yjrjlaawphphrkqv"
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD','')
 
 # AI Settings
 AI_PROVIDER = os.getenv('AI_PROVIDER', 'ollama')
@@ -185,4 +206,12 @@ OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
 OLLAMA_MODEL = os.getenv('OLLAMA_MODEL', 'qwen3:8b')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 OPENAI_MODEL = os.getenv('OPENAI_MODEL', 'gpt-4o')
-FRONTEND_BASE_URL = "http://localhost:3000"
+
+#Claude AI
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+ANTHROPIC_MODEL = os.environ.get('ANTHROPIC_MODEL', 'claude-sonnet-5')
+
+AI_MOCK_MODE = os.getenv('AI_MOCK_MODE', 'false')
+
+
+FRONTEND_BASE_URL = os.getenv('FRONTEND_BASE_URL', 'http://localhost:3000')

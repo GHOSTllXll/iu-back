@@ -161,12 +161,13 @@ class AIClient:
             return response.choices[0].message.content
 
         elif self.provider == 'anthropic':
-            # Anthropic's Messages API takes system prompt as a separate top-level
-            # param, not as a message with role "system" (unlike OpenAI/Ollama).
+            # Sonnet 5 deprecated manual sampling parameters — setting temperature
+            # to any non-default value now returns a 400 error, since the model
+            # uses adaptive thinking by default instead of manual sampling control.
+            # Omit it entirely rather than pass any value.
             response = self.client.messages.create(
                 model=settings.ANTHROPIC_MODEL,
-                max_tokens=4096,
-                temperature=0.2,
+                max_tokens=16384,
                 system=system_prompt,
                 messages=[
                     {"role": "user", "content": user_prompt}

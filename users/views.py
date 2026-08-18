@@ -78,7 +78,7 @@ class LoginView(APIView):
         # secure=False is for local dev. Change to True in production (requires HTTPS).
         cookie_kwargs = {
             'httponly': True,
-            'secure': False,
+            'secure': not settings.DEBUG,
             'samesite': 'Lax',
             'path': '/'
         }
