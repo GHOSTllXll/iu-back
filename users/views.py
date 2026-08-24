@@ -128,8 +128,10 @@ class CurrentUserView(APIView):
     permission_classes = [IsAuthenticated]
     
     def get(self, request):
-        # request.user is populated by our custom CookieJWTAuthentication
-        return Response(UserSerializer(request.user).data)
+        response = Response(UserSerializer(request.user).data)
+        response['Cache-Control'] = 'no-store, no-cache, must-revalidate, private'
+        response['Pragma'] = 'no-cache'
+        return response
 
 class AdminCreateUserView(APIView):
     permission_classes = [IsAuthenticated]
