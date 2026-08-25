@@ -1,6 +1,7 @@
 # backend/users/middleware.py
 from django.utils import timezone
 from django.contrib.auth.models import AnonymousUser
+from django.db import DatabaseError
 
 class ActiveUserMiddleware:
     def __init__(self, get_response):
@@ -9,11 +10,16 @@ class ActiveUserMiddleware:
     def __call__(self, request):
         response = self.get_response(request)
         
-        # Only update for authenticated users (ignore anonymous/public requests)
         if hasattr(request, 'user') and not request.user.is_anonymous:
-            # Update the last_active field
-            request.user.last_active = timezone.now()
-            request.user.save(update_fields=['last_active'])
+            try:
+                request.user.last_active = timezone.now()
+                request.user.save(update_fields=['last_active'])
+            except DatabaseError:
+                # Non-critical housekeeping field. If the DB connection went
+                # stale during a long-running request (e.g. a slow AI call
+                # exceeding MySQL's idle connection timeout), don't let this
+                # trivial update crash an otherwise-successful response.
+                pass
             
         return response
 
