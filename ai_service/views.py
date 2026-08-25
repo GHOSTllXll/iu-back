@@ -46,21 +46,21 @@ TIER_ENTERPRISE = 'enterprise'
 TIER_TRIAL = 'trial'
 
 # Tiers entitled to the 33rd metric (DST / Capex Budget). Basic stays at 32.
-TIERS_WITH_DST_CAPEX = {TIER_PROFESSIONAL, TIER_ENTERPRISE}
+TIERS_WITH_DST_CAPEX = {TIER_PROFESSIONAL, TIER_ENTERPRISE, TIER_TRIAL}
 
 # Module 1 (Cross-Document Reconciliation) is Enterprise-only.
-TIERS_WITH_RECONCILIATION = {TIER_ENTERPRISE}
+TIERS_WITH_RECONCILIATION = {TIER_ENTERPRISE, TIER_TRIAL}
 
 # Module 2 (Smart Standardization Mapping) is also Enterprise-only. Kept as a
 # separate named set from TIERS_WITH_RECONCILIATION even though it's currently
 # identical, in case Enterprise features ever diverge across sub-tiers later.
-TIERS_WITH_STANDARDIZATION = {TIER_ENTERPRISE}
+TIERS_WITH_STANDARDIZATION = {TIER_ENTERPRISE, TIER_TRIAL}
 
 # Module 4 (Source Provenance). Scoped to ONLY the two OM-derived fields that
 # genuinely need citation-based verification — see conversation for why full
 # per-metric provenance was deliberately not built (redundant for
 # formula-backed T12/Rent Roll numbers, and increases hallucination risk).
-TIERS_WITH_PROVENANCE = {TIER_ENTERPRISE}
+TIERS_WITH_PROVENANCE = {TIER_ENTERPRISE, TIER_TRIAL}
 
 
 # ==========================================
