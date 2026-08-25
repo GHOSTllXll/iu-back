@@ -37,6 +37,10 @@ from .document_history import record_processed_documents, record_analysis_report
 from .analysis_cache import store_analysis, get_cached_analysis
 
 
+import logging
+logger = logging.getLogger(__name__)
+
+
 # ==========================================
 # TIER CONFIGURATION
 # ==========================================
@@ -472,9 +476,11 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
     try:
         # 1. Parse documents
         om_text = extract_document_text(om_file)
+        t_after_om = time.perf_counter()
         t12_text = extract_t12_text(t12_file)
+        t_after_t12 = time.perf_counter()
         rent_roll_text = extract_data_from_excel(rent_roll_file)
-
+        t_after_rr_text = time.perf_counter()
         # 2. Parse Excel into DataFrame — uses header-row detection instead of
         #    blindly assuming row 0 (real rent rolls often have a title row
         #    above the actual column headers).
@@ -498,7 +504,6 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
             reshaped = reshape_charge_ledger(rent_roll_df, ledger_cols)
             if not reshaped.empty:
                 rent_roll_df = reshaped
-
         # 2b. Strip likely totals/summary rows (e.g. a trailing "Totals" row
         # with a SUM-of-all-units rent value that would otherwise corrupt
         # AVERAGE()-based metrics). Applied for every tier, not just
@@ -512,6 +517,8 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
                 f"totals/summary rows (rent value far above the median of other rows) — "
                 f"not counted as real units."
             )
+
+        t_after_rr_processing = time.perf_counter()
 
         combined_context = f"""
         OFFERING MEMORANDUM (OM) EXTRACT:
@@ -527,7 +534,9 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         system_prompt = _build_system_prompt(tier)
 
         # 3. Call the AI (or mock, if AI_MOCK_MODE is set)
+        t_before_ai = time.perf_counter()
         ai_response = get_ai_metrics(system_prompt, combined_context, tier)
+        t_after_ai = time.perf_counter()
 
         # 4. Parse + validate JSON
         metrics = extract_json_from_ai_response(ai_response)
@@ -563,6 +572,8 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
                     "note": f"Reconciliation could not run: {str(e)}"
                 }
 
+        t_after_module1 = time.perf_counter()
+
         # 6. Module 2 (Enterprise only): Smart Standardization Mapping.
         #    The AI reports any T12 line item it couldn't confidently map into
         #    a standard category, rather than guessing or silently dropping it.
@@ -591,6 +602,8 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
                 "uncategorized_total": round(uncategorized_total, 2),
             }
 
+        t_after_module2 = time.perf_counter()
+
         # 7. Module 4 (Enterprise only): Source Provenance — scoped to the two
         #    OM-derived fields that genuinely need citation (dst_capex_budget,
         #    om_claimed_occupancy_pct). NOT applied to every metric — see
@@ -612,6 +625,8 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
             if cleaned_citations:
                 metrics["provenance"] = cleaned_citations
 
+        t_after_module4 = time.perf_counter()
+
         # 8. Hard-enforce tier entitlements regardless of what the AI returned
         metrics = enforce_tier_entitlements(metrics, tier)
 
@@ -620,10 +635,36 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         if rent_roll_cleanup_note:
             metrics["data_quality_note"] = rent_roll_cleanup_note
 
+        # elapsed_seconds is measured BEFORE the DB writes below, matching
+        # the original behavior exactly — this is what powers the "Avg
+        # Processing" dashboard stat, so it must reflect actual pipeline
+        # processing time, not include the DB write itself.
         elapsed_seconds = time.perf_counter() - pipeline_start_time
+
+        t_before_db = time.perf_counter()
 
         record_processed_documents(organization, uploaded_by, om_file, t12_file, rent_roll_file, status='completed')
         record_analysis_report(organization, uploaded_by, metrics, tier, processing_seconds=elapsed_seconds)
+
+        t_after_db = time.perf_counter()
+
+        # TIMING BREAKDOWN — logged via the standard logging module so it
+        # reliably lands in passenger.log regardless of DEBUG setting.
+        # Temporary instrumentation to find where the "AI call takes ~100s
+        # but total request takes 5+ minutes" gap is actually coming from.
+        logger.warning(
+            f"TIMING BREAKDOWN — "
+            f"OM parse: {t_after_om - pipeline_start_time:.1f}s | "
+            f"T12 parse: {t_after_t12 - t_after_om:.1f}s | "
+            f"RentRoll text: {t_after_rr_text - t_after_t12:.1f}s | "
+            f"RentRoll DF processing (header/ledger/outlier): {t_after_rr_processing - t_after_rr_text:.1f}s | "
+            f"AI call: {t_after_ai - t_before_ai:.1f}s | "
+            f"Module 1 (Reconciliation): {t_after_module1 - t_after_ai:.1f}s | "
+            f"Module 2 (Standardization): {t_after_module2 - t_after_module1:.1f}s | "
+            f"Module 4 (Provenance): {t_after_module4 - t_after_module2:.1f}s | "
+            f"DB writes: {t_after_db - t_before_db:.1f}s | "
+            f"TOTAL (excl. DB writes): {elapsed_seconds:.1f}s"
+        )
 
         return metrics, rent_roll_df, None
 
