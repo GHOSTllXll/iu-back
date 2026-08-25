@@ -167,7 +167,7 @@ class AIClient:
             # Omit it entirely rather than pass any value.
             response = self.client.messages.create(
                 model=settings.ANTHROPIC_MODEL,
-                max_tokens=16384,
+                max_tokens=30384,
                 system=system_prompt,
                 messages=[
                     {"role": "user", "content": user_prompt}
