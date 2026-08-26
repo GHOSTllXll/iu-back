@@ -40,6 +40,9 @@ from .analysis_cache import store_analysis, get_cached_analysis
 import logging
 logger = logging.getLogger(__name__)
 
+from django.db import connection
+
+
 
 # ==========================================
 # TIER CONFIGURATION
@@ -537,6 +540,17 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         t_before_ai = time.perf_counter()
         ai_response = get_ai_metrics(system_prompt, combined_context, tier)
         t_after_ai = time.perf_counter()
+
+        # The AI call can take 1-2+ minutes. Any DB connection opened earlier
+        # in this request (e.g. the quota check at the top of this function)
+        # may have gone stale during that wait — same root cause as the
+        # earlier ActiveUserMiddleware fix, just a different DB write this
+        # time. This is Django's own recommended pattern for exactly this
+        # scenario: check connection health and silently open a fresh one
+        # if needed, BEFORE any further DB work happens in this request —
+        # protects every database write for the rest of the function, not
+        # just one specific spot.
+        connection.close_if_unusable_or_obsolete()
 
         # 4. Parse + validate JSON
         metrics = extract_json_from_ai_response(ai_response)
