@@ -545,12 +545,13 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         # in this request (e.g. the quota check at the top of this function)
         # may have gone stale during that wait — same root cause as the
         # earlier ActiveUserMiddleware fix, just a different DB write this
-        # time. This is Django's own recommended pattern for exactly this
-        # scenario: check connection health and silently open a fresh one
-        # if needed, BEFORE any further DB work happens in this request —
-        # protects every database write for the rest of the function, not
-        # just one specific spot.
-        connection.close_if_unusable_or_obsolete()
+        # time. Unconditionally closing here (rather than the conditional
+        # close_if_unusable_or_obsolete(), which never fires because Django
+        # has no way to know the idle connection went stale) forces a fresh
+        # connection to open automatically on the next query — protects
+        # every database write for the rest of the function, not just one
+        # specific spot.
+        connection.close()
 
         # 4. Parse + validate JSON
         metrics = extract_json_from_ai_response(ai_response)
