@@ -102,8 +102,13 @@ if os.getenv('DB_ENGINE') == 'mysql':
             'PASSWORD': os.getenv('DB_PASSWORD'),
             'HOST': os.getenv('DB_HOST', 'localhost'),
             'PORT': os.getenv('DB_PORT', '3306'),
+            # Never reuse connections across requests — shared-host MySQL
+            # (cPanel) often kills idle connections during long AI calls,
+            # which then surfaces as (2013) Lost connection / InterfaceError.
+            'CONN_MAX_AGE': 0,
             'OPTIONS': {
                 'charset': 'utf8mb4',  # needed for full JSONField / emoji / special-char support
+                'connect_timeout': 10,
             },
         }
     }

@@ -40,8 +40,35 @@ from .analysis_cache import store_analysis, get_cached_analysis
 import logging
 logger = logging.getLogger(__name__)
 
-from django.db import connection
+from django.db import connection, OperationalError, InterfaceError
 
+
+def _db_write_with_retry(fn):
+    """
+    Runs a DB write once; on a dead/stale MySQL connection (common after a
+    long AI call on shared hosting), closes the connection and retries once
+    so Django opens a fresh one. Non-connection errors are re-raised as-is.
+    """
+    try:
+        return fn()
+    except (OperationalError, InterfaceError) as e:
+        logger.warning(f"DB write failed on stale connection — retrying once: {e}")
+        connection.close()
+        return fn()
+
+
+def _safe_record_failure(organization, uploaded_by, om_file, t12_file, rent_roll_file):
+    """
+    Best-effort history write for failed analyses. Must NEVER raise — if the
+    original failure was itself a dead DB connection, recording 'failed' on
+    that same connection would mask the real error and crash the request.
+    """
+    try:
+        _db_write_with_retry(lambda: record_processed_documents(
+            organization, uploaded_by, om_file, t12_file, rent_roll_file, status='failed'
+        ))
+    except Exception as e:
+        logger.warning(f"Could not record failed document history: {e}")
 
 
 # ==========================================
@@ -658,8 +685,15 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
 
         t_before_db = time.perf_counter()
 
-        record_processed_documents(organization, uploaded_by, om_file, t12_file, rent_roll_file, status='completed')
-        record_analysis_report(organization, uploaded_by, metrics, tier, processing_seconds=elapsed_seconds)
+        # Retry once on stale MySQL connections — shared hosts often kill idle
+        # connections during the long AI call even after connection.close()
+        # above (e.g. race with wait_timeout, or a reconnect that dies mid-write).
+        _db_write_with_retry(lambda: record_processed_documents(
+            organization, uploaded_by, om_file, t12_file, rent_roll_file, status='completed'
+        ))
+        _db_write_with_retry(lambda: record_analysis_report(
+            organization, uploaded_by, metrics, tier, processing_seconds=elapsed_seconds
+        ))
 
         t_after_db = time.perf_counter()
 
@@ -684,7 +718,7 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         return metrics, rent_roll_df, None
 
     except FileValidationError as e:
-        record_processed_documents(organization, uploaded_by, om_file, t12_file, rent_roll_file, status='failed')
+        _safe_record_failure(organization, uploaded_by, om_file, t12_file, rent_roll_file)
         return None, None, Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
     except AIRateLimitExhausted:
         # Deliberately NOT recorded as 'failed' — this is a transient capacity
@@ -696,7 +730,7 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
             'retryable': True
         }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
     except Exception as e:
-        record_processed_documents(organization, uploaded_by, om_file, t12_file, rent_roll_file, status='failed')
+        _safe_record_failure(organization, uploaded_by, om_file, t12_file, rent_roll_file)
         return None, None, Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
