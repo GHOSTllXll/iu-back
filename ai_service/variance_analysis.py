@@ -66,18 +66,63 @@ def detect_monthly_t12_columns(t12_df: pd.DataFrame):
     return matches
 
 
-def find_row_by_label(df: pd.DataFrame, label_col, search_terms: list[str]):
+def find_revenue_row(df: pd.DataFrame, label_col):
     """
-    Finds the first row whose label (in label_col) contains any of the given
-    search terms, case-insensitive. Returns the row's Series, or None.
-    Used to locate "Net Rental Income" regardless of exact real-world
-    labeling/indentation (we've seen "Net Rental Income",
-    "601399.9999 / Net Rental Income", etc. in real files).
+    Searches for the row representing net/total rental revenue, using a
+    strict priority hierarchy AND an exclusion guardrail — deliberately
+    more conservative than a simple "first substring match", because
+    conflating rental-income-specific revenue with a broader property-wide
+    total (or non-rental income) would silently corrupt the month-over-month
+    delta calculation.
+
+    Priority hierarchy (checked in order — ALL rows are searched for term #1
+    before term #2 is ever considered, not "first row in file order"):
+        1. "Net Rental Income"
+        2. "Net Rent Income"
+        3. "Total Rental Income"
+        4. "Gross Potential Rent"
+        5. "Gross Effective Rent"
+
+    Exclusion guardrail — a row is NEVER eligible for matching, regardless
+    of hierarchy term, if its label contains any of:
+        "TOTAL INCOME", "TOTAL REVENUE", "OTHER INCOME",
+        "EFFECTIVE GROSS INCOME (EGI)"
+    (all comparisons case-insensitive, whitespace-stripped)
+
+    Returns the matching row (pandas Series), or None if nothing in the
+    hierarchy matches after exclusions are applied.
     """
+    excluded_substrings = [
+        "total income",
+        "total revenue",
+        "other income",
+        "effective gross income (egi)",
+    ]
+    search_hierarchy = [
+        "net rental income",
+        "net rent income",
+        "total rental income",
+        "gross potential rent",
+        "gross effective rent",
+    ]
+
+    # Guardrail applied FIRST, globally — a row containing an excluded
+    # substring is never eligible, even if it also happens to contain one
+    # of the hierarchy terms above.
+    eligible_rows = []
     for _, row in df.iterrows():
-        label = str(row.get(label_col, ''))
-        if any(term.lower() in label.lower() for term in search_terms):
-            return row
+        label = str(row.get(label_col, '')).strip().lower()
+        if any(excluded in label for excluded in excluded_substrings):
+            continue
+        eligible_rows.append((label, row))
+
+    # Priority search: exhaust term #1 across every eligible row before
+    # term #2 is ever considered.
+    for term in search_hierarchy:
+        for label, row in eligible_rows:
+            if term in label:
+                return row
+
     return None
 
 
@@ -210,11 +255,11 @@ def run_variance_analysis(t12_df: pd.DataFrame, rent_roll_df: pd.DataFrame, unit
     # Find the label column (first non-numeric column, typically "Account Name")
     label_col = t12_df.columns[0]
 
-    revenue_row = find_row_by_label(t12_df, label_col, ["net rental income"])
+    revenue_row = find_revenue_row(t12_df, label_col)
     if revenue_row is None:
         return {
             "skipped": True,
-            "reason": "[Reconciliation Skipped: Could not locate a 'Net Rental Income' row in the T12]",
+            "reason": "[Reconciliation Skipped: Source Document Lacks Standard Rental Income Labeling]",
         }
 
     monthly_values = {}
