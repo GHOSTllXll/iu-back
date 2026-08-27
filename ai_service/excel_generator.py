@@ -95,8 +95,6 @@ T12_LINE_ITEMS = [
     ("total_operating_expenses", "TOTAL OPERATING EXPENSES", True),  # subtotal row
     ("net_operating_income", "NET OPERATING INCOME (NOI)", True),    # subtotal row
 ]
-
-
 def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_assumptions: dict = None) -> bytes:
     wb = Workbook()
 
@@ -154,7 +152,6 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
                 cell.number_format = '$#,##0.00'
                 if isinstance(cleaned_val, str) and cleaned_val.replace('.', '').replace('-', '').isdigit():
                     cell.value = float(cleaned_val)
-
     last_row = len(rent_roll_df) + 1
     status_letter = get_column_letter(rent_roll_df.columns.get_loc(status_col) + 1)
     rent_letter = get_column_letter(rent_col_idx)
@@ -221,7 +218,6 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
 
         line_item_rows[key] = row_num
         row_num += 1
-
     # ==========================================
     # MODULE 2 (Enterprise only): Uncategorized Expenses
     # Per spec: a dedicated, visible row for any T12 line item the AI couldn't
@@ -255,7 +251,6 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         total_cell.number_format = '$#,##0.00'
 
         row_num = total_uncategorized_row + 1
-
     # ==========================================
     # TAB 2 continued: Capital Structure
     # Only builds what current data actually supports: Purchase Price + DST/Capex.
@@ -315,7 +310,6 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         acq_cell = ws_t12.cell(row=total_acq_cost_row, column=2, value=f"=B{purchase_price_row}")
         acq_cell.font = Font(bold=True)
         acq_cell.number_format = '$#,##0.00'
-
     # ==========================================
     # TAB 2 continued: Debt Sizing & Returns
     # LTV / Interest Rate / Amortization are raw user-entered numbers (not
@@ -374,7 +368,6 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
     )
     equity_cell.font = Font(bold=True)
     equity_cell.number_format = '$#,##0.00'
-
     debt_service_row = equity_row + 1
     ws_t12.cell(row=debt_service_row, column=1, value="Annual Debt Service")
     # PMT(rate/12, term*12, -loan) * 12 — standard amortizing loan payment,
@@ -423,7 +416,6 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
     noi_row = line_item_rows.get("net_operating_income")
     revenue_row = line_item_rows.get("total_operating_revenue")
     opex_row = line_item_rows.get("total_operating_expenses")
-
     dash_rows = [
         ("Property Name", property_metadata.get("property_name"), None, False, None, None),
         ("Address", property_metadata.get("address"), None, False, None, None),
@@ -473,7 +465,6 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
             dash_row_by_metric[metric_key] = row_idx
 
         row_idx += 1
-
     # ==========================================
     # MODULE 1 (Enterprise only): Reconciliation flag highlighting
     # If flags were computed (see reconciliation.py — Python compares OM claims
@@ -525,7 +516,6 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         next_free_row = note_row + 1
     else:
         next_free_row = row_idx
-
     # ==========================================
     # MODULE 2 (Enterprise only): Standardization summary
     # Quick visibility on the Dashboard tab so uncategorized items aren't only
@@ -543,6 +533,72 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
             value=f"{count} line item(s) totaling ${total:,.2f} could not be confidently "
                   f"categorized. See 'Cleaned T12' tab for details — manual review recommended."
         ).font = Font(italic=True, color="FF888888")
+
+        # FIX: previously this section never advanced next_free_row after
+        # writing itself — anything added below it (e.g. Module 7 below)
+        # would have silently overlapped these rows.
+        next_free_row = summary_row + 1
+
+    # ==========================================
+    # MODULE 7 (Enterprise/Trial only): Forensic Variance Analysis
+    # Per spec: a dedicated, visible 3-column grid (Month/Period | Calculated
+    # Variance % | Forensic System Flag), with a light-red highlight on
+    # ACTIVE flags only — "Insufficient Historical Data" rows are an explicit
+    # non-finding, not something requiring the executive's urgent attention,
+    # so they're shown but not highlighted. Full explanation for each flagged
+    # row is available as a hoverable cell comment, same pattern as Module 1.
+    #
+    # Placed as a section on the Dashboard Summary tab (matching how Modules
+    # 1 and 2 are laid out above), rather than a separate tab — keeps every
+    # advanced-tier finding in one place for a fast top-to-bottom review.
+    # ==========================================
+    variance_analysis = metrics.get("variance_analysis")
+    if variance_analysis is not None:
+        va_header_row = next_free_row + 2
+        ws_dash.cell(row=va_header_row, column=1, value="FORENSIC VARIANCE ANALYSIS").font = Font(bold=True, size=12, color="FFD4AF37")
+
+        if variance_analysis.get("skipped"):
+            skip_row = va_header_row + 1
+            ws_dash.cell(row=skip_row, column=1, value=variance_analysis["reason"]).font = Font(italic=True, color="FF888888")
+            next_free_row = skip_row + 1
+        else:
+            dips = variance_analysis.get("dips", [])
+            if not dips:
+                no_dips_row = va_header_row + 1
+                ws_dash.cell(
+                    row=no_dips_row, column=1,
+                    value="No month-over-month revenue drops of 10% or more detected."
+                ).font = Font(italic=True, color="FF888888")
+                next_free_row = no_dips_row + 1
+            else:
+                table_header_row = va_header_row + 1
+                ws_dash.cell(row=table_header_row, column=1, value="Month / Period").font = Font(bold=True)
+                ws_dash.cell(row=table_header_row, column=2, value="Calculated Variance %").font = Font(bold=True)
+                ws_dash.cell(row=table_header_row, column=3, value="Forensic System Flag").font = Font(bold=True)
+
+                active_flag_fill = PatternFill(start_color="FFF8D7DA", end_color="FFF8D7DA", fill_type="solid")
+
+                dip_row = table_header_row + 1
+                for dip in dips:
+                    month_cell = ws_dash.cell(row=dip_row, column=1, value=dip["month"])
+                    pct_cell = ws_dash.cell(row=dip_row, column=2, value=dip["pct_change"] / 100)
+                    pct_cell.number_format = '0.0%'
+                    flag_cell = ws_dash.cell(row=dip_row, column=3, value=dip["flag"])
+
+                    if dip.get("detail"):
+                        flag_cell.comment = Comment(dip["detail"], "Variance Analysis Engine")
+
+                    # Only highlight actionable flags — explicitly NOT the
+                    # "Insufficient Historical Data" case, which is a
+                    # deliberate non-finding rather than something urgent.
+                    if "Insufficient Historical Data" not in dip["flag"]:
+                        month_cell.fill = active_flag_fill
+                        pct_cell.fill = active_flag_fill
+                        flag_cell.fill = active_flag_fill
+
+                    dip_row += 1
+
+                next_free_row = dip_row
 
     output = io.BytesIO()
     wb.save(output)
