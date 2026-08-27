@@ -41,7 +41,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from django.db import connection, OperationalError, InterfaceError
-
+from .variance_analysis import run_variance_analysis, VarianceAnalysisSkipped
 
 def _db_write_with_retry(fn):
     """
@@ -95,8 +95,11 @@ TIERS_WITH_STANDARDIZATION = {TIER_ENTERPRISE, TIER_TRIAL}
 # per-metric provenance was deliberately not built (redundant for
 # formula-backed T12/Rent Roll numbers, and increases hallucination risk).
 TIERS_WITH_PROVENANCE = {TIER_ENTERPRISE, TIER_TRIAL}
-
-
+# ==========================================
+# Module 7 (Multi-Family Variance Analysis Engine) — same Enterprise/Trial
+# gating as the other advanced modules. See variance_analysis.py for the
+# full deterministic logic and design rationale.
+TIERS_WITH_VARIANCE_ANALYSIS = {TIER_ENTERPRISE, TIER_TRIAL}
 # ==========================================
 # UPLOAD QUOTA CONFIGURATION
 # ==========================================
@@ -182,8 +185,6 @@ def check_upload_quota(organization, tier):
         }, status=status.HTTP_402_PAYMENT_REQUIRED)
 
     return None
-
-
 # Sensible bounds — not enforcing "correctness", just catching obvious garbage
 # input (negative rates, 500% LTV, etc.) before it reaches Excel formulas.
 DEBT_ASSUMPTION_BOUNDS = {
@@ -272,8 +273,6 @@ def _parse_debt_assumptions(request):
     assumptions['purchase_price'] = price
  
     return assumptions, None
-
-
 def get_user_tier(request) -> str:
     """
     Reads the requesting user's subscription tier from their Organization.
@@ -341,8 +340,6 @@ MOCK_METRICS_BASE = {
         "cash_on_cash_return_pct": 0.082
     }
 }
-
-
 def get_mock_metrics(tier: str) -> dict:
     """Returns mock metrics shaped correctly for the given tier."""
     metrics = json.loads(json.dumps(MOCK_METRICS_BASE))  # cheap deep copy
@@ -419,7 +416,6 @@ def validate_metrics_shape(metrics: dict):
             f"AI response is missing expected section(s): {', '.join(missing)}"
         )
 
-
 def enforce_tier_entitlements(metrics: dict, tier: str) -> dict:
     """
     Hard enforcement of tier limits, independent of what the AI actually returned.
@@ -440,6 +436,9 @@ def enforce_tier_entitlements(metrics: dict, tier: str) -> dict:
 
     if tier not in TIERS_WITH_PROVENANCE:
         metrics.pop("provenance", None)
+
+    if tier not in TIERS_WITH_VARIANCE_ANALYSIS:
+        metrics.pop("variance_analysis", None)
 
     # reconciliation_claims, uncategorized_items, and source_citations are all
     # intermediate fields the AI populates so Python can process them — none
@@ -475,7 +474,6 @@ def extract_json_from_ai_response(ai_response: str) -> dict:
 
     validate_metrics_shape(metrics)
     return metrics
-
 
 # ==========================================
 # SHARED PROCESSING FUNCTION (DRY Principle)
@@ -547,7 +545,6 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
                 f"totals/summary rows (rent value far above the median of other rows) — "
                 f"not counted as real units."
             )
-
         t_after_rr_processing = time.perf_counter()
 
         combined_context = f"""
@@ -616,7 +613,7 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
 
         t_after_module1 = time.perf_counter()
 
-        # 6. Module 2 (Enterprise only): Smart Standardization Mapping.
+       # 6. Module 2 (Enterprise only): Smart Standardization Mapping.
         #    The AI reports any T12 line item it couldn't confidently map into
         #    a standard category, rather than guessing or silently dropping it.
         #    Python computes the total by summing the list itself — not trusting
@@ -669,6 +666,35 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
 
         t_after_module4 = time.perf_counter()
 
+        # 7b. Module 7 (Enterprise/Trial only): Multi-Family Variance
+        #     Analysis Engine. Fully deterministic — see variance_analysis.py
+        #     for the full design rationale. Only runs for Excel-format T12s
+        #     with real chronological monthly columns; cleanly skipped
+        #     otherwise (PDF T12s, annual-only statements).
+        if tier in TIERS_WITH_VARIANCE_ANALYSIS:
+            try:
+                t12_ext = os.path.splitext(t12_file.name)[1].lower()
+                if t12_ext in ('.xlsx', '.xls', '.csv'):
+                    t12_file.seek(0)  # already consumed once by extract_t12_text() above
+                    t12_df = read_excel_with_header_detection(t12_file)
+                    rent_col_va, status_col_va, tenant_col_va = detect_rent_roll_columns(rent_roll_df)
+                    variance_result = run_variance_analysis(t12_df, rent_roll_df, unit_col=tenant_col_va)
+                    metrics["variance_analysis"] = variance_result
+                else:
+                    metrics["variance_analysis"] = {
+                        "skipped": True,
+                        "reason": "Reconciliation Skipped: Source Document Lacks Monthly Granularity (PDF T12 not supported for this analysis).",
+                    }
+            except Exception as e:
+                # Never let this optional module crash the whole analysis —
+                # same principle as Module 1's RentRollColumnError handling.
+                metrics["variance_analysis"] = {
+                    "skipped": True,
+                    "reason": f"Variance analysis could not run: {str(e)}",
+                }
+
+        t_after_module7 = time.perf_counter()
+
         # 8. Hard-enforce tier entitlements regardless of what the AI returned
         metrics = enforce_tier_entitlements(metrics, tier)
 
@@ -697,7 +723,7 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
 
         t_after_db = time.perf_counter()
 
-        # TIMING BREAKDOWN — logged via the standard logging module so it
+       # TIMING BREAKDOWN — logged via the standard logging module so it
         # reliably lands in passenger.log regardless of DEBUG setting.
         # Temporary instrumentation to find where the "AI call takes ~100s
         # but total request takes 5+ minutes" gap is actually coming from.
@@ -711,6 +737,7 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
             f"Module 1 (Reconciliation): {t_after_module1 - t_after_ai:.1f}s | "
             f"Module 2 (Standardization): {t_after_module2 - t_after_module1:.1f}s | "
             f"Module 4 (Provenance): {t_after_module4 - t_after_module2:.1f}s | "
+            f"Module 7 (Variance Analysis): {t_after_module7 - t_after_module4:.1f}s | "
             f"DB writes: {t_after_db - t_before_db:.1f}s | "
             f"TOTAL (excl. DB writes): {elapsed_seconds:.1f}s"
         )
@@ -732,8 +759,6 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
     except Exception as e:
         _safe_record_failure(organization, uploaded_by, om_file, t12_file, rent_roll_file)
         return None, None, Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-
 def _build_system_prompt(tier: str = TIER_BASIC) -> str:
     include_dst_capex = tier in TIERS_WITH_DST_CAPEX
     include_reconciliation = tier in TIERS_WITH_RECONCILIATION
@@ -780,7 +805,7 @@ def _build_system_prompt(tier: str = TIER_BASIC) -> str:
 
     standardization_guidance = """
 
-    CRITICAL — "uncategorized_items" section (Chart of Accounts mapping):
+   CRITICAL — "uncategorized_items" section (Chart of Accounts mapping):
     When mapping T12 line items into the categories above, use these standard
     classifications:
     - RUBS, Utility Reimbursement, Valet Trash Income, Pet Rent, Garage Fees -> "other_income"
@@ -841,7 +866,7 @@ def _build_system_prompt(tier: str = TIER_BASIC) -> str:
     2. If a metric cannot be found, set its value to null.
     3. Use the exact keys provided below.
 
-    Required JSON Structure:
+   Required JSON Structure:
     {{
       "property_metadata": {{
         "property_name": "string",
@@ -890,7 +915,6 @@ def _build_system_prompt(tier: str = TIER_BASIC) -> str:
     }}{dst_capex_guidance}{reconciliation_guidance}{standardization_guidance}{provenance_guidance}
     """
 
-
 class UnderwritePropertyView(APIView):
     """
     ENDPOINT 1: Returns JSON metrics (used by the dashboard's "Analyze Documents" button)
@@ -921,7 +945,6 @@ class UnderwritePropertyView(APIView):
         analysis_id = store_analysis(metrics, rent_roll_df)
 
         return Response({'metrics': metrics, 'tier': tier, 'analysis_id': analysis_id})
-
 
 class UnderwritePropertyDownloadView(APIView):
     """
@@ -995,7 +1018,6 @@ class UnderwritePropertyDownloadView(APIView):
         )
         return response
 
-
 # ==========================================
 # Existing utility views
 # ==========================================
@@ -1026,7 +1048,6 @@ class TestAIView(APIView):
 
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
 
 class DocumentUploadView(APIView):
     permission_classes = [IsAuthenticated]
@@ -1094,7 +1115,6 @@ class DocumentHistoryView(APIView):
             'processing': all_docs.filter(status='processing').count(),
             'failed': all_docs.filter(status='failed').count(),
         }
- 
         documents = [
             {
                 'id': doc.id,
@@ -1146,7 +1166,6 @@ class AnalysisReportListView(APIView):
  
         return Response({'reports': reports})
 
-
 class AnalysisReportDetailView(APIView):
     """
     GET returns the full stored metrics JSON for Preview — 404s if the report
@@ -1193,8 +1212,6 @@ class AnalysisReportDetailView(APIView):
         report.is_deleted = True
         report.save(update_fields=['is_deleted'])
         return Response(status=status.HTTP_204_NO_CONTENT)
-
-
 class DashboardStatsView(APIView):
     """
     Powers the 4 stat cards at the top of the dashboard. Every number here is
