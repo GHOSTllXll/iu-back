@@ -727,7 +727,7 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         # reliably lands in passenger.log regardless of DEBUG setting.
         # Temporary instrumentation to find where the "AI call takes ~100s
         # but total request takes 5+ minutes" gap is actually coming from.
-        logger.warning(
+        logger.info(
             f"TIMING BREAKDOWN — "
             f"OM parse: {t_after_om - pipeline_start_time:.1f}s | "
             f"T12 parse: {t_after_t12 - t_after_om:.1f}s | "
@@ -865,7 +865,6 @@ def _build_system_prompt(tier: str = TIER_BASIC) -> str:
     1. Output ONLY valid JSON. Do not include markdown formatting like ```json or any conversational text.
     2. If a metric cannot be found, set its value to null.
     3. Use the exact keys provided below.
-
    Required JSON Structure:
     {{
       "property_metadata": {{
