@@ -33,10 +33,19 @@ class OrganizationSerializer(serializers.ModelSerializer):
 class UserSerializer(serializers.ModelSerializer):
     # allow_null=True prevents crashes when the user has no organization (like you, the admin!)
     organization_name = serializers.CharField(source='organization.name', read_only=True, allow_null=True)
-    
+
+    # Drives the Institutional PPM Batch Console's UI gating on the frontend
+    # (sidebar link visibility + the page's own access gate) — a
+    # SerializerMethodField rather than a dotted `source=` lookup so a
+    # user with no organization at all returns False instead of blowing up.
+    has_ppm_access = serializers.SerializerMethodField()
+
     class Meta:
         model = CustomUser
-        fields = ['email', 'first_name', 'last_name', 'role', 'is_admin', 'is_active', 'date_joined', 'organization_name']
+        fields = ['email', 'first_name', 'last_name', 'role', 'is_admin', 'is_active', 'date_joined', 'organization_name', 'has_ppm_access']
+
+    def get_has_ppm_access(self, obj):
+        return bool(obj.organization and obj.organization.has_ppm_access)
 
 class LoginSerializer(serializers.Serializer):
     email = serializers.EmailField()

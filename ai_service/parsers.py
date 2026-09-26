@@ -16,10 +16,15 @@ class FileValidationError(Exception):
     pass
 
 
-def validate_uploaded_file(uploaded_file, allowed_extensions, label="File"):
+def validate_uploaded_file(uploaded_file, allowed_extensions, label="File", max_size_bytes: int = MAX_FILE_SIZE):
     """
     Basic guardrails every uploaded file should pass before any parser touches it.
     Raises FileValidationError with a clean, user-facing message on failure.
+
+    max_size_bytes defaults to the standard MAX_FILE_SIZE (25MB) but can be
+    overridden per-caller — e.g. the PPM pipeline uses a larger limit for its
+    heavier documents (see ai_service/views.py PPM_MAX_FILE_SIZE) without
+    changing the default for the existing OM/T12/Rent Roll pipeline.
     """
     if uploaded_file is None:
         raise FileValidationError(f"{label} is missing.")
@@ -27,10 +32,10 @@ def validate_uploaded_file(uploaded_file, allowed_extensions, label="File"):
     if uploaded_file.size == 0:
         raise FileValidationError(f"{label} is empty (0 bytes). Please re-upload.")
 
-    if uploaded_file.size > MAX_FILE_SIZE:
+    if uploaded_file.size > max_size_bytes:
         size_mb = uploaded_file.size / (1024 * 1024)
         raise FileValidationError(
-            f"{label} is {size_mb:.1f}MB, which exceeds the {MAX_FILE_SIZE // (1024*1024)}MB limit."
+            f"{label} is {size_mb:.1f}MB, which exceeds the {max_size_bytes // (1024*1024)}MB limit."
         )
 
     ext = os.path.splitext(uploaded_file.name)[1].lower()

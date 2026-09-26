@@ -39,6 +39,18 @@ class Organization(models.Model):
     account_status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     date_created = models.DateTimeField(auto_now_add=True)
 
+    # Institutional PPM feature gate — separate from subscription_plan on
+    # purpose, so PPM access can be granted/revoked independently of tier
+    # without needing a new PLAN_CHOICES value.
+    has_ppm_access = models.BooleanField(default=False)
+
+    # Per-org override for the rolling 30-day upload ceiling (see
+    # TIER_UPLOAD_LIMITS / check_upload_quota in ai_service/views.py). Null
+    # means "no override — use the standard tier-based limit". Set to an
+    # integer for bespoke arrangements (e.g. a custom negotiated quota)
+    # without needing a new tier or a hardcoded per-org special case.
+    quota_override = models.IntegerField(null=True, blank=True)
+
     objects = OrganizationManager()
 
     def __str__(self):

@@ -26,6 +26,7 @@ class ProcessedDocument(models.Model):
         ('OM', 'Offering Memorandum'),
         ('T12', 'T12 Statement'),
         ('RENT_ROLL', 'Rent Roll'),
+        ('PPM', 'Private Placement Memorandum'),
     ]
 
     organization = models.ForeignKey(
@@ -77,10 +78,22 @@ class AnalysisReport(models.Model):
     already finished successfully. 'generating' is kept as a valid choice for
     when background processing exists, but in practice today every row lands
     as 'ready'.
+
+    NOTE on 'document_type': added for the Institutional PPM pipeline, which
+    shares this exact model/table rather than getting its own — same quota
+    counting (get_period_usage doesn't filter by document_type, so PPM and
+    CRE analyses draw from the same rolling 30-day pool, by design), same
+    Outputs page, same dashboard stats, for free. Defaults to 'CRE' so every
+    existing row (and every existing call site) keeps working unchanged.
     """
     STATUS_CHOICES = [
         ('ready', 'Ready'),
         ('generating', 'Generating'),
+    ]
+
+    DOCUMENT_TYPE_CHOICES = [
+        ('CRE', 'CRE Underwriting (OM/T12/Rent Roll)'),
+        ('PPM', 'Private Placement Memorandum'),
     ]
 
     organization = models.ForeignKey(
@@ -99,6 +112,7 @@ class AnalysisReport(models.Model):
     is_deleted = models.BooleanField(default=False)
     property_name = models.CharField(max_length=255, blank=True, default='')
     tier = models.CharField(max_length=20)
+    document_type = models.CharField(max_length=10, choices=DOCUMENT_TYPE_CHOICES, default='CRE')
     metrics = models.JSONField()
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ready')
 

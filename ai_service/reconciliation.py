@@ -130,6 +130,76 @@ def _check_concessions(rent_roll_df: pd.DataFrame, rent_roll_metrics: dict) -> d
     return None
 
 
+RECONCILIATION_DELTA_THRESHOLD = 0.01  # dollars — effectively "must match exactly"
+
+
+def run_ppm_reconciliation(raw_sources_and_uses_items, claimed_master_acquisition_cost) -> dict:
+    """
+    PPM equivalent of this module's core design principle above: the AI's
+    ONLY job is to extract the raw "Sources and Uses" line items and the
+    document's claimed master acquisition cost figure — it never grades its
+    own arithmetic or produces a color verdict. Python performs the
+    summation and comparison here, same as the CRE checks above.
+
+    Returns a tri-state result rather than a flat GREEN/RED boolean, because
+    "some line items didn't parse" and "the numbers genuinely don't balance"
+    are different problems that shouldn't look identical to the user:
+      - GREEN: parsed cleanly AND the totals match within threshold.
+      - RED: parsed cleanly, but the totals genuinely don't match — a real
+        mismatch in the sponsor's own document math.
+      - NEEDS_REVIEW: one or more line items (or the acquisition cost
+        itself) couldn't be parsed as a number — a data-quality gap, not a
+        proven mismatch. Takes priority over RED/GREEN regardless of what
+        the parseable items happen to sum to, since a partial sum isn't a
+        trustworthy basis for either verdict.
+
+    Never raises — malformed AI output degrades into unparseable_items
+    entries (and a NEEDS_REVIEW flag) rather than crashing the request,
+    same defensive posture as every other AI-output-facing function in this
+    module and in variance_analysis.py/parsers.py.
+    """
+    total_sources_and_uses = 0.0
+    unparseable_items = []
+
+    for item in (raw_sources_and_uses_items or []):
+        if not isinstance(item, dict):
+            unparseable_items.append({"item": item, "error": "Line item was not an object."})
+            continue
+        try:
+            amount = float(item.get('amount'))
+        except (TypeError, ValueError):
+            unparseable_items.append({
+                "item": item,
+                "error": f"Non-numeric or missing 'amount': {item.get('amount')!r}",
+            })
+            continue
+        total_sources_and_uses += amount
+
+    acquisition_cost = None
+    try:
+        acquisition_cost = float(claimed_master_acquisition_cost)
+    except (TypeError, ValueError):
+        unparseable_items.append({
+            "item": {"claimed_master_acquisition_cost": claimed_master_acquisition_cost},
+            "error": "Non-numeric or missing claimed_master_acquisition_cost.",
+        })
+
+    if unparseable_items:
+        flag = "NEEDS_REVIEW"
+        delta = None
+    else:
+        delta = abs(total_sources_and_uses - acquisition_cost)
+        flag = "GREEN" if delta < RECONCILIATION_DELTA_THRESHOLD else "RED"
+
+    return {
+        "flag": flag,
+        "total_sources_and_uses": round(total_sources_and_uses, 2),
+        "claimed_acquisition_cost": round(acquisition_cost, 2) if acquisition_cost is not None else None,
+        "delta": round(delta, 2) if delta is not None else None,
+        "unparseable_items": unparseable_items,
+    }
+
+
 def run_reconciliation(metrics: dict, rent_roll_df: pd.DataFrame, ground_truth: dict) -> list:
     """
     Runs all reconciliation checks and returns a list of flag dicts.

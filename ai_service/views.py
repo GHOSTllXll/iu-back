@@ -19,9 +19,11 @@ from .parsers import (
     extract_t12_text,
     extract_data_from_excel,
     read_excel_with_header_detection,
+    validate_uploaded_file,
     FileValidationError,
 )
 from .excel_generator import generate_underwriting_excel, ExcelGenerationError
+from .excel_ppm_generator import build_ppm_master_grid, PPMExcelGenerationError
 from .rent_roll_utils import (
     detect_charge_ledger_columns,
     reshape_charge_ledger,
@@ -32,9 +34,16 @@ from .rent_roll_utils import (
     compute_ground_truth,
     RentRollColumnError,
 )
-from .reconciliation import run_reconciliation
-from .document_history import record_processed_documents, record_analysis_report
+from .reconciliation import run_reconciliation, run_ppm_reconciliation
+from .document_history import record_processed_documents, record_analysis_report, record_processed_ppm_document
 from .analysis_cache import store_analysis, get_cached_analysis
+from .ppm_splitter import extract_ppm_target_text, PPMSplitterError
+from .document_classifier import (
+    classify_document,
+    DocumentClassificationError,
+    CLASSIFIABLE_EXTENSIONS,
+    DOCUMENT_TYPE_UNCLASSIFIED,
+)
 
 
 import logging
@@ -69,6 +78,19 @@ def _safe_record_failure(organization, uploaded_by, om_file, t12_file, rent_roll
         ))
     except Exception as e:
         logger.warning(f"Could not record failed document history: {e}")
+
+
+def _safe_record_ppm_failure(organization, uploaded_by, ppm_file):
+    """
+    PPM equivalent of _safe_record_failure — single-file shape, same
+    never-raise guarantee (see above).
+    """
+    try:
+        _db_write_with_retry(lambda: record_processed_ppm_document(
+            organization, uploaded_by, ppm_file, status='failed'
+        ))
+    except Exception as e:
+        logger.warning(f"Could not record failed PPM document history: {e}")
 
 
 # ==========================================
@@ -163,11 +185,19 @@ def check_upload_quota(organization, tier):
     the current cycle, else None. organization=None (user with no org) skips
     quota enforcement entirely — matches the existing "no org, no tracking"
     pattern used elsewhere (History recording, reports).
+
+    organization.quota_override (nullable) takes priority over the standard
+    tier-based limit when set — lets a specific org get a bespoke rolling
+    30-day ceiling (e.g. a negotiated arrangement) without needing a new
+    tier or a hardcoded per-org special case in this function.
     """
     if organization is None:
         return None
 
-    limit = TIER_UPLOAD_LIMITS.get(tier, TIER_UPLOAD_LIMITS[TIER_BASIC])
+    if organization.quota_override is not None:
+        limit = organization.quota_override
+    else:
+        limit = TIER_UPLOAD_LIMITS.get(tier, TIER_UPLOAD_LIMITS[TIER_BASIC])
     used = get_period_usage(organization)
 
     if used >= limit:
@@ -185,6 +215,18 @@ def check_upload_quota(organization, tier):
         }, status=status.HTTP_402_PAYMENT_REQUIRED)
 
     return None
+
+
+# ==========================================
+# INSTITUTIONAL PPM CONFIGURATION
+# ==========================================
+# PPMs run heavier (up to ~300 pages) than the standard OM/T12 documents, so
+# they get a larger cap than parsers.MAX_FILE_SIZE (25MB) — passed explicitly
+# to validate_uploaded_file rather than changing the shared default, so the
+# existing CRE pipeline's limit is untouched.
+PPM_MAX_FILE_SIZE = 100 * 1024 * 1024  # 100 MB
+
+
 # Sensible bounds — not enforcing "correctness", just catching obvious garbage
 # input (negative rates, 500% LTV, etc.) before it reaches Excel formulas.
 DEBT_ASSUMPTION_BOUNDS = {
@@ -392,6 +434,50 @@ def get_ai_metrics(system_prompt: str, user_prompt: str, tier: str) -> str:
     return ai_client.generate_completion(system_prompt=system_prompt, user_prompt=user_prompt)
 
 
+# Deliberately mismatched: 29.25M + 15.75M (Senior Loan + Sponsor Equity) =
+# 45M, not the 45.5M claimed_master_acquisition_cost below — so AI_MOCK_MODE
+# exercises the RED reconciliation path instead of silently passing every
+# time, same principle as MOCK_METRICS_BASE's deliberately-mismatched
+# reconciliation_claims for the CRE pipeline above.
+MOCK_PPM_METRICS = {
+    "target_asset_name": "Sunbelt Logistics Portfolio (MOCK DATA)",
+    "sponsor_platform_name": "Meridian Capital Partners",
+    "offering_volume": 45000000.00,
+    "loan_to_cost_ratio": 0.65,
+    "weighted_exit_cap": 0.058,
+    "total_sponsor_fees": 1350000.00,
+    "year_1_yield": 0.071,
+    "raw_sources_and_uses_items": [
+        {"line_item": "Senior Loan Proceeds", "amount": 29250000.00},
+        {"line_item": "Sponsor Equity", "amount": 15750000.00},
+        {"line_item": "Acquisition Fee", "amount": 450000.00},
+    ],
+    "claimed_master_acquisition_cost": 45500000.00,
+    "provenance_citations": {
+        "target_asset_name": {
+            "page_location": 12,
+            "section_title": "Sources and Uses of Funds",
+            "exact_text_anchor": "Sunbelt Logistics Portfolio"
+        },
+    },
+}
+
+
+def get_ppm_ai_metrics(system_prompt: str, user_prompt: str) -> str:
+    """
+    PPM equivalent of get_ai_metrics — same AI_MOCK_MODE escape hatch for
+    local testing without a working AI provider (see get_ai_metrics for the
+    "turn this back off before production" caveat, which applies here too).
+    Kept as a separate function rather than adding a branch to get_ai_metrics
+    because the two pipelines' mock data shapes are completely different and
+    get_ai_metrics' tier parameter has no PPM equivalent.
+    """
+    if os.environ.get("AI_MOCK_MODE", "false").lower() == "true":
+        return json.dumps(MOCK_PPM_METRICS)
+
+    return ai_client.generate_completion(system_prompt=system_prompt, user_prompt=user_prompt)
+
+
 # Keys the AI response MUST have at the top level before we trust it downstream.
 REQUIRED_METRIC_SECTIONS = [
     "property_metadata",
@@ -452,27 +538,80 @@ def enforce_tier_entitlements(metrics: dict, tier: str) -> dict:
     return metrics
 
 
-def extract_json_from_ai_response(ai_response: str) -> dict:
+# Keys the PPM AI response MUST have at the top level before we trust it
+# downstream. raw_sources_and_uses_items + claimed_master_acquisition_cost
+# are the two fields run_ppm_reconciliation needs — the AI extracts them,
+# Python does the actual math (see reconciliation.py). provenance_citations
+# is deliberately NOT required here, same as the CRE path's source_citations
+# — a citation-less response is still usable, just less verifiable.
+PPM_REQUIRED_FIELDS = [
+    "target_asset_name",
+    "sponsor_platform_name",
+    "offering_volume",
+    "loan_to_cost_ratio",
+    "weighted_exit_cap",
+    "total_sponsor_fees",
+    "year_1_yield",
+    "raw_sources_and_uses_items",
+    "claimed_master_acquisition_cost",
+]
+
+
+def validate_ppm_metrics_shape(metrics: dict):
+    """
+    PPM equivalent of validate_metrics_shape — raises FileValidationError if
+    the AI response is missing expected top-level fields.
+    """
+    if not isinstance(metrics, dict):
+        raise FileValidationError("AI response was not a JSON object.")
+
+    missing = [key for key in PPM_REQUIRED_FIELDS if key not in metrics]
+    if missing:
+        raise FileValidationError(
+            f"AI response is missing expected PPM field(s): {', '.join(missing)}"
+        )
+
+
+def _parse_ai_json_response(ai_response: str) -> dict:
+    """
+    Shared by both the CRE and PPM pipelines: strips markdown fences if
+    present, extracts the first {...} block, and parses it as JSON. Does NOT
+    validate shape — callers apply their own validator (validate_metrics_shape
+    or validate_ppm_metrics_shape) since the two pipelines expect completely
+    different top-level keys.
+    """
     if not ai_response or not ai_response.strip():
         raise FileValidationError(
             "The AI returned an empty response. This can happen if the model's "
             "thinking/reasoning consumed the entire token budget, or if the "
             "request was refused. Try again, or check the AI provider's status."
         )
-    """
-    Strips markdown fences if present, then extracts the first {...} block.
-    """
+
     cleaned = ai_response.replace('```json', '').replace('```', '').strip()
 
     match = re.search(r'\{.*\}', cleaned, re.DOTALL)
     json_str = match.group(0) if match else cleaned
 
     try:
-        metrics = json.loads(json_str)
+        return json.loads(json_str)
     except json.JSONDecodeError as e:
         raise FileValidationError(f"AI returned invalid JSON: {str(e)}")
 
+
+def extract_json_from_ai_response(ai_response: str) -> dict:
+    """
+    CRE pipeline entry point — unchanged behavior from before this function
+    was split into _parse_ai_json_response + per-pipeline validators.
+    """
+    metrics = _parse_ai_json_response(ai_response)
     validate_metrics_shape(metrics)
+    return metrics
+
+
+def extract_ppm_json_from_ai_response(ai_response: str) -> dict:
+    """PPM pipeline entry point — same parsing, PPM-shaped validation."""
+    metrics = _parse_ai_json_response(ai_response)
+    validate_ppm_metrics_shape(metrics)
     return metrics
 
 # ==========================================
@@ -914,6 +1053,168 @@ def _build_system_prompt(tier: str = TIER_BASIC) -> str:
     }}{dst_capex_guidance}{reconciliation_guidance}{standardization_guidance}{provenance_guidance}
     """
 
+
+def _build_ppm_system_prompt() -> str:
+    """
+    Institutional PPM pipeline's prompt builder. Lives here next to
+    _build_system_prompt (its CRE equivalent) and PPMUnderwriteView, NOT in
+    llm_router.py — that module is purely the provider-routing/retry
+    transport layer and contains no prompt content today; keeping prompt
+    text out of it preserves that separation of concerns.
+
+    CRITICAL design point (see reconciliation.run_ppm_reconciliation): the
+    AI is explicitly instructed to extract raw Sources & Uses line items and
+    the claimed acquisition cost as separate raw figures, and told NOT to
+    compute or judge whether they reconcile — that comparison is done in
+    Python afterward, so a reconciliation flag reflects a real document
+    mismatch, never the AI grading its own math.
+    """
+    return """
+    You are an expert Institutional Real Estate Private Placement analyst.
+    You will be given extracted text from SPECIFIC PAGES of a Private Placement
+    Memorandum (PPM) — the financial summary pages only (Sources and Uses, Fee
+    Structure, and Historical Operations / Pro Forma sections), not the full
+    legal document. Extract the following fields and output STRICT JSON only.
+
+    Rules:
+    1. Output ONLY valid JSON. Do not include markdown formatting like ```json or any conversational text.
+    2. If a field cannot be found in the provided text, set its value to null.
+    3. Use the exact keys provided below.
+    4. Do NOT calculate whether the Sources and Uses total matches the acquisition
+       cost, and do NOT state an opinion on whether the numbers reconcile — simply
+       report each raw line item and each raw figure exactly as the document
+       states them. A separate system performs that comparison independently.
+
+    Required JSON structure:
+    {
+      "target_asset_name": "string",
+      "sponsor_platform_name": "string",
+      "offering_volume": number,
+      "loan_to_cost_ratio": number,
+      "weighted_exit_cap": number,
+      "total_sponsor_fees": number,
+      "year_1_yield": number,
+      "raw_sources_and_uses_items": [
+        {
+          "line_item": "string",
+          "amount": number
+        }
+      ],
+      "claimed_master_acquisition_cost": number,
+      "provenance_citations": {
+        "target_asset_name": {"page_location": number, "section_title": "string", "exact_text_anchor": "string"},
+        "offering_volume": {"page_location": number, "section_title": "string", "exact_text_anchor": "string"},
+        "loan_to_cost_ratio": {"page_location": number, "section_title": "string", "exact_text_anchor": "string"},
+        "weighted_exit_cap": {"page_location": number, "section_title": "string", "exact_text_anchor": "string"},
+        "total_sponsor_fees": {"page_location": number, "section_title": "string", "exact_text_anchor": "string"},
+        "year_1_yield": {"page_location": number, "section_title": "string", "exact_text_anchor": "string"}
+      }
+    }
+
+    Field-specific guidance:
+    - "loan_to_cost_ratio", "weighted_exit_cap", "year_1_yield": express as decimals
+      (e.g. 0.65 for 65%, 0.055 for 5.5%), not whole-number percentages.
+    - "raw_sources_and_uses_items": list EVERY line item from the Sources and Uses
+      table exactly as labeled in the document, with its dollar amount. Include
+      both "Sources" and "Uses" line items — do not net them against each other or
+      pre-sum them into a single figure. If a line item's amount is unclear or
+      unstated, omit that line item rather than guessing a number.
+    - "claimed_master_acquisition_cost": the total property/asset acquisition cost
+      as explicitly stated in the document (often labeled "Purchase Price",
+      "Acquisition Cost", or appearing as a "Total Uses" line) — extract exactly
+      what is stated, do not derive it by summing other figures yourself.
+
+    CRITICAL — "provenance_citations" section:
+    For each field listed above, provide where in the provided text you found
+    that information:
+    - "page_location": the page number shown by the "--- PAGE N ---" markers in
+      the extract. Set to null if you cannot identify it.
+    - "section_title": the heading/section name the information appeared under,
+      if identifiable. Set to null if not identifiable.
+    - "exact_text_anchor": a SHORT excerpt (under 15 words) from the source text
+      that supports this figure.
+    Do NOT fabricate a page number, section, or quote if you are not confident —
+    set the relevant sub-field to null rather than guess. A false citation is
+    worse than no citation. If you cannot cite a field at all, omit it from
+    "provenance_citations" entirely rather than including it with all-null values.
+    """
+
+
+class ClassifyDocumentView(APIView):
+    """
+    ENDPOINT 0: Intelligent Document Classification Layer — the front of the
+    ingestion pipeline, ahead of UnderwritePropertyView. Given ONE uploaded
+    file, runs a fast local keyword scan (see document_classifier.py) to
+    guess whether it's a Rent Roll, a Trailing-12, or an Offering
+    Memorandum — no AI call, no file parsing beyond a small sample.
+
+    This exists so the dashboard's upload area can be a single mixed-file
+    drop zone instead of 3 separate boxes: the frontend calls this once per
+    dropped file and uses document_type to auto-place it into the om_file /
+    t12_file / rent_roll_file slot, entirely client-side. It does NOT change
+    how UnderwritePropertyView itself works — that endpoint still expects
+    the same 3 named fields it always has, sent together in one request, and
+    runs the exact same combined OM+T12+RentRoll AI analysis it did before
+    this classification layer existed. "Routing" a classified file therefore
+    means nothing more than placing it in the right named slot; the vacancy
+    calculation (rent_roll_utils.compute_ground_truth), the T12 revenue/NOI
+    extraction, and the reconciliation math (reconciliation.run_reconciliation)
+    are all pre-existing logic inside that combined pipeline, not duplicated
+    here.
+
+    DESIGN PRINCIPLE — fail loud, not silent (see document_classifier.py's
+    module docstring): a low-confidence or tied result comes back as
+    UNCLASSIFIED rather than a guess, so the frontend can ask the user to
+    place that one file manually instead of silently feeding a Rent Roll
+    into the T12 slot (or vice versa).
+
+    Deliberately NOT gated by upload quota or tier — this never calls the
+    AI, so it costs nothing to run, and gating it would defeat the point of
+    an instant per-file sort.
+
+    URL: POST /api/ai/classify-document/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        uploaded_file = request.FILES.get('file')
+        if uploaded_file is None:
+            return Response({'error': 'file is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if uploaded_file.size == 0:
+            return Response({
+                'error': f"'{uploaded_file.name}' is empty (0 bytes).",
+                'document_type': DOCUMENT_TYPE_UNCLASSIFIED,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        ext = os.path.splitext(uploaded_file.name)[1].lower()
+        if ext not in CLASSIFIABLE_EXTENSIONS:
+            return Response({
+                'error': (
+                    f"'{uploaded_file.name}' has an unsupported extension '{ext}'. "
+                    f"Allowed: {', '.join(sorted(CLASSIFIABLE_EXTENSIONS))}"
+                ),
+                'document_type': DOCUMENT_TYPE_UNCLASSIFIED,
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            result = classify_document(uploaded_file)
+        except DocumentClassificationError as e:
+            # Unreadable file (corrupt, scanned-image-only, etc.) still comes
+            # back as a 200 with UNCLASSIFIED rather than a hard error — the
+            # user can still place it in a slot manually, and the real
+            # read/validation error will surface properly if they try to
+            # Analyze with it regardless. This mirrors how a genuinely
+            # unreadable file is handled once it reaches the real pipeline.
+            return Response({
+                'document_type': DOCUMENT_TYPE_UNCLASSIFIED,
+                'scores': {},
+                'note': str(e),
+            })
+
+        return Response(result)
+
+
 class UnderwritePropertyView(APIView):
     """
     ENDPOINT 1: Returns JSON metrics (used by the dashboard's "Analyze Documents" button)
@@ -1016,6 +1317,216 @@ class UnderwritePropertyDownloadView(APIView):
             content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         )
         return response
+
+class PPMUnderwriteView(APIView):
+    """
+    ENDPOINT: Institutional PPM analysis. Processes exactly ONE PPM document
+    per request — the frontend's "Institutional PPM Batch Console" loops this
+    call once per uploaded file (up to 5 per batch) client-side, awaiting
+    each response before firing the next. That loop deliberately does NOT
+    live in this view: keeping each request single-document keeps it well
+    under the VPS's 300-second nginx timeout regardless of how many files a
+    user drops into the console at once — batching several files into one
+    request here would reintroduce the exact timeout failure mode the CRE
+    pipeline's VPS migration already fixed once, just multiplied by batch size.
+
+    Gated on organization.has_ppm_access, which is INDEPENDENT of
+    subscription_plan — a feature flag rather than a new tier, so PPM access
+    can be granted per-org without restructuring TIER_UPLOAD_LIMITS. Counts
+    against the same rolling 30-day upload quota as the CRE pipeline (see
+    document_history.record_analysis_report / get_period_usage — usage
+    counting doesn't filter by document_type, by design).
+
+    URL: POST /api/ai/ppm/underwrite/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        organization = get_user_organization(request)
+
+        if organization is None or not organization.has_ppm_access:
+            return Response(
+                {'error': 'Institutional PPM analysis is not enabled for your organization.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        ppm_file = request.FILES.get('ppm_file')
+        if ppm_file is None:
+            return Response({'error': 'ppm_file is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Optional manual page-range override — the escape hatch when the
+        # heuristic splitter (ppm_splitter.py) can't confidently locate all
+        # 3 target sections. Comma-separated 1-indexed page numbers, e.g.
+        # "4,5,12,13". When present, the splitter's heuristic is skipped
+        # entirely in favor of exactly these pages.
+        manual_pages_raw = (request.data.get('manual_pages') or '').strip()
+        manual_pages = None
+        if manual_pages_raw:
+            try:
+                manual_pages = sorted({int(p.strip()) for p in manual_pages_raw.split(',') if p.strip()})
+            except ValueError:
+                return Response(
+                    {'error': "'manual_pages' must be a comma-separated list of page numbers, e.g. '4,5,12,13'."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if not manual_pages:
+                manual_pages = None
+
+        tier = get_user_tier(request)
+
+        # Quota check BEFORE any parsing/AI work, same principle as the CRE
+        # pipeline (process_underwriting_files) — an org over their limit is
+        # rejected immediately rather than wasting processing on a file that
+        # was never going to be allowed through.
+        quota_error = check_upload_quota(organization, tier)
+        if quota_error:
+            return quota_error
+
+        try:
+            validate_uploaded_file(ppm_file, {'.pdf'}, label="PPM Document", max_size_bytes=PPM_MAX_FILE_SIZE)
+        except FileValidationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        pipeline_start_time = time.perf_counter()
+
+        # Local, pre-AI page-range narrowing — runs before any cloud AI call
+        # so a 300-page document never gets sent to the model in full. See
+        # ppm_splitter.py's module docstring for the fail-loud rationale.
+        try:
+            ppm_text, located_sections = extract_ppm_target_text(ppm_file, manual_pages=manual_pages)
+        except PPMSplitterError as e:
+            return Response({
+                'error': str(e),
+                'needs_manual_page_range': True,
+            }, status=status.HTTP_400_BAD_REQUEST)
+        except FileValidationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        system_prompt = _build_ppm_system_prompt()
+
+        try:
+            ai_response = get_ppm_ai_metrics(system_prompt, ppm_text)
+
+            # Same rationale as process_underwriting_files: the AI call can
+            # take 1-2+ minutes, long enough for a DB connection opened
+            # earlier in this request (the quota check above) to have gone
+            # stale. Unconditionally closing forces a fresh connection on
+            # the next query, protecting every DB write below.
+            connection.close()
+
+            extracted_data = extract_ppm_json_from_ai_response(ai_response)
+        except FileValidationError as e:
+            _safe_record_ppm_failure(organization, request.user, ppm_file)
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        except AIRateLimitExhausted:
+            # Deliberately NOT recorded as 'failed' — transient capacity
+            # issue, not a problem with the document — same reasoning as the
+            # CRE pipeline's identical handling above.
+            return Response({
+                'error': "We're experiencing high demand right now. Please try again in a minute or two.",
+                'retryable': True
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        except Exception as e:
+            _safe_record_ppm_failure(organization, request.user, ppm_file)
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # Python performs the actual Sources & Uses vs. acquisition cost
+        # math — the AI only extracted raw figures above. See
+        # reconciliation.run_ppm_reconciliation for the tri-state logic.
+        reconciliation_result = run_ppm_reconciliation(
+            extracted_data.get('raw_sources_and_uses_items'),
+            extracted_data.get('claimed_master_acquisition_cost'),
+        )
+
+        metrics = {
+            'target_asset_name': extracted_data.get('target_asset_name'),
+            'sponsor_platform_name': extracted_data.get('sponsor_platform_name'),
+            'offering_volume': extracted_data.get('offering_volume'),
+            'loan_to_cost_ratio': extracted_data.get('loan_to_cost_ratio'),
+            'weighted_exit_cap': extracted_data.get('weighted_exit_cap'),
+            'total_sponsor_fees': extracted_data.get('total_sponsor_fees'),
+            'year_1_yield': extracted_data.get('year_1_yield'),
+            'provenance': extracted_data.get('provenance_citations') or {},
+            'reconciliation': reconciliation_result,
+            'located_sections': located_sections,
+        }
+
+        elapsed_seconds = time.perf_counter() - pipeline_start_time
+
+        _db_write_with_retry(lambda: record_processed_ppm_document(
+            organization, request.user, ppm_file, status='completed'
+        ))
+        _db_write_with_retry(lambda: record_analysis_report(
+            organization, request.user, metrics, tier,
+            processing_seconds=elapsed_seconds, document_type='PPM'
+        ))
+
+        return Response({'metrics': metrics, 'tier': tier})
+
+
+class ExportPPMMasterGridView(APIView):
+    """
+    ENDPOINT: Institutional cross-analysis export — a single Master Grid
+    spreadsheet listing every PPM analysis for the requesting user's
+    organization, one row per deal, for side-by-side portfolio comparison.
+
+    Distinct from UnderwritePropertyDownloadView's per-analysis download:
+    this is a many-rows-at-once export across an org's PPM history, not a
+    single deal's underwriting workbook.
+
+    SECURITY: organization is derived ONLY from get_user_organization(request)
+    — the authenticated user's own organization — never from a client-
+    supplied org_id or similar request parameter. Every other org-scoped
+    view in this file (DocumentHistoryView, AnalysisReportListView,
+    AnalysisReportDetailView, DashboardStatsView) follows this same rule; do
+    not add an org_id parameter here, as that would let one organization
+    pull another's PPM deal data.
+
+    URL: GET /api/ai/ppm/export-master-grid/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .models import AnalysisReport
+
+        organization = get_user_organization(request)
+
+        if organization is None:
+            # Matches the read-view convention used elsewhere in this file
+            # (DocumentHistoryView, AnalysisReportListView, DashboardStatsView)
+            # — no organization means nothing to export, not an error.
+            return Response({'message': 'No organization associated with this account.'}, status=status.HTTP_200_OK)
+
+        if not organization.has_ppm_access:
+            return Response(
+                {'error': 'Institutional PPM analysis is not enabled for your organization.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        reports = AnalysisReport.objects.filter(
+            organization=organization,
+            document_type='PPM',
+            is_deleted=False,
+        ).order_by('-created_at')
+
+        try:
+            excel_bytes = build_ppm_master_grid(reports)
+        except PPMExcelGenerationError as e:
+            # Not really an error from the user's perspective — they simply
+            # haven't analyzed any PPMs yet. 200 + a plain message, same
+            # spirit as the empty-state responses elsewhere in this file.
+            return Response({'message': str(e)}, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        response = FileResponse(
+            io.BytesIO(excel_bytes),
+            as_attachment=True,
+            filename='PPM_Master_Grid.xlsx',
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        return response
+
 
 # ==========================================
 # Existing utility views

@@ -5,8 +5,10 @@ from .models import Organization, CustomUser
 
 @admin.register(Organization)
 class OrganizationAdmin(admin.ModelAdmin):
-    list_display = ('name', 'primary_email', 'subscription_plan', 'team_size_limit', 'is_paid', 'account_status')
-    list_filter = ('account_status', 'subscription_plan', 'is_paid')
+    list_display = ('name', 'primary_email', 'subscription_plan', 'team_size_limit', 'is_paid', 'account_status',
+                     'has_ppm_access', 'quota_override')
+    list_editable = ('has_ppm_access', 'quota_override')
+    list_filter = ('account_status', 'subscription_plan', 'is_paid', 'has_ppm_access')
     search_fields = ('name', 'primary_email')
 
 class CustomUserAdmin(UserAdmin):
