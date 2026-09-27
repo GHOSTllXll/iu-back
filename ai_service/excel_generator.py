@@ -43,6 +43,12 @@ CURRENCY_FORMATS = {
     'CAD': {'symbol': 'C$', 'number_format': '"C$"#,##0.00'},
     'AUD': {'symbol': 'A$', 'number_format': '"A$"#,##0.00'},
     'ZAR': {'symbol': 'R', 'number_format': '"R"#,##0.00'},
+    # NOTE: uses standard thousands grouping (1,23,456.00 style lakh/crore
+    # grouping is NOT applied here), for consistency with every other currency
+    # in this map and to avoid a locale-specific format code. Flag if Indian
+    # analysts specifically need lakh/crore grouping — that's a real, separate
+    # ask worth doing deliberately, not something to slip in silently here.
+    'INR': {'symbol': '₹', 'number_format': '"₹"#,##0.00'},
 }
 DEFAULT_CURRENCY_CODE = 'USD'
 
