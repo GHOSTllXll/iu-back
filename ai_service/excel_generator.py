@@ -42,6 +42,7 @@ CURRENCY_FORMATS = {
     'CHF': {'symbol': 'CHF', 'number_format': '"CHF" #,##0.00'},
     'CAD': {'symbol': 'C$', 'number_format': '"C$"#,##0.00'},
     'AUD': {'symbol': 'A$', 'number_format': '"A$"#,##0.00'},
+    'ZAR': {'symbol': 'R', 'number_format': '"R"#,##0.00'},
 }
 DEFAULT_CURRENCY_CODE = 'USD'
 
