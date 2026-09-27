@@ -16,6 +16,36 @@ class ExcelGenerationError(Exception):
     pass
 
 
+# ==========================================
+# MULTI-CURRENCY SUPPORT
+# Maps a currency code to (a) the literal symbol used in a couple of plain-text
+# summary strings, and (b) the openpyxl number_format code used on every
+# currency cell in the workbook.
+#
+# NOTE on the number_format codes: these are intentionally simple
+# quoted-literal formats (e.g. '"€"#,##0.00'), NOT the '[$€-407]'-style
+# locale-code formats. A quoted literal renders identically in every Excel
+# build/locale/OS with zero risk of a malformed format code — Excel treats
+# anything inside "..." as plain text, full stop. The '[$SYMBOL-LCID]' syntax
+# exists to make the *number* (decimal separator, digit grouping) follow a
+# specific locale rather than the workbook's own locale, which isn't something
+# this feature needs — we just want the right symbol next to a normally
+# grouped number. Going this route also avoids depending on any specific LCID
+# codes being exactly right, which is easy to get subtly wrong and, if wrong,
+# is exactly the kind of thing that produces "unreadable formatting" or a
+# repair prompt when a file is opened in certain Excel builds.
+# ==========================================
+CURRENCY_FORMATS = {
+    'USD': {'symbol': '$', 'number_format': '"$"#,##0.00'},
+    'EUR': {'symbol': '€', 'number_format': '"€"#,##0.00'},
+    'GBP': {'symbol': '£', 'number_format': '"£"#,##0.00'},
+    'CHF': {'symbol': 'CHF', 'number_format': '"CHF" #,##0.00'},
+    'CAD': {'symbol': 'C$', 'number_format': '"C$"#,##0.00'},
+    'AUD': {'symbol': 'A$', 'number_format': '"A$"#,##0.00'},
+}
+DEFAULT_CURRENCY_CODE = 'USD'
+
+
 def format_citation(citation: dict) -> str:
     """
     Module 4 (Source Provenance) — builds a human-readable citation string from
@@ -95,8 +125,18 @@ T12_LINE_ITEMS = [
     ("total_operating_expenses", "TOTAL OPERATING EXPENSES", True),  # subtotal row
     ("net_operating_income", "NET OPERATING INCOME (NOI)", True),    # subtotal row
 ]
-def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_assumptions: dict = None) -> bytes:
+def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_assumptions: dict = None, currency_code: str = None) -> bytes:
     wb = Workbook()
+
+    # Multi-currency: purely a display/formatting concern — every numeric value
+    # written to the sheet below is untouched (no conversion, no rate lookup).
+    # This only changes which symbol + number_format string gets stamped onto
+    # currency cells. Invalid/unknown codes fall back to USD rather than
+    # raising, since this is a formatting nicety, not something that should be
+    # able to break a download.
+    currency_info = CURRENCY_FORMATS.get((currency_code or DEFAULT_CURRENCY_CODE).upper(), CURRENCY_FORMATS[DEFAULT_CURRENCY_CODE])
+    currency_format = currency_info['number_format']
+    currency_symbol = currency_info['symbol']
 
     # debt_assumptions: {'ltv_pct': 75.0, 'interest_rate_pct': 7.0, 'amortization_years': 30}
     # User-entered per upload — see conversation history for why these can't be
@@ -149,7 +189,7 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
             cleaned_val = clean_cell_value(val)
             cell = ws_rr.cell(row=row_idx, column=col_idx, value=cleaned_val)
             if col_idx == rent_col_idx:
-                cell.number_format = '$#,##0.00'
+                cell.number_format = currency_format
                 if isinstance(cleaned_val, str) and cleaned_val.replace('.', '').replace('-', '').isdigit():
                     cell.value = float(cleaned_val)
     last_row = len(rent_roll_df) + 1
@@ -174,7 +214,7 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
 
     ws_rr.cell(row=avg_rent_row, column=1, value="AVG IN-PLACE RENT:").font = Font(bold=True)
     ws_rr.cell(row=avg_rent_row, column=2, value=f"=AVERAGE({rent_letter}2:{rent_letter}{last_row})")
-    ws_rr.cell(row=avg_rent_row, column=2).number_format = '$#,##0.00'
+    ws_rr.cell(row=avg_rent_row, column=2).number_format = currency_format
 
     # ==========================================
     # TAB 2: CLEANED T12
@@ -214,7 +254,7 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
 
         cell_value.value = value if value is not None else ""
         if isinstance(value, (int, float)):
-            cell_value.number_format = '$#,##0.00'
+            cell_value.number_format = currency_format
 
         line_item_rows[key] = row_num
         row_num += 1
@@ -241,14 +281,14 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
                 "Standardization Engine"
             )
             amount_cell = ws_t12.cell(row=item_row, column=2, value=item["allocated_amount"])
-            amount_cell.number_format = '$#,##0.00'
+            amount_cell.number_format = currency_format
             item_row += 1
 
         total_uncategorized_row = item_row
         ws_t12.cell(row=total_uncategorized_row, column=1, value="TOTAL UNCATEGORIZED").font = Font(bold=True)
         total_cell = ws_t12.cell(row=total_uncategorized_row, column=2, value=standardization["uncategorized_total"])
         total_cell.font = Font(bold=True)
-        total_cell.number_format = '$#,##0.00'
+        total_cell.number_format = currency_format
 
         row_num = total_uncategorized_row + 1
     # ==========================================
@@ -268,7 +308,7 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
     purchase_price_row = capital_header_row + 1
     ws_t12.cell(row=purchase_price_row, column=1, value="Target Purchase Price")
     pp_cell = ws_t12.cell(row=purchase_price_row, column=2, value=purchase_price)
-    pp_cell.number_format = '$#,##0.00'
+    pp_cell.number_format = currency_format
     pp_cell.comment = Comment(
         "Confirmed purchase price used for this analysis — either extracted "
         "from the Offering Memorandum, or manually entered/adjusted before "
@@ -282,7 +322,7 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         dst_row = purchase_price_row + 1
         ws_t12.cell(row=dst_row, column=1, value="DST / Capex Budget")
         dst_cell = ws_t12.cell(row=dst_row, column=2, value=dst_capex)
-        dst_cell.number_format = '$#,##0.00'
+        dst_cell.number_format = currency_format
 
         comment_text = (
             "Deferred maintenance, physical capital repairs, and/or sponsor reserves "
@@ -302,14 +342,14 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
             value=f"=B{purchase_price_row}+B{dst_row}"
         )
         acq_cell.font = Font(bold=True)
-        acq_cell.number_format = '$#,##0.00'
+        acq_cell.number_format = currency_format
     else:
         # No DST/Capex (Basic tier, or AI found none) — Total Acquisition Cost is
         # just the purchase price, still expressed as a formula for consistency.
         ws_t12.cell(row=total_acq_cost_row, column=1, value="TOTAL ACQUISITION COST").font = Font(bold=True)
         acq_cell = ws_t12.cell(row=total_acq_cost_row, column=2, value=f"=B{purchase_price_row}")
         acq_cell.font = Font(bold=True)
-        acq_cell.number_format = '$#,##0.00'
+        acq_cell.number_format = currency_format
     # ==========================================
     # TAB 2 continued: Debt Sizing & Returns
     # LTV / Interest Rate / Amortization are raw user-entered numbers (not
@@ -358,7 +398,7 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         value=f"=B{total_acq_cost_row}*B{ltv_row}"
     )
     loan_cell.font = Font(bold=True)
-    loan_cell.number_format = '$#,##0.00'
+    loan_cell.number_format = currency_format
 
     equity_row = loan_amount_row + 1
     ws_t12.cell(row=equity_row, column=1, value="Total Initial Cash Equity Required").font = Font(bold=True)
@@ -367,7 +407,7 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         value=f"=B{total_acq_cost_row}-B{loan_amount_row}"
     )
     equity_cell.font = Font(bold=True)
-    equity_cell.number_format = '$#,##0.00'
+    equity_cell.number_format = currency_format
     debt_service_row = equity_row + 1
     ws_t12.cell(row=debt_service_row, column=1, value="Annual Debt Service")
     # PMT(rate/12, term*12, -loan) * 12 — standard amortizing loan payment,
@@ -376,7 +416,7 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         row=debt_service_row, column=2,
         value=f"=PMT(B{interest_row}/12, B{amort_row}*12, -B{loan_amount_row})*12"
     )
-    debt_service_cell.number_format = '$#,##0.00'
+    debt_service_cell.number_format = currency_format
 
     dscr_row = debt_service_row + 1
     ws_t12.cell(row=dscr_row, column=1, value="Debt Service Coverage Ratio (DSCR)").font = Font(bold=True)
@@ -459,7 +499,7 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         if is_pct:
             value_cell.number_format = '0.00%'
         elif currency == '$':
-            value_cell.number_format = '$#,##0.00'
+            value_cell.number_format = currency_format
 
         if metric_key:
             dash_row_by_metric[metric_key] = row_idx
@@ -530,7 +570,7 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         summary_row = std_header_row + 1
         ws_dash.cell(
             row=summary_row, column=1,
-            value=f"{count} line item(s) totaling ${total:,.2f} could not be confidently "
+            value=f"{count} line item(s) totaling {currency_symbol}{total:,.2f} could not be confidently "
                   f"categorized. See 'Cleaned T12' tab for details — manual review recommended."
         ).font = Font(italic=True, color="FF888888")
 

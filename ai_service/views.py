@@ -22,7 +22,7 @@ from .parsers import (
     validate_uploaded_file,
     FileValidationError,
 )
-from .excel_generator import generate_underwriting_excel, ExcelGenerationError
+from .excel_generator import generate_underwriting_excel, ExcelGenerationError, CURRENCY_FORMATS, DEFAULT_CURRENCY_CODE
 from .excel_ppm_generator import build_ppm_master_grid, PPMExcelGenerationError
 from .rent_roll_utils import (
     detect_charge_ledger_columns,
@@ -1270,6 +1270,21 @@ class UnderwritePropertyDownloadView(APIView):
         if debt_error:
             return debt_error
 
+        # Multi-currency: purely a display/formatting selection for the Excel
+        # export — does not touch AI extraction, reconciliation, or any
+        # numeric value. Missing field silently defaults to USD (this is a
+        # frontend dropdown that always sends a value; an old cached client
+        # or a direct API caller omitting it shouldn't break downloads). An
+        # explicitly-sent but unrecognized code IS rejected loudly, since that
+        # can only mean a frontend/backend mismatch worth surfacing rather
+        # than silently mis-formatting a client's model.
+        currency_code = (request.data.get('currency_code') or DEFAULT_CURRENCY_CODE).strip().upper()
+        if currency_code not in CURRENCY_FORMATS:
+            return Response(
+                {'error': f"'{currency_code}' is not a supported currency. Supported: {', '.join(sorted(CURRENCY_FORMATS.keys()))}."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         analysis_id = request.data.get('analysis_id')
         cached = get_cached_analysis(analysis_id) if analysis_id else None
 
@@ -1304,7 +1319,7 @@ class UnderwritePropertyDownloadView(APIView):
                 return error
 
         try:
-            excel_bytes = generate_underwriting_excel(metrics, rent_roll_df, debt_assumptions=debt_assumptions)
+            excel_bytes = generate_underwriting_excel(metrics, rent_roll_df, debt_assumptions=debt_assumptions, currency_code=currency_code)
         except ExcelGenerationError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as e:
