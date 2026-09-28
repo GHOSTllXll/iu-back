@@ -49,6 +49,7 @@ CURRENCY_FORMATS = {
     # analysts specifically need lakh/crore grouping — that's a real, separate
     # ask worth doing deliberately, not something to slip in silently here.
     'INR': {'symbol': '₹', 'number_format': '"₹"#,##0.00'},
+    'SGD': {'symbol': 'S$', 'number_format': '"S$"#,##0.00'},
 }
 DEFAULT_CURRENCY_CODE = 'USD'
 

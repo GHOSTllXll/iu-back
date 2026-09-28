@@ -694,7 +694,7 @@ class AdminCreateTrialAccountView(APIView):
     """
     permission_classes = [IsAuthenticated]
  
-    TRIAL_DURATION_HOURS = 24
+    TRIAL_DURATION_HOURS = 48
  
     def post(self, request):
         if not request.user.is_admin:
