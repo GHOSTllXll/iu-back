@@ -722,6 +722,101 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         ws_ind.column_dimensions['A'].width = 34
         ws_ind.column_dimensions['B'].width = 22
 
+    # ==========================================
+    # TAB: OFFICE ANALYSIS (Office assets only)
+    # Same additive/gated pattern as Industrial Analysis above: only created
+    # when the AI extraction returned office-specific data, otherwise the
+    # export is completely unaffected.
+    #
+    # Pro-Rata Share and Net Effective Rent/SF are LIVE FORMULAS referencing
+    # the raw cells above them, both wrapped in IFERROR(...,"N/A") per spec
+    # so a missing/zero denominator degrades to a clean text label instead of
+    # a #DIV/0!/#VALUE! error in the opened workbook.
+    #
+    # NOTE on Net Effective Rent/SF: the originally-specified formula
+    # subtracted "TI Allowance Total" (a lump-sum $ figure) directly from
+    # "Base Rent/SF x Lease Term" (a $/SF figure) -- a unit mismatch that
+    # would silently produce a meaningless number. Fixed here by amortizing
+    # TI Allowance Total over Tenant RSF first (ti_allowance_total /
+    # tenant_rsf) so every term in the formula is in $/SF before combining.
+    # Lease Term is stored in MONTHS (see views.py's office_metrics_guidance)
+    # and converted to years (/12) since Base Rent/SF is an annual rate.
+    #
+    # "Expense Stop Value" is written as a raw reference figure only -- no
+    # Expense Overage formula is built from it, since that would need the
+    # building's actual operating expense per SF, which isn't part of this
+    # schema (deliberately deferred, see office_metrics_guidance).
+    # ==========================================
+    office_metrics = metrics.get("office_metrics")
+    if office_metrics and any(
+        office_metrics.get(k) is not None
+        for k in ("tenant_rsf", "building_total_rsf", "annual_base_rent_per_sf",
+                   "expense_stop_value", "ti_allowance_total", "lease_term_months")
+    ):
+        ws_off = wb.create_sheet("Office Analysis")
+        ws_off.cell(row=1, column=1, value="OFFICE METRIC").font = Font(bold=True, size=12, color="FFD4AF37")
+        ws_off.cell(row=1, column=2, value="VALUE").font = Font(bold=True, size=12, color="FFD4AF37")
+
+        tenant_rsf = safe_get(office_metrics, "tenant_rsf")
+        building_rsf = safe_get(office_metrics, "building_total_rsf")
+        base_rent_psf = safe_get(office_metrics, "annual_base_rent_per_sf")
+        expense_stop = safe_get(office_metrics, "expense_stop_value")
+        ti_allowance = safe_get(office_metrics, "ti_allowance_total")
+        lease_term_months = safe_get(office_metrics, "lease_term_months")
+
+        tenant_rsf_row = 2
+        ws_off.cell(row=tenant_rsf_row, column=1, value="Tenant RSF").font = Font(bold=True)
+        ws_off.cell(row=tenant_rsf_row, column=2, value=tenant_rsf).number_format = '#,##0'
+
+        building_rsf_row = 3
+        ws_off.cell(row=building_rsf_row, column=1, value="Building Total RSF").font = Font(bold=True)
+        ws_off.cell(row=building_rsf_row, column=2, value=building_rsf).number_format = '#,##0'
+
+        base_rent_psf_row = 4
+        ws_off.cell(row=base_rent_psf_row, column=1, value="Annual Base Rent per SF").font = Font(bold=True)
+        ws_off.cell(row=base_rent_psf_row, column=2, value=base_rent_psf).number_format = currency_format
+
+        expense_stop_row = 5
+        expense_stop_label_cell = ws_off.cell(row=expense_stop_row, column=1, value="Expense Stop Value")
+        expense_stop_label_cell.font = Font(bold=True)
+        expense_stop_label_cell.comment = Comment(
+            "Reference figure only. No Expense Overage formula is calculated "
+            "against this yet -- that requires the building's actual operating "
+            "expense per SF, which this extraction does not currently capture.",
+            "Underwriting AI"
+        )
+        ws_off.cell(row=expense_stop_row, column=2, value=expense_stop).number_format = currency_format
+
+        ti_allowance_row = 6
+        ws_off.cell(row=ti_allowance_row, column=1, value="TI Allowance Total").font = Font(bold=True)
+        ws_off.cell(row=ti_allowance_row, column=2, value=ti_allowance).number_format = currency_format
+
+        lease_term_row = 7
+        ws_off.cell(row=lease_term_row, column=1, value="Lease Term (Months)").font = Font(bold=True)
+        ws_off.cell(row=lease_term_row, column=2, value=lease_term_months).number_format = '#,##0'
+
+        pro_rata_row = 9
+        ws_off.cell(row=pro_rata_row, column=1, value="Pro-Rata Share").font = Font(bold=True)
+        pro_rata_cell = ws_off.cell(
+            row=pro_rata_row, column=2,
+            value=f'=IFERROR(B{tenant_rsf_row}/B{building_rsf_row},"N/A")'
+        )
+        pro_rata_cell.number_format = '0.00%'
+
+        ner_row = 10
+        ws_off.cell(row=ner_row, column=1, value="Net Effective Rent per SF").font = Font(bold=True)
+        ner_cell = ws_off.cell(
+            row=ner_row, column=2,
+            value=(
+                f'=IFERROR((B{base_rent_psf_row}*(B{lease_term_row}/12)'
+                f'-B{ti_allowance_row}/B{tenant_rsf_row})/(B{lease_term_row}/12),"N/A")'
+            )
+        )
+        ner_cell.number_format = currency_format
+
+        ws_off.column_dimensions['A'].width = 34
+        ws_off.column_dimensions['B'].width = 22
+
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)

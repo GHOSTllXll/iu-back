@@ -390,6 +390,15 @@ MOCK_METRICS_BASE = {
         "rentable_square_footage": None,
         "annual_base_rent": None,
         "annual_nnn_reimbursements": None
+    },
+    # Same reasoning as industrial_metrics above, for the Office asset class.
+    "office_metrics": {
+        "tenant_rsf": None,
+        "building_total_rsf": None,
+        "annual_base_rent_per_sf": None,
+        "expense_stop_value": None,
+        "ti_allowance_total": None,
+        "lease_term_months": None
     }
 }
 def get_mock_metrics(tier: str) -> dict:
@@ -913,7 +922,45 @@ def _build_system_prompt(tier: str = TIER_BASIC) -> str:
     include_reconciliation = tier in TIERS_WITH_RECONCILIATION
     include_standardization = tier in TIERS_WITH_STANDARDIZATION
     include_provenance = tier in TIERS_WITH_PROVENANCE
-    metric_count = 36 if include_dst_capex else 35
+    metric_count = 42 if include_dst_capex else 41
+
+    # "office_metrics" — same always-included, always-nullable pattern as
+    # industrial_metrics below. Note "expense_stop_value" is extracted as a
+    # raw informational figure ONLY — there is deliberately no "Expense
+    # Overage" formula built on it yet, because that would need the
+    # building's ACTUAL operating expense per SF, which is not part of this
+    # schema. Wiring an overage formula against data we never extract would
+    # produce a formula pointing at nothing; that's a real follow-up ask, not
+    # something to fake tonight. "lease_term_months" is explicitly in MONTHS
+    # (not "months or years") so the Excel formula below has one unambiguous
+    # unit to work with.
+    office_metrics_guidance = """
+
+    Field-specific guidance:
+    - "office_metrics": This section applies ONLY to office properties (a
+      single tenant suite or a multi-tenant office building), typically
+      leased with a Base Year, Expense Stop, and/or Tenant Improvement (TI)
+      allowance structure. If the subject property is NOT an office asset, or
+      the source documents don't state these figures, set ALL SIX fields to
+      null — do not estimate, and do not repurpose residential or industrial
+      figures to fill these in.
+      - "tenant_rsf": The square footage footprint of the specific tenant
+        suite being underwritten (often labeled "Usable Square Feet"/"USF" or
+        "Rentable Square Feet"/"RSF" on the lease abstract or rent roll).
+      - "building_total_rsf": The total rentable square footage of the entire
+        office building/tower, as stated in the OM.
+      - "annual_base_rent_per_sf": The starting ANNUAL base rent rate charged
+        per square foot (before expense reimbursements or TI amortization).
+      - "expense_stop_value": The maximum annual operating expense (per SF or
+        total, as stated) the landlord absorbs before the tenant must
+        contribute — often labeled "Expense Stop" or tied to a "Base Year".
+        Extracted for reference only; no downstream formula depends on it yet.
+      - "ti_allowance_total": The total (lump-sum, not per-SF) cash
+        improvement/build-out budget given to the tenant, as stated in the
+        lease or OM.
+      - "lease_term_months": The total lease duration, converted to MONTHS
+        even if the source document states it in years (e.g. "5-year lease"
+        -> 60)."""
 
     # "industrial_metrics" — ALWAYS included in the schema (not tier-gated:
     # asset class is a property of the deal, not the subscription), but every
@@ -1095,8 +1142,16 @@ def _build_system_prompt(tier: str = TIER_BASIC) -> str:
         "rentable_square_footage": number,
         "annual_base_rent": number,
         "annual_nnn_reimbursements": number
+      }},
+      "office_metrics": {{
+        "tenant_rsf": number,
+        "building_total_rsf": number,
+        "annual_base_rent_per_sf": number,
+        "expense_stop_value": number,
+        "ti_allowance_total": number,
+        "lease_term_months": number
       }}{reconciliation_claims_section}{standardization_section}{provenance_section}
-    }}{industrial_metrics_guidance}{dst_capex_guidance}{reconciliation_guidance}{standardization_guidance}{provenance_guidance}
+    }}{industrial_metrics_guidance}{office_metrics_guidance}{dst_capex_guidance}{reconciliation_guidance}{standardization_guidance}{provenance_guidance}
     """
 
 

@@ -93,25 +93,31 @@ CLASSIFICATION_RULES = [
 MIN_DISTINCT_GROUP_HITS = 2
 
 # ==========================================
-# ASSET-CLASS DETECTION (Industrial & Logistics) — ADDITIVE, NOT part of
-# document-type classification above.
+# ASSET-CLASS DETECTION (Industrial & Logistics, Office, ...) — ADDITIVE, NOT
+# part of document-type classification above.
 #
 # This is a second, independent signal layered on top of the RENT_ROLL /
 # TRAILING_12 / OFFERING_MEMORANDUM / UNCLASSIFIED routing decision, not a
 # replacement or a variant of it. It never changes document_type or scores —
-# it answers a different question ("does this content look like an
-# industrial/NNN-leased property, as opposed to the residential multifamily
-# shape this pipeline was originally built for?") so downstream code (the
-# AI extraction schema in views.py) can decide whether to expect
-# industrial-specific fields (RSF, Base Rent/SF, NNN Reimbursements) at all.
+# it answers a different question ("does this content look like a
+# specialized commercial asset type — industrial/NNN, office/base-year, etc.
+# — as opposed to the residential multifamily shape this pipeline was
+# originally built for?") so downstream code (the AI extraction schema in
+# views.py) can decide which extra fields to expect at all.
 #
-# Same fail-loud principle as MIN_DISTINCT_GROUP_HITS above: below
-# MIN_ASSET_CLASS_GROUP_HITS distinct signals, this reports UNDETERMINED
-# rather than guessing INDUSTRIAL. A wrong Industrial guess would misdirect
-# the extraction prompt for no benefit, so silence (falling back to the
-# standard multifamily-shaped extraction) is the safe default.
+# Structured as a ranked multi-class scorer (same pattern as
+# CLASSIFICATION_RULES above): every registered asset class gets scored
+# independently, and the top scorer wins ONLY if it clears
+# MIN_ASSET_CLASS_GROUP_HITS and strictly beats the runner-up — otherwise the
+# result is UNDETERMINED. A wrong asset-class guess (or an ambiguous
+# Industrial-vs-Office tie) would misdirect the extraction prompt for no
+# benefit, so silence (falling back to the standard multifamily-shaped
+# extraction) is the safe default. Adding a future asset class (Self-Storage,
+# Retail, ...) means adding one new keyword-group constant and one line to
+# ASSET_CLASS_RULES below — nothing else in this file changes.
 # ==========================================
 ASSET_CLASS_INDUSTRIAL = 'INDUSTRIAL'
+ASSET_CLASS_OFFICE = 'OFFICE'
 ASSET_CLASS_UNDETERMINED = 'UNDETERMINED'
 
 INDUSTRIAL_KEYWORD_GROUPS = [
@@ -123,14 +129,48 @@ INDUSTRIAL_KEYWORD_GROUPS = [
     ['warehouse', 'distribution center', 'logistics facility', 'industrial park', 'loading dock', 'dock door', 'clear height'],
 ]
 
+# Office-specific accounting vocabulary — deliberately distinct from the
+# Industrial groups above wherever the real-world terms differ (Base
+# Year / Expense Stop / TI Allowance / Loss Factor are office-lease-specific
+# concepts with no NNN-industrial equivalent), even though a couple of
+# groups (RSF, escalation) legitimately overlap between the two asset
+# classes — that overlap is fine; the ranked-scorer picks whichever class
+# has the stronger overall signal, and ties fall back to UNDETERMINED.
+OFFICE_KEYWORD_GROUPS = [
+    ['usable square feet', 'usable sf', 'usf', 'rentable square feet', 'rsf'],
+    ['base year', 'base year expenses', 'expense base year'],
+    ['expense stop', 'expense stop amount', 'stop amount'],
+    ['tenant improvements', 'ti allowance', 'tenant improvement allowance', 'build-out allowance'],
+    ['net effective rent', 'effective rent'],
+    ['pro-rata share', 'pro rata share', 'proportionate share', 'loss factor'],
+    ['escalation clause', 'rent escalation', 'annual escalation'],
+]
+
+ASSET_CLASS_RULES = [
+    (ASSET_CLASS_INDUSTRIAL, INDUSTRIAL_KEYWORD_GROUPS),
+    (ASSET_CLASS_OFFICE, OFFICE_KEYWORD_GROUPS),
+]
+
 MIN_ASSET_CLASS_GROUP_HITS = 2
 
 
 def _detect_asset_class(lower_text: str) -> dict:
     """Additive asset-class signal — see module note above. Never touches document_type."""
-    industrial_score = _score_text(lower_text, INDUSTRIAL_KEYWORD_GROUPS)
-    asset_class = ASSET_CLASS_INDUSTRIAL if industrial_score >= MIN_ASSET_CLASS_GROUP_HITS else ASSET_CLASS_UNDETERMINED
-    return {"asset_class": asset_class, "industrial_score": industrial_score}
+    scores = {
+        asset_class: _score_text(lower_text, keyword_groups)
+        for asset_class, keyword_groups in ASSET_CLASS_RULES
+    }
+
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    top_class, top_score = ranked[0]
+    runner_up_score = ranked[1][1]
+
+    if top_score >= MIN_ASSET_CLASS_GROUP_HITS and top_score > runner_up_score:
+        asset_class = top_class
+    else:
+        asset_class = ASSET_CLASS_UNDETERMINED
+
+    return {"asset_class": asset_class, "scores": scores}
 
 
 class DocumentClassificationError(Exception):
@@ -251,10 +291,11 @@ def classify_document(uploaded_file) -> dict:
                 DOCUMENT_TYPE_TRAILING_12 / DOCUMENT_TYPE_OFFERING_MEMORANDUM /
                 DOCUMENT_TYPE_UNCLASSIFIED,
             "scores": {"RENT_ROLL": n, "TRAILING_12": n, "OFFERING_MEMORANDUM": n},
-            "asset_class": one of ASSET_CLASS_INDUSTRIAL / ASSET_CLASS_UNDETERMINED
-                — an ADDITIVE, independent signal (see module note above);
-                does not affect document_type or scores in any way.
-            "asset_class_scores": {"INDUSTRIAL": n},
+            "asset_class": one of ASSET_CLASS_INDUSTRIAL / ASSET_CLASS_OFFICE /
+                ASSET_CLASS_UNDETERMINED — an ADDITIVE, independent signal
+                (see module note above); does not affect document_type or
+                scores in any way.
+            "asset_class_scores": {"INDUSTRIAL": n, "OFFICE": n},
         }
 
     Raises DocumentClassificationError if the file itself can't be read.
@@ -282,5 +323,5 @@ def classify_document(uploaded_file) -> dict:
         "document_type": document_type,
         "scores": scores,
         "asset_class": asset_class_result["asset_class"],
-        "asset_class_scores": {"INDUSTRIAL": asset_class_result["industrial_score"]},
+        "asset_class_scores": asset_class_result["scores"],
     }
