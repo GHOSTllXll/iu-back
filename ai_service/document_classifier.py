@@ -92,6 +92,46 @@ CLASSIFICATION_RULES = [
 # otherwise the result is UNCLASSIFIED. See module docstring's fail-loud note.
 MIN_DISTINCT_GROUP_HITS = 2
 
+# ==========================================
+# ASSET-CLASS DETECTION (Industrial & Logistics) — ADDITIVE, NOT part of
+# document-type classification above.
+#
+# This is a second, independent signal layered on top of the RENT_ROLL /
+# TRAILING_12 / OFFERING_MEMORANDUM / UNCLASSIFIED routing decision, not a
+# replacement or a variant of it. It never changes document_type or scores —
+# it answers a different question ("does this content look like an
+# industrial/NNN-leased property, as opposed to the residential multifamily
+# shape this pipeline was originally built for?") so downstream code (the
+# AI extraction schema in views.py) can decide whether to expect
+# industrial-specific fields (RSF, Base Rent/SF, NNN Reimbursements) at all.
+#
+# Same fail-loud principle as MIN_DISTINCT_GROUP_HITS above: below
+# MIN_ASSET_CLASS_GROUP_HITS distinct signals, this reports UNDETERMINED
+# rather than guessing INDUSTRIAL. A wrong Industrial guess would misdirect
+# the extraction prompt for no benefit, so silence (falling back to the
+# standard multifamily-shaped extraction) is the safe default.
+# ==========================================
+ASSET_CLASS_INDUSTRIAL = 'INDUSTRIAL'
+ASSET_CLASS_UNDETERMINED = 'UNDETERMINED'
+
+INDUSTRIAL_KEYWORD_GROUPS = [
+    ['square feet', 'square footage', 'sq ft', 'sq. ft.', 'rentable square footage', 'rsf', 'gla'],
+    ['nnn', 'triple net', 'triple-net lease', 'net net net'],
+    ['cam reimbursement', 'cam recovery', 'common area maintenance', 'cam charges', 'expense reimbursement'],
+    ['base rent/sf', 'base rent per sf', 'rent per square foot', 'annual rent per sf', '$/sf'],
+    ['escalation', 'rent escalation', 'annual escalation', 'escalation clause'],
+    ['warehouse', 'distribution center', 'logistics facility', 'industrial park', 'loading dock', 'dock door', 'clear height'],
+]
+
+MIN_ASSET_CLASS_GROUP_HITS = 2
+
+
+def _detect_asset_class(lower_text: str) -> dict:
+    """Additive asset-class signal — see module note above. Never touches document_type."""
+    industrial_score = _score_text(lower_text, INDUSTRIAL_KEYWORD_GROUPS)
+    asset_class = ASSET_CLASS_INDUSTRIAL if industrial_score >= MIN_ASSET_CLASS_GROUP_HITS else ASSET_CLASS_UNDETERMINED
+    return {"asset_class": asset_class, "industrial_score": industrial_score}
+
 
 class DocumentClassificationError(Exception):
     """
@@ -211,6 +251,10 @@ def classify_document(uploaded_file) -> dict:
                 DOCUMENT_TYPE_TRAILING_12 / DOCUMENT_TYPE_OFFERING_MEMORANDUM /
                 DOCUMENT_TYPE_UNCLASSIFIED,
             "scores": {"RENT_ROLL": n, "TRAILING_12": n, "OFFERING_MEMORANDUM": n},
+            "asset_class": one of ASSET_CLASS_INDUSTRIAL / ASSET_CLASS_UNDETERMINED
+                — an ADDITIVE, independent signal (see module note above);
+                does not affect document_type or scores in any way.
+            "asset_class_scores": {"INDUSTRIAL": n},
         }
 
     Raises DocumentClassificationError if the file itself can't be read.
@@ -232,4 +276,11 @@ def classify_document(uploaded_file) -> dict:
     else:
         document_type = DOCUMENT_TYPE_UNCLASSIFIED
 
-    return {"document_type": document_type, "scores": scores}
+    asset_class_result = _detect_asset_class(lower_text)
+
+    return {
+        "document_type": document_type,
+        "scores": scores,
+        "asset_class": asset_class_result["asset_class"],
+        "asset_class_scores": {"INDUSTRIAL": asset_class_result["industrial_score"]},
+    }

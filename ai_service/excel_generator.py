@@ -648,6 +648,80 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
 
                 next_free_row = dip_row
 
+    # ==========================================
+    # TAB: INDUSTRIAL ANALYSIS (Industrial & Logistics assets only)
+    # Purely additive: only created when the AI extraction actually returned
+    # industrial-specific data (rentable_square_footage / annual_base_rent /
+    # annual_nnn_reimbursements not all null). A standard multifamily export
+    # gets no new tab at all and is otherwise byte-for-byte unaffected by
+    # this block's existence.
+    #
+    # Per-SF figures are LIVE FORMULAS referencing the raw extracted totals
+    # written just above them on this same tab — never AI-computed or
+    # pre-divided values — same "live formula" principle already used for
+    # DSCR / Cash-on-Cash / Sized Loan Amount on the Cleaned T12 tab, so a
+    # lender opening this file can trace exactly how each per-SF number was
+    # derived instead of trusting a black box.
+    # ==========================================
+    industrial_metrics = metrics.get("industrial_metrics")
+    if industrial_metrics and any(
+        industrial_metrics.get(k) is not None
+        for k in ("rentable_square_footage", "annual_base_rent", "annual_nnn_reimbursements")
+    ):
+        ws_ind = wb.create_sheet("Industrial Analysis")
+        ws_ind.cell(row=1, column=1, value="INDUSTRIAL & LOGISTICS METRIC").font = Font(bold=True, size=12, color="FFD4AF37")
+        ws_ind.cell(row=1, column=2, value="VALUE").font = Font(bold=True, size=12, color="FFD4AF37")
+
+        rsf = safe_get(industrial_metrics, "rentable_square_footage")
+        base_rent = safe_get(industrial_metrics, "annual_base_rent")
+        nnn_reimb = safe_get(industrial_metrics, "annual_nnn_reimbursements")
+
+        rsf_row = 2
+        ws_ind.cell(row=rsf_row, column=1, value="Rentable Square Footage (RSF)").font = Font(bold=True)
+        ws_ind.cell(row=rsf_row, column=2, value=rsf).number_format = '#,##0'
+
+        base_rent_row = 3
+        ws_ind.cell(row=base_rent_row, column=1, value="Annual Base Rent").font = Font(bold=True)
+        ws_ind.cell(row=base_rent_row, column=2, value=base_rent).number_format = currency_format
+
+        nnn_row = 4
+        ws_ind.cell(row=nnn_row, column=1, value="Annual NNN Reimbursements").font = Font(bold=True)
+        ws_ind.cell(row=nnn_row, column=2, value=nnn_reimb).number_format = currency_format
+
+        total_rent_row = 5
+        total_rent_cell = ws_ind.cell(row=total_rent_row, column=1, value="Total Annual Rent (Base + NNN)")
+        total_rent_cell.font = Font(bold=True)
+        ws_ind.cell(row=total_rent_row, column=2, value=f"=B{base_rent_row}+B{nnn_row}").number_format = currency_format
+
+        # Per-SF formulas only make sense with a nonzero RSF — if RSF is
+        # missing/zero, write an explanatory note rather than a formula that
+        # would surface as #DIV/0! in the opened workbook.
+        na_font = Font(italic=True, color="FF888888")
+
+        base_rent_psf_row = 7
+        ws_ind.cell(row=base_rent_psf_row, column=1, value="Base Rent per SF").font = Font(bold=True)
+        if rsf:
+            ws_ind.cell(row=base_rent_psf_row, column=2, value=f"=B{base_rent_row}/B{rsf_row}").number_format = currency_format
+        else:
+            ws_ind.cell(row=base_rent_psf_row, column=2, value="N/A (RSF not available)").font = na_font
+
+        nnn_psf_row = 8
+        ws_ind.cell(row=nnn_psf_row, column=1, value="NNN Reimbursement per SF").font = Font(bold=True)
+        if rsf:
+            ws_ind.cell(row=nnn_psf_row, column=2, value=f"=B{nnn_row}/B{rsf_row}").number_format = currency_format
+        else:
+            ws_ind.cell(row=nnn_psf_row, column=2, value="N/A (RSF not available)").font = na_font
+
+        total_psf_row = 9
+        ws_ind.cell(row=total_psf_row, column=1, value="Total Rent per SF (Base + NNN)").font = Font(bold=True)
+        if rsf:
+            ws_ind.cell(row=total_psf_row, column=2, value=f"=B{total_rent_row}/B{rsf_row}").number_format = currency_format
+        else:
+            ws_ind.cell(row=total_psf_row, column=2, value="N/A (RSF not available)").font = na_font
+
+        ws_ind.column_dimensions['A'].width = 34
+        ws_ind.column_dimensions['B'].width = 22
+
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)

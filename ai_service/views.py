@@ -380,6 +380,16 @@ MOCK_METRICS_BASE = {
     },
     "debt_returns": {
         "cash_on_cash_return_pct": 0.082
+    },
+    # This base mock property (View High Lake) is multifamily, so every
+    # industrial field is null here — exactly the shape the real AI path
+    # returns for a non-industrial property (see _build_system_prompt's
+    # industrial_metrics_guidance). This exercises the "industrial tab is
+    # absent for a standard multifamily export" path in AI_MOCK_MODE.
+    "industrial_metrics": {
+        "rentable_square_footage": None,
+        "annual_base_rent": None,
+        "annual_nnn_reimbursements": None
     }
 }
 def get_mock_metrics(tier: str) -> dict:
@@ -903,7 +913,38 @@ def _build_system_prompt(tier: str = TIER_BASIC) -> str:
     include_reconciliation = tier in TIERS_WITH_RECONCILIATION
     include_standardization = tier in TIERS_WITH_STANDARDIZATION
     include_provenance = tier in TIERS_WITH_PROVENANCE
-    metric_count = 33 if include_dst_capex else 32
+    metric_count = 36 if include_dst_capex else 35
+
+    # "industrial_metrics" — ALWAYS included in the schema (not tier-gated:
+    # asset class is a property of the deal, not the subscription), but every
+    # field is explicitly nullable and the guidance below tells the AI to
+    # null the whole section out for non-industrial (e.g. multifamily)
+    # properties. This mirrors the existing "if a metric cannot be found, set
+    # to null" rule already stated below, so a standard multifamily
+    # underwrite behaves exactly as it did before this section existed — it
+    # just gets back three more nulls that downstream code already discards
+    # (see excel_generator.py: the new Industrial Analysis tab only appears
+    # when at least one of these three is non-null).
+    industrial_metrics_guidance = """
+
+    Field-specific guidance:
+    - "industrial_metrics": This section applies ONLY to industrial,
+      warehouse, distribution, or logistics properties leased on a triple-net
+      (NNN) or similar expense-reimbursement basis. If the subject property is
+      NOT an industrial asset (e.g. it's multifamily), or the source documents
+      don't state these figures, set ALL THREE fields to null — do not
+      estimate, and do not repurpose residential rent-roll figures to fill
+      these in.
+      - "rentable_square_footage": The property's total rentable square
+        footage (RSF), as stated in the OM or Rent Roll (often labeled "RSF",
+        "Total SF", "Building SF", or "GLA").
+      - "annual_base_rent": The total ANNUAL base rent (before any NNN/expense
+        reimbursements), summed across all tenant leases if the property is
+        multi-tenant.
+      - "annual_nnn_reimbursements": The total ANNUAL triple-net (NNN) or CAM
+        expense reimbursement income billed to tenants, as stated in the T12
+        or Rent Roll (often labeled "NNN Reimbursement", "CAM Recovery", or
+        "Expense Reimbursement Income")."""
 
     dst_capex_field = ',\n        "dst_capex_budget": number' if include_dst_capex else ''
     dst_capex_guidance = """
@@ -1049,8 +1090,13 @@ def _build_system_prompt(tier: str = TIER_BASIC) -> str:
       }},
       "debt_returns": {{
         "cash_on_cash_return_pct": number
+      }},
+      "industrial_metrics": {{
+        "rentable_square_footage": number,
+        "annual_base_rent": number,
+        "annual_nnn_reimbursements": number
       }}{reconciliation_claims_section}{standardization_section}{provenance_section}
-    }}{dst_capex_guidance}{reconciliation_guidance}{standardization_guidance}{provenance_guidance}
+    }}{industrial_metrics_guidance}{dst_capex_guidance}{reconciliation_guidance}{standardization_guidance}{provenance_guidance}
     """
 
 
