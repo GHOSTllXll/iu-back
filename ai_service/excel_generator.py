@@ -817,6 +817,105 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         ws_off.column_dimensions['A'].width = 34
         ws_off.column_dimensions['B'].width = 22
 
+    # ==========================================
+    # TAB: RETAIL ANALYSIS (Retail assets only)
+    # Same additive/gated pattern as Industrial/Office Analysis above.
+    #
+    # All 4 derived rows (Pro-Rata CAM Share, Sales Overage, Percentage Rent
+    # Owed, Total Gross Rent Revenue) are LIVE FORMULAS chained off the raw
+    # cells above them and off each other, each independently wrapped in
+    # IFERROR(...,"N/A") per spec -- including the ones that reference an
+    # upstream formula cell, so if an upstream cell degrades to the text
+    # "N/A" (missing/zero denominator), the downstream formula's own IFERROR
+    # catches the resulting #VALUE! and degrades to "N/A" too rather than
+    # propagating a broken error chain.
+    #
+    # Unlike Office's Expense Stop Value, every retail field here IS used by
+    # a formula -- this schema has no informational-only leftover field.
+    # ==========================================
+    retail_metrics = metrics.get("retail_metrics")
+    if retail_metrics and any(
+        retail_metrics.get(k) is not None
+        for k in ("tenant_gla", "center_total_gla", "annual_base_rent_per_sf",
+                   "percentage_rent_rate", "tenant_breakpoint_threshold", "tenant_gross_annual_sales")
+    ):
+        ws_ret = wb.create_sheet("Retail Analysis")
+        ws_ret.cell(row=1, column=1, value="RETAIL METRIC").font = Font(bold=True, size=12, color="FFD4AF37")
+        ws_ret.cell(row=1, column=2, value="VALUE").font = Font(bold=True, size=12, color="FFD4AF37")
+
+        tenant_gla = safe_get(retail_metrics, "tenant_gla")
+        center_gla = safe_get(retail_metrics, "center_total_gla")
+        base_rent_psf = safe_get(retail_metrics, "annual_base_rent_per_sf")
+        pct_rent_rate = safe_get(retail_metrics, "percentage_rent_rate")
+        breakpoint_threshold = safe_get(retail_metrics, "tenant_breakpoint_threshold")
+        gross_sales = safe_get(retail_metrics, "tenant_gross_annual_sales")
+
+        tenant_gla_row = 2
+        ws_ret.cell(row=tenant_gla_row, column=1, value="Tenant GLA").font = Font(bold=True)
+        ws_ret.cell(row=tenant_gla_row, column=2, value=tenant_gla).number_format = '#,##0'
+
+        center_gla_row = 3
+        ws_ret.cell(row=center_gla_row, column=1, value="Center Total GLA").font = Font(bold=True)
+        ws_ret.cell(row=center_gla_row, column=2, value=center_gla).number_format = '#,##0'
+
+        base_rent_psf_row = 4
+        ws_ret.cell(row=base_rent_psf_row, column=1, value="Annual Base Rent per SF").font = Font(bold=True)
+        ws_ret.cell(row=base_rent_psf_row, column=2, value=base_rent_psf).number_format = currency_format
+
+        pct_rent_rate_row = 5
+        ws_ret.cell(row=pct_rent_rate_row, column=1, value="Percentage Rent Rate").font = Font(bold=True)
+        ws_ret.cell(row=pct_rent_rate_row, column=2, value=pct_rent_rate).number_format = '0.00%'
+
+        breakpoint_row = 6
+        ws_ret.cell(row=breakpoint_row, column=1, value="Tenant Breakpoint Threshold").font = Font(bold=True)
+        ws_ret.cell(row=breakpoint_row, column=2, value=breakpoint_threshold).number_format = currency_format
+
+        gross_sales_row = 7
+        ws_ret.cell(row=gross_sales_row, column=1, value="Tenant Gross Annual Sales").font = Font(bold=True)
+        ws_ret.cell(row=gross_sales_row, column=2, value=gross_sales).number_format = currency_format
+
+        pro_rata_row = 9
+        ws_ret.cell(row=pro_rata_row, column=1, value="Pro-Rata CAM Share").font = Font(bold=True)
+        pro_rata_cell = ws_ret.cell(
+            row=pro_rata_row, column=2,
+            value=f'=IFERROR(B{tenant_gla_row}/B{center_gla_row},"N/A")'
+        )
+        pro_rata_cell.number_format = '0.00%'
+
+        overage_row = 10
+        ws_ret.cell(row=overage_row, column=1, value="Retail Sales Overage").font = Font(bold=True)
+        overage_cell = ws_ret.cell(
+            row=overage_row, column=2,
+            value=(
+                f'=IFERROR(IF(B{gross_sales_row}>B{breakpoint_row},'
+                f'B{gross_sales_row}-B{breakpoint_row},0),"N/A")'
+            )
+        )
+        overage_cell.number_format = currency_format
+
+        pct_rent_owed_row = 11
+        ws_ret.cell(row=pct_rent_owed_row, column=1, value="Total Percentage Rent Owed").font = Font(bold=True)
+        pct_rent_owed_cell = ws_ret.cell(
+            row=pct_rent_owed_row, column=2,
+            value=f'=IFERROR(B{overage_row}*B{pct_rent_rate_row},"N/A")'
+        )
+        pct_rent_owed_cell.number_format = currency_format
+
+        total_revenue_row = 12
+        total_revenue_cell = ws_ret.cell(row=total_revenue_row, column=1, value="Total Gross Rent Revenue (Base + Percentage)")
+        total_revenue_cell.font = Font(bold=True)
+        total_gross_revenue_cell = ws_ret.cell(
+            row=total_revenue_row, column=2,
+            value=(
+                f'=IFERROR((B{tenant_gla_row}*B{base_rent_psf_row})+B{pct_rent_owed_row},"N/A")'
+            )
+        )
+        total_gross_revenue_cell.font = Font(bold=True)
+        total_gross_revenue_cell.number_format = currency_format
+
+        ws_ret.column_dimensions['A'].width = 34
+        ws_ret.column_dimensions['B'].width = 22
+
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)

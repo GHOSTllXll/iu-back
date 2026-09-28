@@ -399,6 +399,15 @@ MOCK_METRICS_BASE = {
         "expense_stop_value": None,
         "ti_allowance_total": None,
         "lease_term_months": None
+    },
+    # Same reasoning again, for the Retail asset class.
+    "retail_metrics": {
+        "tenant_gla": None,
+        "center_total_gla": None,
+        "annual_base_rent_per_sf": None,
+        "percentage_rent_rate": None,
+        "tenant_breakpoint_threshold": None,
+        "tenant_gross_annual_sales": None
     }
 }
 def get_mock_metrics(tier: str) -> dict:
@@ -922,7 +931,41 @@ def _build_system_prompt(tier: str = TIER_BASIC) -> str:
     include_reconciliation = tier in TIERS_WITH_RECONCILIATION
     include_standardization = tier in TIERS_WITH_STANDARDIZATION
     include_provenance = tier in TIERS_WITH_PROVENANCE
-    metric_count = 42 if include_dst_capex else 41
+    metric_count = 48 if include_dst_capex else 47
+
+    # "retail_metrics" — same always-included, always-nullable pattern as
+    # industrial_metrics/office_metrics. Unlike office_metrics's dropped
+    # Expense Overage formula, every field referenced by the Retail Analysis
+    # Excel formulas (Sales Overage, Percentage Rent Owed, Total Gross Rent
+    # Revenue) IS present in this schema, so nothing here is a stub for a
+    # missing figure. "percentage_rent_rate" is a DECIMAL FRACTION (0.05 for
+    # 5%), matching every other percentage field already in this schema
+    # (e.g. physical_occupancy_pct) — not a whole-number percent.
+    retail_metrics_guidance = """
+
+    Field-specific guidance:
+    - "retail_metrics": This section applies ONLY to retail properties
+      (strip centers, shopping centers, or regional malls) with a
+      Percentage Rent / sales-breakpoint lease structure. If the subject
+      property is NOT a retail asset, or the source documents don't state
+      these figures, set ALL SIX fields to null — do not estimate, and do
+      not repurpose figures from another asset class to fill these in.
+      - "tenant_gla": The Gross Leasable Area (GLA), in square feet, of the
+        specific retail shop/unit being underwritten.
+      - "center_total_gla": The total Gross Leasable Area of the entire
+        shopping center/mall, as stated in the OM.
+      - "annual_base_rent_per_sf": The flat ANNUAL base rent rate charged per
+        square foot, before any percentage rent.
+      - "percentage_rent_rate": The commission rate the tenant owes on sales
+        above their breakpoint, as a DECIMAL FRACTION (e.g. 0.05 for a
+        5% percentage rent clause), not a whole number.
+      - "tenant_breakpoint_threshold": The exact gross sales dollar volume
+        (natural or artificial breakpoint, as stated) the tenant must exceed
+        before percentage rent applies.
+      - "tenant_gross_annual_sales": The tenant's actual historical annual
+        gross sales dollar volume, as reported in a sales log or estoppel, if
+        stated. If the source documents don't report actual tenant sales,
+        set to null — do not estimate from the breakpoint or rent alone."""
 
     # "office_metrics" — same always-included, always-nullable pattern as
     # industrial_metrics below. Note "expense_stop_value" is extracted as a
@@ -1150,8 +1193,16 @@ def _build_system_prompt(tier: str = TIER_BASIC) -> str:
         "expense_stop_value": number,
         "ti_allowance_total": number,
         "lease_term_months": number
+      }},
+      "retail_metrics": {{
+        "tenant_gla": number,
+        "center_total_gla": number,
+        "annual_base_rent_per_sf": number,
+        "percentage_rent_rate": number,
+        "tenant_breakpoint_threshold": number,
+        "tenant_gross_annual_sales": number
       }}{reconciliation_claims_section}{standardization_section}{provenance_section}
-    }}{industrial_metrics_guidance}{office_metrics_guidance}{dst_capex_guidance}{reconciliation_guidance}{standardization_guidance}{provenance_guidance}
+    }}{industrial_metrics_guidance}{office_metrics_guidance}{retail_metrics_guidance}{dst_capex_guidance}{reconciliation_guidance}{standardization_guidance}{provenance_guidance}
     """
 
 

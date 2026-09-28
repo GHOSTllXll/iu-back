@@ -118,6 +118,7 @@ MIN_DISTINCT_GROUP_HITS = 2
 # ==========================================
 ASSET_CLASS_INDUSTRIAL = 'INDUSTRIAL'
 ASSET_CLASS_OFFICE = 'OFFICE'
+ASSET_CLASS_RETAIL = 'RETAIL'
 ASSET_CLASS_UNDETERMINED = 'UNDETERMINED'
 
 INDUSTRIAL_KEYWORD_GROUPS = [
@@ -146,9 +147,25 @@ OFFICE_KEYWORD_GROUPS = [
     ['escalation clause', 'rent escalation', 'annual escalation'],
 ]
 
+
+# Retail-specific accounting vocabulary — Percentage Rent / breakpoint /
+# anchor-tenant concepts have no equivalent in the Industrial or Office
+# groups above. GLA and CAM legitimately overlap with the other classes
+# (same overlap-is-fine reasoning as Office's RSF/escalation groups); the
+# ranked scorer resolves it by whichever class has the stronger signal.
+RETAIL_KEYWORD_GROUPS = [
+    ['gross leasable area', 'gla'],
+    ['percentage rent', 'percent rent'],
+    ['overage rent', 'natural breakpoint', 'artificial breakpoint', 'breakpoint'],
+    ['gross sales threshold', 'tenant sales log', 'gross sales', 'gross annual sales'],
+    ['common area maintenance', 'cam charges', 'cam reimbursement', 'cam recovery'],
+    ['anchor tenant', 'anchor store', 'shopping center', 'strip center'],
+]
+
 ASSET_CLASS_RULES = [
     (ASSET_CLASS_INDUSTRIAL, INDUSTRIAL_KEYWORD_GROUPS),
     (ASSET_CLASS_OFFICE, OFFICE_KEYWORD_GROUPS),
+    (ASSET_CLASS_RETAIL, RETAIL_KEYWORD_GROUPS),
 ]
 
 MIN_ASSET_CLASS_GROUP_HITS = 2
@@ -292,10 +309,10 @@ def classify_document(uploaded_file) -> dict:
                 DOCUMENT_TYPE_UNCLASSIFIED,
             "scores": {"RENT_ROLL": n, "TRAILING_12": n, "OFFERING_MEMORANDUM": n},
             "asset_class": one of ASSET_CLASS_INDUSTRIAL / ASSET_CLASS_OFFICE /
-                ASSET_CLASS_UNDETERMINED — an ADDITIVE, independent signal
-                (see module note above); does not affect document_type or
-                scores in any way.
-            "asset_class_scores": {"INDUSTRIAL": n, "OFFICE": n},
+                ASSET_CLASS_RETAIL / ASSET_CLASS_UNDETERMINED — an ADDITIVE,
+                independent signal (see module note above); does not affect
+                document_type or scores in any way.
+            "asset_class_scores": {"INDUSTRIAL": n, "OFFICE": n, "RETAIL": n},
         }
 
     Raises DocumentClassificationError if the file itself can't be read.
