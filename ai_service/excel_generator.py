@@ -50,6 +50,9 @@ CURRENCY_FORMATS = {
     # ask worth doing deliberately, not something to slip in silently here.
     'INR': {'symbol': '₹', 'number_format': '"₹"#,##0.00'},
     'SGD': {'symbol': 'S$', 'number_format': '"S$"#,##0.00'},
+    'TWD': {'symbol': 'NT$', 'number_format': '"NT$"#,##0.00'},
+    'BDT': {'symbol': '৳', 'number_format': '"৳"#,##0.00'},
+    'BRL': {'symbol': 'R$', 'number_format': '"R$"#,##0.00'},
 }
 DEFAULT_CURRENCY_CODE = 'USD'
 
