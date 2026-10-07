@@ -13,6 +13,7 @@ from .views import (
     DashboardStatsView,
     PPMUnderwriteView,
     ExportPPMMasterGridView,
+    TaskStatusView,
 )
 
 urlpatterns = [
@@ -37,4 +38,8 @@ urlpatterns = [
     # PPMUnderwriteView docstring for why the batch loop lives client-side.
     path('ppm/underwrite/', PPMUnderwriteView.as_view(), name='ppm_underwrite'),
     path('ppm/export-master-grid/', ExportPPMMasterGridView.as_view(), name='ppm_export_master_grid'),
+
+    # Shared polling endpoint for the Celery-backed CRE (underwrite/) and
+    # PPM (ppm/underwrite/) tasks above - see TaskStatusView's docstring.
+    path('task-status/<str:task_id>/', TaskStatusView.as_view(), name='task_status'),
 ]

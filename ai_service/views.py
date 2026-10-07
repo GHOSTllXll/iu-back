@@ -4,6 +4,8 @@ import re
 import json
 import os
 import time
+import uuid
+import tempfile
 import pandas as pd
 from datetime import timedelta
 from django.http import FileResponse
@@ -12,6 +14,9 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
+
+from celery.result import AsyncResult
+from .tasks import run_cre_underwriting_task, run_ppm_underwriting_task
 
 from .llm_router import ai_client, AIRateLimitExhausted
 from .parsers import (
@@ -1292,6 +1297,37 @@ def _build_ppm_system_prompt() -> str:
     """
 
 
+# Temp-file staging directory for uploads about to be handed off to a
+# Celery task - see _save_upload_to_temp's docstring for why this exists.
+# Each task deletes its own temp file(s) in a finally block on both the
+# success and failure path; a cron job also sweeps anything older than an
+# hour as a backstop against a worker crashing before reaching that finally
+# block (see deploy notes).
+PENDING_UPLOAD_DIR = os.path.join(tempfile.gettempdir(), 'ppm_underwriting_pending_uploads')
+
+
+def _save_upload_to_temp(uploaded_file):
+    """
+    Saves an in-memory/temp-file Django UploadedFile to a plain file on disk
+    so a Celery task - running in a completely separate OS process, after
+    this request has already finished - can read it. Django's UploadedFile
+    objects are bound to the request and can't be serialized across the
+    Celery broker; a disk path (a plain string) can.
+
+    Returns (temp_path, original_filename). The caller enqueues both into
+    the Celery task, which re-wraps the file in django.core.files.File
+    (restoring the .name/.seek() interface the existing parsers expect) and
+    deletes the temp file once it's done with it.
+    """
+    os.makedirs(PENDING_UPLOAD_DIR, exist_ok=True)
+    ext = os.path.splitext(uploaded_file.name)[1]
+    temp_path = os.path.join(PENDING_UPLOAD_DIR, f"{uuid.uuid4().hex}{ext}")
+    with open(temp_path, 'wb') as out:
+        for chunk in uploaded_file.chunks():
+            out.write(chunk)
+    return temp_path, uploaded_file.name
+
+
 class ClassifyDocumentView(APIView):
     """
     ENDPOINT 0: Intelligent Document Classification Layer — the front of the
@@ -1369,7 +1405,14 @@ class ClassifyDocumentView(APIView):
 
 class UnderwritePropertyView(APIView):
     """
-    ENDPOINT 1: Returns JSON metrics (used by the dashboard's "Analyze Documents" button)
+    ENDPOINT 1: Enqueues the CRE/Multifamily extraction pipeline as a
+    background Celery task and returns a task_id immediately, instead of
+    blocking the request on the AI call (which can take 1-2+ minutes - see
+    the TIMING BREAKDOWN log line inside process_underwriting_files). The
+    frontend polls TaskStatusView with this task_id until it resolves to
+    the exact same {metrics, tier, analysis_id} shape this endpoint used to
+    return directly, so no downstream response-handling code had to change.
+
     URL: /api/ai/underwrite/
     """
     permission_classes = [IsAuthenticated]
@@ -1383,20 +1426,28 @@ class UnderwritePropertyView(APIView):
             return Response({'error': 'All three files are required.'}, status=status.HTTP_400_BAD_REQUEST)
 
         tier = get_user_tier(request)
-        metrics, rent_roll_df, error = process_underwriting_files(
-            om_file, t12_file, rent_roll_file, tier=tier,
-            organization=get_user_organization(request), uploaded_by=request.user
-        )
 
-        if error:
-            return error
+        om_path, om_name = _save_upload_to_temp(om_file)
+        t12_path, t12_name = _save_upload_to_temp(t12_file)
+        rent_roll_path, rent_roll_name = _save_upload_to_temp(rent_roll_file)
 
-        # Cache this result so a follow-up "Download Excel" click (which lives
-        # inside the modal this response populates) can reuse it instead of
-        # re-parsing files and re-calling the AI. See analysis_cache.py.
-        analysis_id = store_analysis(metrics, rent_roll_df)
-
-        return Response({'metrics': metrics, 'tier': tier, 'analysis_id': analysis_id})
+        try:
+            task = run_cre_underwriting_task.delay(
+                om_path, om_name, t12_path, t12_name, rent_roll_path, rent_roll_name,
+                tier, request.user.pk,
+            )
+        except Exception:
+            # Enqueueing itself failed (e.g. Redis unreachable) - the temp
+            # files we just wrote will never be picked up by a task to clean
+            # them, so remove them ourselves rather than leaking them until
+            # the hourly stale-upload cron sweep catches them.
+            for p in (om_path, t12_path, rent_roll_path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            raise
+        return Response({'task_id': task.id, 'status': 'queued'}, status=status.HTTP_202_ACCEPTED)
 
 class UnderwritePropertyDownloadView(APIView):
     """
@@ -1485,23 +1536,106 @@ class UnderwritePropertyDownloadView(APIView):
         )
         return response
 
+def process_ppm_file(ppm_file, manual_pages, tier, organization=None, uploaded_by=None):
+    """
+    Shared logic for the institutional PPM pipeline - extracted out of
+    PPMUnderwriteView.post so both the Celery task (run_ppm_underwriting_task)
+    and this view can share one implementation, mirroring
+    process_underwriting_files' role for the CRE pipeline above.
+    Organization-gating (has_ppm_access) and request-level parsing (the
+    ppm_file-required check, manual_pages string parsing) stay in the view
+    itself, since those need the request object directly and are cheap,
+    fast checks worth rejecting on before ever touching a Celery worker.
+
+    Returns: (metrics_dict, error_response_or_None) - same two-value shape
+    process_underwriting_files uses for the CRE pipeline (minus the
+    DataFrame, which the PPM pipeline has no equivalent of).
+    """
+    quota_error = check_upload_quota(organization, tier)
+    if quota_error:
+        return None, quota_error
+
+    try:
+        validate_uploaded_file(ppm_file, {'.pdf'}, label="PPM Document", max_size_bytes=PPM_MAX_FILE_SIZE)
+    except FileValidationError as e:
+        return None, Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    pipeline_start_time = time.perf_counter()
+
+    try:
+        ppm_text, located_sections = extract_ppm_target_text(ppm_file, manual_pages=manual_pages)
+    except PPMSplitterError as e:
+        return None, Response({
+            'error': str(e),
+            'needs_manual_page_range': True,
+        }, status=status.HTTP_400_BAD_REQUEST)
+    except FileValidationError as e:
+        return None, Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    system_prompt = _build_ppm_system_prompt()
+
+    try:
+        ai_response = get_ppm_ai_metrics(system_prompt, ppm_text)
+        connection.close()
+        extracted_data = extract_ppm_json_from_ai_response(ai_response)
+    except FileValidationError as e:
+        _safe_record_ppm_failure(organization, uploaded_by, ppm_file)
+        return None, Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    except AIRateLimitExhausted:
+        return None, Response({
+            'error': "We're experiencing high demand right now. Please try again in a minute or two.",
+            'retryable': True
+        }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+    except Exception as e:
+        _safe_record_ppm_failure(organization, uploaded_by, ppm_file)
+        return None, Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    reconciliation_result = run_ppm_reconciliation(
+        extracted_data.get('raw_sources_and_uses_items'),
+        extracted_data.get('claimed_master_acquisition_cost'),
+    )
+
+    metrics = {
+        'target_asset_name': extracted_data.get('target_asset_name'),
+        'sponsor_platform_name': extracted_data.get('sponsor_platform_name'),
+        'offering_volume': extracted_data.get('offering_volume'),
+        'loan_to_cost_ratio': extracted_data.get('loan_to_cost_ratio'),
+        'weighted_exit_cap': extracted_data.get('weighted_exit_cap'),
+        'total_sponsor_fees': extracted_data.get('total_sponsor_fees'),
+        'year_1_yield': extracted_data.get('year_1_yield'),
+        'provenance': extracted_data.get('provenance_citations') or {},
+        'reconciliation': reconciliation_result,
+        'located_sections': located_sections,
+    }
+
+    elapsed_seconds = time.perf_counter() - pipeline_start_time
+
+    _db_write_with_retry(lambda: record_processed_ppm_document(
+        organization, uploaded_by, ppm_file, status='completed'
+    ))
+    _db_write_with_retry(lambda: record_analysis_report(
+        organization, uploaded_by, metrics, tier,
+        processing_seconds=elapsed_seconds, document_type='PPM'
+    ))
+
+    return metrics, None
+
+
 class PPMUnderwriteView(APIView):
     """
-    ENDPOINT: Institutional PPM analysis. Processes exactly ONE PPM document
-    per request — the frontend's "Institutional PPM Batch Console" loops this
-    call once per uploaded file (up to 5 per batch) client-side, awaiting
-    each response before firing the next. That loop deliberately does NOT
-    live in this view: keeping each request single-document keeps it well
-    under the VPS's 300-second nginx timeout regardless of how many files a
-    user drops into the console at once — batching several files into one
-    request here would reintroduce the exact timeout failure mode the CRE
-    pipeline's VPS migration already fixed once, just multiplied by batch size.
+    ENDPOINT: Institutional PPM analysis. Enqueues process_ppm_file as a
+    background Celery task and returns a task_id immediately - same
+    migration as UnderwritePropertyView above, for the same reason (the AI
+    call here routinely takes 1-2+ minutes). Still processes exactly ONE PPM
+    document per request; the frontend's "Institutional PPM Batch Console"
+    still loops this call once per uploaded file (up to 5 per batch)
+    client-side, polling each task to completion before firing the next.
 
     Gated on organization.has_ppm_access, which is INDEPENDENT of
-    subscription_plan — a feature flag rather than a new tier, so PPM access
+    subscription_plan - a feature flag rather than a new tier, so PPM access
     can be granted per-org without restructuring TIER_UPLOAD_LIMITS. Counts
     against the same rolling 30-day upload quota as the CRE pipeline (see
-    document_history.record_analysis_report / get_period_usage — usage
+    document_history.record_analysis_report / get_period_usage - usage
     counting doesn't filter by document_type, by design).
 
     URL: POST /api/ai/ppm/underwrite/
@@ -1521,11 +1655,6 @@ class PPMUnderwriteView(APIView):
         if ppm_file is None:
             return Response({'error': 'ppm_file is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Optional manual page-range override — the escape hatch when the
-        # heuristic splitter (ppm_splitter.py) can't confidently locate all
-        # 3 target sections. Comma-separated 1-indexed page numbers, e.g.
-        # "4,5,12,13". When present, the splitter's heuristic is skipped
-        # entirely in favor of exactly these pages.
         manual_pages_raw = (request.data.get('manual_pages') or '').strip()
         manual_pages = None
         if manual_pages_raw:
@@ -1541,94 +1670,58 @@ class PPMUnderwriteView(APIView):
 
         tier = get_user_tier(request)
 
-        # Quota check BEFORE any parsing/AI work, same principle as the CRE
-        # pipeline (process_underwriting_files) — an org over their limit is
-        # rejected immediately rather than wasting processing on a file that
-        # was never going to be allowed through.
-        quota_error = check_upload_quota(organization, tier)
-        if quota_error:
-            return quota_error
-
+        temp_path, temp_name = _save_upload_to_temp(ppm_file)
         try:
-            validate_uploaded_file(ppm_file, {'.pdf'}, label="PPM Document", max_size_bytes=PPM_MAX_FILE_SIZE)
-        except FileValidationError as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            task = run_ppm_underwriting_task.delay(
+                temp_path, temp_name, manual_pages, tier, request.user.pk,
+            )
+        except Exception:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            raise
+        return Response({'task_id': task.id, 'status': 'queued'}, status=status.HTTP_202_ACCEPTED)
 
-        pipeline_start_time = time.perf_counter()
 
-        # Local, pre-AI page-range narrowing — runs before any cloud AI call
-        # so a 300-page document never gets sent to the model in full. See
-        # ppm_splitter.py's module docstring for the fail-loud rationale.
-        try:
-            ppm_text, located_sections = extract_ppm_target_text(ppm_file, manual_pages=manual_pages)
-        except PPMSplitterError as e:
-            return Response({
-                'error': str(e),
-                'needs_manual_page_range': True,
-            }, status=status.HTTP_400_BAD_REQUEST)
-        except FileValidationError as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+class TaskStatusView(APIView):
+    """
+    Polling endpoint shared by both the CRE and PPM Celery tasks (see
+    ai_service/tasks.py and UnderwritePropertyView / PPMUnderwriteView
+    above). On completion, returns EXACTLY the same body the old fully
+    synchronous endpoints used to return directly - {metrics, tier,
+    analysis_id} on success, or the identical error shape
+    ({error, retryable, needs_manual_page_range, ...} with the original
+    status code) on a handled failure - so the frontend's existing
+    response-handling and error-handling code needed no changes beyond
+    wrapping the initial request in a poll loop.
 
-        system_prompt = _build_ppm_system_prompt()
+    URL: GET /api/ai/task-status/<task_id>/
+    """
+    permission_classes = [IsAuthenticated]
 
-        try:
-            ai_response = get_ppm_ai_metrics(system_prompt, ppm_text)
+    def get(self, request, task_id):
+        result = AsyncResult(task_id)
 
-            # Same rationale as process_underwriting_files: the AI call can
-            # take 1-2+ minutes, long enough for a DB connection opened
-            # earlier in this request (the quota check above) to have gone
-            # stale. Unconditionally closing forces a fresh connection on
-            # the next query, protecting every DB write below.
-            connection.close()
+        if not result.ready():
+            return Response({'status': 'processing'})
 
-            extracted_data = extract_ppm_json_from_ai_response(ai_response)
-        except FileValidationError as e:
-            _safe_record_ppm_failure(organization, request.user, ppm_file)
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        except AIRateLimitExhausted:
-            # Deliberately NOT recorded as 'failed' — transient capacity
-            # issue, not a problem with the document — same reasoning as the
-            # CRE pipeline's identical handling above.
-            return Response({
-                'error': "We're experiencing high demand right now. Please try again in a minute or two.",
-                'retryable': True
-            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-        except Exception as e:
-            _safe_record_ppm_failure(organization, request.user, ppm_file)
-            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        if result.failed():
+            logger.error(f"Celery task {task_id} failed: {result.result!r}")
+            return Response(
+                {'error': 'Something went wrong while processing your document. Please try again.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
-        # Python performs the actual Sources & Uses vs. acquisition cost
-        # math — the AI only extracted raw figures above. See
-        # reconciliation.run_ppm_reconciliation for the tri-state logic.
-        reconciliation_result = run_ppm_reconciliation(
-            extracted_data.get('raw_sources_and_uses_items'),
-            extracted_data.get('claimed_master_acquisition_cost'),
-        )
+        task_result = result.result
 
-        metrics = {
-            'target_asset_name': extracted_data.get('target_asset_name'),
-            'sponsor_platform_name': extracted_data.get('sponsor_platform_name'),
-            'offering_volume': extracted_data.get('offering_volume'),
-            'loan_to_cost_ratio': extracted_data.get('loan_to_cost_ratio'),
-            'weighted_exit_cap': extracted_data.get('weighted_exit_cap'),
-            'total_sponsor_fees': extracted_data.get('total_sponsor_fees'),
-            'year_1_yield': extracted_data.get('year_1_yield'),
-            'provenance': extracted_data.get('provenance_citations') or {},
-            'reconciliation': reconciliation_result,
-            'located_sections': located_sections,
-        }
+        if isinstance(task_result, dict) and task_result.get('error'):
+            return Response(
+                task_result.get('data', {'error': 'Request failed.'}),
+                status=task_result.get('status_code', status.HTTP_500_INTERNAL_SERVER_ERROR)
+            )
 
-        elapsed_seconds = time.perf_counter() - pipeline_start_time
-
-        _db_write_with_retry(lambda: record_processed_ppm_document(
-            organization, request.user, ppm_file, status='completed'
-        ))
-        _db_write_with_retry(lambda: record_analysis_report(
-            organization, request.user, metrics, tier,
-            processing_seconds=elapsed_seconds, document_type='PPM'
-        ))
-
-        return Response({'metrics': metrics, 'tier': tier})
+        return Response(task_result)
 
 
 class ExportPPMMasterGridView(APIView):

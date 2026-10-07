@@ -48,3 +48,4 @@ urllib3==2.7.0
 django-redis==7.0.0
 redis==8.1.0
 PyMySQL==1.2.0
+celery==5.4.0

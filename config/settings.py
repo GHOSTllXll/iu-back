@@ -130,6 +130,28 @@ CACHES = {
     }
 }
 
+# Celery - background task queue for the CRE/PPM AI-extraction pipelines
+# (see ai_service/tasks.py). Reuses the same Redis instance as the cache
+# above but a different DB index (2, not 1) so task bookkeeping never mixes
+# with analysis-result caching.
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://127.0.0.1:6379/2')
+CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://127.0.0.1:6379/2')
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TASK_TRACK_STARTED = True
+# 1 hour - long enough for a client to finish polling and read the result,
+# short enough not to let completed-task bookkeeping pile up in Redis.
+CELERY_RESULT_EXPIRES = 60 * 60
+# Hard ceiling well above the observed 1-2+ minute AI call time - a safety
+# net against a hung task, not the expected runtime.
+CELERY_TASK_TIME_LIMIT = 60 * 10
+CELERY_TASK_SOFT_TIME_LIMIT = 60 * 8
+# Recycle worker processes periodically - mirrors the CONN_MAX_AGE=0
+# reasoning above: a long-lived worker process holding a stale DB/AI-client
+# connection for hours is its own failure mode on shared/VPS hosting.
+CELERY_WORKER_MAX_TASKS_PER_CHILD = 50
+
 
 # Password validation
 # https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators
