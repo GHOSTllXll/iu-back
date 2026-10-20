@@ -28,3 +28,6 @@ logs
 celery_worker.pid
 celery_worker.log
 celery_watchdog.log
+
+# Local Redis dump artifact — never commit actual cache/broker data
+dump.rdb
