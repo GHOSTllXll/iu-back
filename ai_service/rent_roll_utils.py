@@ -267,3 +267,78 @@ def compute_ground_truth(rent_roll_df: pd.DataFrame, rent_col, status_col) -> di
         "physical_occupancy_pct": physical_occupancy_pct,
         "annualized_rent_roll_income": annualized_rent_roll_income,
     }
+
+
+def detect_argus_fields(rent_roll_df: pd.DataFrame):
+    """
+    Best-effort detection of the additional per-tenant fields a CRE rent roll
+    MAY contain beyond the core Unit/Tenant/Rent/Status set already handled by
+    detect_rent_roll_columns() above. Used to build the Argus-oriented rent
+    roll export tab (see excel_generator.py).
+
+    Every field here is OPTIONAL and this never raises: real rent rolls vary
+    wildly in which of these they include. Lease start/end dates and
+    escalation schedules in particular often live on a separate lease
+    abstract rather than the rent roll itself, so a None here is an expected,
+    common outcome, not a bug. Downstream code must render a None as a
+    visible "not present in source" gap (e.g. a cell comment) — NEVER as a
+    fabricated zero or an estimated value.
+
+    Heuristics are intentionally conservative substring matches, same style
+    as detect_rent_column/detect_rent_roll_columns above — a loose match that
+    grabs the wrong column is worse than no match for fields we have no way
+    to cross-check (unlike rent/status, which get validated downstream).
+
+    Returns a dict: suite_col, sf_col, lease_start_col, lease_end_col,
+    concession_col, escalation_col — each either a real column label from
+    rent_roll_df.columns, or None.
+    """
+    suite_col = None
+    sf_col = None
+    lease_start_col = None
+    lease_end_col = None
+    concession_col = None
+    escalation_col = None
+
+    for col in rent_roll_df.columns:
+        col_str = str(col).lower().strip()
+
+        if suite_col is None and ('suite' in col_str or col_str == 'unit' or col_str.startswith('unit ')):
+            suite_col = col
+
+        if sf_col is None and (
+            'square foot' in col_str or 'sq ft' in col_str or 'sqft' in col_str
+            or col_str in ('sf', 'rsf', 'nsf', 'gla')
+        ):
+            sf_col = col
+
+        if lease_start_col is None and (
+            ('lease' in col_str and 'start' in col_str)
+            or 'commencement' in col_str or col_str in ('lease start', 'start date')
+        ):
+            lease_start_col = col
+
+        if lease_end_col is None and (
+            ('lease' in col_str and 'end' in col_str)
+            or 'expir' in col_str or col_str in ('lease end', 'end date')
+        ):
+            lease_end_col = col
+
+        if concession_col is None and any(
+            term in col_str for term in ('concession', 'abatement', 'rent free', 'loss to lease')
+        ):
+            concession_col = col
+
+        if escalation_col is None and any(
+            term in col_str for term in ('escalation', 'rent step', 'rent increase', 'annual increase', 'bump')
+        ):
+            escalation_col = col
+
+    return {
+        'suite_col': suite_col,
+        'sf_col': sf_col,
+        'lease_start_col': lease_start_col,
+        'lease_end_col': lease_end_col,
+        'concession_col': concession_col,
+        'escalation_col': escalation_col,
+    }
