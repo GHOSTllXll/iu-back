@@ -229,30 +229,40 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
 
     # ==========================================
     # TAB: ARGUS RENT ROLL EXPORT
-    # Per-tenant rows mapped onto the 10 fields requested for ARGUS
-    # Enterprise rent-roll compatibility: Tenant/Suite, SF, Lease Start/End,
-    # Base Rent, Annual Rent, Concessions/Abatements, Escalation Structure,
-    # Occupancy Status, and a per-row Reconciliation Flag.
+    # Per-tenant rows mapped onto 16 fields for ARGUS Enterprise rent-roll
+    # compatibility: Tenant Name, Suite ID, Suite/Space Type, SF, Lease
+    # Start/End, Base Rent, Rent Frequency, Annual Rent, Concessions,
+    # Escalation Structure, Recovery Structure, Base Year Details, an MLA
+    # Profile placeholder, Occupancy Status, and a per-row Reconciliation
+    # Flag -- plus two property-level context rows (Property Name/ID, Total
+    # Building Area) above the table, per the latest ARGUS import checklist.
     #
-    # Every field is sourced from the UPLOADED rent roll itself via
-    # best-effort column detection (detect_argus_fields — see
-    # rent_roll_utils.py), NEVER from the AI's own aggregate extraction
-    # (the `metrics` dict), because that schema only produces PROPERTY-level
-    # totals, not per-tenant/per-lease data. A field the source rent roll
-    # genuinely doesn't contain (most rent rolls have no escalation-schedule
-    # column — that typically lives on a lease abstract, not the rent roll)
-    # is left BLANK with an explanatory cell comment on the header, never
-    # fabricated or estimated. Annual Rent is the one fully-derived field —
-    # always computable as Base Rent * 12 — and is written as a LIVE Excel
-    # formula (=E{row}*12), not a static value, consistent with every other
-    # formula-driven cell in this workbook.
+    # Per-tenant fields are sourced from the UPLOADED rent roll via
+    # best-effort column detection (detect_argus_fields -- see
+    # rent_roll_utils.py). Property-level fields (name, total building area,
+    # asset class) come from the AI's own aggregate extraction (`metrics`),
+    # since those genuinely are property-level facts, not per-tenant ones.
+    # A field that is genuinely absent from the source is left BLANK with an
+    # explanatory cell comment -- NEVER fabricated -- except Concessions and
+    # Escalation, which default to a flat 0 / "0" for import compatibility
+    # (see DEFAULTED_ZERO_COMMENT), and MLA Profile, which is intentionally
+    # always blank because it's configured inside ARGUS itself, not derived
+    # from a rent roll (see MLA_NOT_DERIVED_COMMENT).
     #
-    # ARGUS NOTE: ARGUS Enterprise has no single published universal import
-    # CSV — it's primarily a lease-by-lease entry application, and firms
-    # typically bridge a rent roll into it via their own mapping template.
-    # These columns use ARGUS's own field terminology so this tab can be
-    # copy/pasted into whatever bridge template or manual entry screen the
-    # user's firm already uses.
+    # FLAT VALUES: per explicit instruction, Base Rent / Annual Rent /
+    # Concessions on THIS tab are plain numbers with no currency symbol in
+    # either the value or the display format, and Annual Rent is a
+    # PRECOMPUTED value (Base Rent * 12, done in Python), not a live Excel
+    # formula -- a deliberate exception to this workbook's normal
+    # formula-driven convention, scoped to this one import-target tab. Every
+    # other tab in this workbook is unaffected and stays formula-driven.
+    #
+    # ARGUS NOTE (unchanged from the original build of this tab): I have not
+    # found a canonical public ARGUS Enterprise import file spec -- ARGUS is
+    # primarily a lease-by-lease entry application, and firms typically
+    # bridge a rent roll into it via their own mapping template. This layout
+    # follows the field list and structure given for this update; it has not
+    # been independently verified against ARGUS's own documentation.
     # ==========================================
     argus_fields = detect_argus_fields(rent_roll_df)
     suite_col = argus_fields['suite_col']
@@ -261,18 +271,74 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
     lease_end_col = argus_fields['lease_end_col']
     concession_col = argus_fields['concession_col']
     escalation_col = argus_fields['escalation_col']
+    space_type_col = argus_fields['space_type_col']
+    recovery_col = argus_fields['recovery_col']
+    base_year_col = argus_fields['base_year_col']
 
     ws_argus = wb.create_sheet("Argus Rent Roll Export")
 
+    # Rows 1-2: property-level context, row 3: spacer, row 4: column
+    # headers, row 5+: data. Everything below is indexed off these three
+    # constants rather than hardcoded, so the layout can shift again later
+    # without hunting down every row number by hand.
+    ARGUS_PROP_NAME_ROW = 1
+    ARGUS_PROP_AREA_ROW = 2
+    ARGUS_HEADER_ROW = 4
+    ARGUS_DATA_START_ROW = 5
+
+    property_name_val = safe_get(metrics, 'property_metadata', 'property_name')
+    asset_class_val = safe_get(metrics, 'property_metadata', 'asset_class')
+    # Total building-level SF only exists in the schema for industrial,
+    # office, or retail properties (see _build_system_prompt in views.py) --
+    # there is no building-wide SF field for e.g. multifamily, so this is
+    # legitimately blank for those deals, not a detection failure.
+    total_building_area_val = (
+        safe_get(metrics, 'industrial_metrics', 'rentable_square_footage')
+        or safe_get(metrics, 'office_metrics', 'building_total_rsf')
+        or safe_get(metrics, 'retail_metrics', 'center_total_gla')
+    )
+
+    prop_label_cell = ws_argus.cell(row=ARGUS_PROP_NAME_ROW, column=1, value="Property Name / ID:")
+    prop_label_cell.font = Font(bold=True)
+    prop_value_cell = ws_argus.cell(row=ARGUS_PROP_NAME_ROW, column=2, value=property_name_val or "")
+    if not property_name_val:
+        prop_value_cell.comment = Comment(
+            "Not extracted from the source documents for this analysis.",
+            "Underwriting AI"
+        )
+
+    area_label_cell = ws_argus.cell(row=ARGUS_PROP_AREA_ROW, column=1, value="Total Property Building Area (SF):")
+    area_label_cell.font = Font(bold=True)
+    area_value_cell = ws_argus.cell(
+        row=ARGUS_PROP_AREA_ROW, column=2,
+        value=total_building_area_val if isinstance(total_building_area_val, (int, float)) else ""
+    )
+    if isinstance(total_building_area_val, (int, float)):
+        area_value_cell.number_format = '#,##0'
+    else:
+        area_value_cell.comment = Comment(
+            "Not available -- our extraction schema only captures a "
+            "building-wide SF total for industrial, office, or retail "
+            "properties. This deal is either a different asset class (e.g. "
+            "multifamily) or the source documents didn't state one.",
+            "Underwriting AI"
+        )
+
     ARGUS_HEADERS = [
-        "Tenant Name / Suite ID",
+        "Tenant Name",
+        "Suite ID / Number",
+        "Suite Type / Space Type",
         "Square Footage (SF)",
         "Lease Start Date",
         "Lease End Date",
         "Base Rent (Monthly Contract Rent)",
+        "Rent Units / Frequency",
         "Annual Rent",
         "Concessions / Abatements",
         "Escalation Structure (Steps/Increments)",
+        "Recovery Structure (Net / Gross / Base Year)",
+        "Base Year Details",
+        "Market Leasing Assumptions (MLA) Profile",
         "Physical Occupancy Status",
         "Reconciliation Flags (Forensic Variance Alerts)",
     ]
@@ -287,109 +353,133 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         "confirmed figure from the source document. Treat as \"unknown\", not "
         "\"verified zero\", until checked against the lease file."
     )
+    SUITE_TYPE_FROM_ASSET_CLASS_COMMENT = (
+        "No per-suite space-type column was found in the Rent Roll -- every "
+        "row is filled with the property's overall asset class instead. "
+        "This is a property-level value, not a confirmed per-suite "
+        "classification -- verify manually for mixed-use properties."
+    )
+    MLA_NOT_DERIVED_COMMENT = (
+        "Market Leasing Assumptions are configured inside ARGUS itself and "
+        "aren't derivable from a rent roll or OM -- left blank intentionally "
+        "for manual assignment in ARGUS, not an extraction gap."
+    )
 
     for col_idx, header in enumerate(ARGUS_HEADERS, 1):
-        argus_header_cell = ws_argus.cell(row=1, column=col_idx, value=header)
+        argus_header_cell = ws_argus.cell(row=ARGUS_HEADER_ROW, column=col_idx, value=header)
         argus_header_cell.font = Font(bold=True)
 
-    # SF and the two lease dates stay genuinely BLANK with a "not present"
-    # comment when their column is missing -- per explicit instruction, these
-    # require real source data and are not safe to default.
-    for col_idx, detected in ((2, sf_col), (3, lease_start_col), (4, lease_end_col)):
+    for col_idx, detected in ((4, sf_col), (5, lease_start_col), (6, lease_end_col), (12, recovery_col), (13, base_year_col)):
         if detected is None:
-            ws_argus.cell(row=1, column=col_idx).comment = Comment(NOT_IN_SOURCE_COMMENT, "Underwriting AI")
+            ws_argus.cell(row=ARGUS_HEADER_ROW, column=col_idx).comment = Comment(NOT_IN_SOURCE_COMMENT, "Underwriting AI")
 
-    # Concessions/Abatements and Escalation Structure are DEFAULTED to 0 /
-    # "0" (not left blank) when their column is missing, so the export stays
-    # flat and numeric for import. The header comment carries the "this is a
-    # default, not a confirmed source figure" distinction forward so it
-    # isn't silently lost.
-    for col_idx, detected in ((7, concession_col), (8, escalation_col)):
+    if space_type_col is None:
+        comment_text = SUITE_TYPE_FROM_ASSET_CLASS_COMMENT if asset_class_val else NOT_IN_SOURCE_COMMENT
+        ws_argus.cell(row=ARGUS_HEADER_ROW, column=3).comment = Comment(comment_text, "Underwriting AI")
+
+    for col_idx, detected in ((10, concession_col), (11, escalation_col)):
         if detected is None:
-            ws_argus.cell(row=1, column=col_idx).comment = Comment(DEFAULTED_ZERO_COMMENT, "Underwriting AI")
+            ws_argus.cell(row=ARGUS_HEADER_ROW, column=col_idx).comment = Comment(DEFAULTED_ZERO_COMMENT, "Underwriting AI")
+
+    ws_argus.cell(row=ARGUS_HEADER_ROW, column=14).comment = Comment(MLA_NOT_DERIVED_COMMENT, "Underwriting AI")
 
     # Real datetimes (not formatted strings) so the Reconciliation Flags
     # formula below can do a genuine <TODAY() comparison on Lease End Date.
     lease_start_dates = pd.to_datetime(rent_roll_df[lease_start_col], errors='coerce') if lease_start_col else None
     lease_end_dates = pd.to_datetime(rent_roll_df[lease_end_col], errors='coerce') if lease_end_col else None
 
-    argus_last_row = len(rent_roll_df) + 1
+    argus_last_row = ARGUS_DATA_START_ROW + len(rent_roll_df) - 1
+
+    # Plain, non-currency numeric format for this tab's dollar columns --
+    # flat raw numbers, no "$" text anywhere in value or display format.
+    FLAT_NUMERIC_FORMAT = '#,##0.00'
 
     for argus_i in range(len(rent_roll_df)):
-        r = argus_i + 2
+        r = ARGUS_DATA_START_ROW + argus_i
         src = rent_roll_df.iloc[argus_i]
 
-        tenant_val = clean_cell_value(src[tenant_col]) if tenant_col else ""
-        suite_val = clean_cell_value(src[suite_col]) if suite_col else ""
-        combined_name = f"{tenant_val} / {suite_val}" if (tenant_val and suite_val) else (tenant_val or suite_val or "")
-        ws_argus.cell(row=r, column=1, value=combined_name)
+        ws_argus.cell(row=r, column=1, value=clean_cell_value(src[tenant_col]) if tenant_col else "")
+        ws_argus.cell(row=r, column=2, value=clean_cell_value(src[suite_col]) if suite_col else "")
+
+        if space_type_col is not None:
+            space_type_val = clean_cell_value(src[space_type_col])
+        else:
+            space_type_val = asset_class_val or ""
+        ws_argus.cell(row=r, column=3, value=space_type_val)
 
         sf_val = clean_cell_value(src[sf_col]) if sf_col else ""
-        sf_cell = ws_argus.cell(row=r, column=2, value=sf_val)
+        sf_cell = ws_argus.cell(row=r, column=4, value=sf_val)
         if isinstance(sf_val, (int, float)):
             sf_cell.number_format = '#,##0'
 
         if lease_start_dates is not None and pd.notna(lease_start_dates.iloc[argus_i]):
-            start_cell = ws_argus.cell(row=r, column=3, value=lease_start_dates.iloc[argus_i].to_pydatetime())
+            start_cell = ws_argus.cell(row=r, column=5, value=lease_start_dates.iloc[argus_i].to_pydatetime())
             start_cell.number_format = 'yyyy-mm-dd'
         else:
-            ws_argus.cell(row=r, column=3, value="")
+            ws_argus.cell(row=r, column=5, value="")
 
         if lease_end_dates is not None and pd.notna(lease_end_dates.iloc[argus_i]):
-            end_cell = ws_argus.cell(row=r, column=4, value=lease_end_dates.iloc[argus_i].to_pydatetime())
+            end_cell = ws_argus.cell(row=r, column=6, value=lease_end_dates.iloc[argus_i].to_pydatetime())
             end_cell.number_format = 'yyyy-mm-dd'
         else:
-            ws_argus.cell(row=r, column=4, value="")
+            ws_argus.cell(row=r, column=6, value="")
 
-        base_rent_val = clean_cell_value(src[rent_col])
-        base_rent_cell = ws_argus.cell(row=r, column=5, value=base_rent_val if isinstance(base_rent_val, (int, float)) else 0)
-        base_rent_cell.number_format = currency_format
+        base_rent_raw = clean_cell_value(src[rent_col])
+        base_rent_val = base_rent_raw if isinstance(base_rent_raw, (int, float)) else 0
+        base_rent_cell = ws_argus.cell(row=r, column=7, value=base_rent_val)
+        base_rent_cell.number_format = FLAT_NUMERIC_FORMAT
 
-        annual_rent_cell = ws_argus.cell(row=r, column=6, value=f"=E{r}*12")
-        annual_rent_cell.number_format = currency_format
+        # Every Base Rent figure in this workbook is already MONTHLY (see
+        # "Base Rent (Monthly Contract Rent)" above, and AVG IN-PLACE RENT
+        # on the Rent Roll Analysis tab) -- a true structural fact about our
+        # own column, safe to state as a constant rather than detect.
+        ws_argus.cell(row=r, column=8, value="Monthly")
 
-        # Default to 0.00 (not blank) both when the whole column is missing
-        # from the source AND when this specific row's cell is blank within
-        # an existing column -- either way, an empty string here would be
-        # the exact non-flat/non-numeric cell the import validation choked
-        # on, so both cases resolve to a real number.
+        # Flat PRECOMPUTED value, not a live formula -- see the tab-level
+        # comment above for why this one tab departs from the workbook's
+        # normal formula-driven convention.
+        annual_rent_cell = ws_argus.cell(row=r, column=9, value=round(base_rent_val * 12, 2))
+        annual_rent_cell.number_format = FLAT_NUMERIC_FORMAT
+
         concession_raw = clean_cell_value(src[concession_col]) if concession_col else 0.00
         concession_val = concession_raw if isinstance(concession_raw, (int, float)) else 0.00
-        concession_cell = ws_argus.cell(row=r, column=7, value=concession_val)
-        concession_cell.number_format = currency_format
+        concession_cell = ws_argus.cell(row=r, column=10, value=concession_val)
+        concession_cell.number_format = FLAT_NUMERIC_FORMAT
 
-        # Same reasoning as concessions above: a flat "0" instead of blank
-        # whenever the source has no escalation data for this row, whether
-        # because the whole column is missing or just this cell is empty.
         escalation_raw = clean_cell_value(src[escalation_col]) if escalation_col else ""
         escalation_val = escalation_raw if (isinstance(escalation_raw, str) and escalation_raw.strip()) else "0"
-        ws_argus.cell(row=r, column=8, value=escalation_val)
+        ws_argus.cell(row=r, column=11, value=escalation_val)
 
-        ws_argus.cell(row=r, column=9, value=clean_cell_value(src[status_col]))
+        ws_argus.cell(row=r, column=12, value=clean_cell_value(src[recovery_col]) if recovery_col else "")
+        ws_argus.cell(row=r, column=13, value=clean_cell_value(src[base_year_col]) if base_year_col else "")
 
-        # MEDIAN, not AVERAGE: a single extreme rent value (e.g. a totals row
-        # that slipped through, or a genuine outlier tenant) skews a mean
-        # badly enough to falsely flag every NORMAL tenant as "LOW" by
-        # comparison -- confirmed against a real LibreOffice recalculation
-        # during testing. strip_rent_outlier_rows() (rent_roll_utils.py)
-        # already uses MEDIAN for the exact same reason; this matches it.
+        # MLA Profile is always blank -- see MLA_NOT_DERIVED_COMMENT above.
+        ws_argus.cell(row=r, column=14, value="")
+
+        ws_argus.cell(row=r, column=15, value=clean_cell_value(src[status_col]))
+
+        # Reconciliation Flags -- column letters match the 16-column layout
+        # above (status=O, base rent=G, SF=D, lease start/end=E/F). Still
+        # MEDIAN-based, not AVERAGE (see the earlier fix in this file's
+        # history): a single extreme rent value skews a mean badly enough to
+        # falsely flag every normal tenant as an outlier by comparison.
         flag_parts = [
-            f'IF(AND(I{r}="Occupied",E{r}>0,E{r}>MEDIAN($E$2:$E${argus_last_row})*3),"RENT OUTLIER (HIGH); ","")',
-            f'IF(AND(I{r}="Occupied",E{r}>0,E{r}<MEDIAN($E$2:$E${argus_last_row})*0.3),"RENT OUTLIER (LOW); ","")',
+            f'IF(AND(O{r}="Occupied",G{r}>0,G{r}>MEDIAN($G${ARGUS_DATA_START_ROW}:$G${argus_last_row})*3),"RENT OUTLIER (HIGH); ","")',
+            f'IF(AND(O{r}="Occupied",G{r}>0,G{r}<MEDIAN($G${ARGUS_DATA_START_ROW}:$G${argus_last_row})*0.3),"RENT OUTLIER (LOW); ","")',
         ]
         if sf_col is not None:
-            flag_parts.append(f'IF(AND(I{r}="Occupied",B{r}=""),"MISSING SF; ","")')
+            flag_parts.append(f'IF(AND(O{r}="Occupied",D{r}=""),"MISSING SF; ","")')
         if lease_start_col is not None:
-            flag_parts.append(f'IF(AND(I{r}="Occupied",C{r}=""),"MISSING LEASE START; ","")')
+            flag_parts.append(f'IF(AND(O{r}="Occupied",E{r}=""),"MISSING LEASE START; ","")')
         if lease_end_col is not None:
-            flag_parts.append(f'IF(AND(I{r}="Occupied",D{r}<>"",D{r}<TODAY()),"LEASE EXPIRED; ","")')
-            flag_parts.append(f'IF(AND(I{r}="Occupied",D{r}=""),"MISSING LEASE END; ","")')
+            flag_parts.append(f'IF(AND(O{r}="Occupied",F{r}<>"",F{r}<TODAY()),"LEASE EXPIRED; ","")')
+            flag_parts.append(f'IF(AND(O{r}="Occupied",F{r}=""),"MISSING LEASE END; ","")')
 
         concat_formula = " & ".join(flag_parts)
-        ws_argus.cell(row=r, column=10, value=f'=IF(LEN(TRIM({concat_formula}))=0,"OK",TRIM({concat_formula}))')
+        ws_argus.cell(row=r, column=16, value=f'=IF(LEN(TRIM({concat_formula}))=0,"OK",TRIM({concat_formula}))')
 
-    for col_idx in range(1, 11):
-        ws_argus.column_dimensions[get_column_letter(col_idx)].width = 24
+    for col_idx in range(1, 17):
+        ws_argus.column_dimensions[get_column_letter(col_idx)].width = 22
 
     # ==========================================
     # TAB 2: CLEANED T12

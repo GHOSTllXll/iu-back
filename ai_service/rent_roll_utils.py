@@ -299,6 +299,9 @@ def detect_argus_fields(rent_roll_df: pd.DataFrame):
     lease_end_col = None
     concession_col = None
     escalation_col = None
+    space_type_col = None
+    recovery_col = None
+    base_year_col = None
 
     for col in rent_roll_df.columns:
         col_str = str(col).lower().strip()
@@ -334,6 +337,25 @@ def detect_argus_fields(rent_roll_df: pd.DataFrame):
         ):
             escalation_col = col
 
+        # Added for ARGUS Enterprise field mapping (Suite Type, Recovery
+        # Structure, Base Year). Same conservative-match philosophy as
+        # everything above -- deliberately narrow terms, since a wrong match
+        # on an ambiguous column name (e.g. "Unit Type" meaning "1BR/2BR" on
+        # a multifamily rent roll, not an office/retail/industrial space
+        # type) would be worse than leaving the field undetected.
+        if space_type_col is None and any(
+            term in col_str for term in ('space type', 'suite type', 'use type', 'asset type')
+        ):
+            space_type_col = col
+
+        if recovery_col is None and any(
+            term in col_str for term in ('recovery structure', 'recovery type', 'reimbursement type', 'expense recovery')
+        ):
+            recovery_col = col
+
+        if base_year_col is None and ('base year' in col_str or 'expense stop' in col_str):
+            base_year_col = col
+
     return {
         'suite_col': suite_col,
         'sf_col': sf_col,
@@ -341,4 +363,7 @@ def detect_argus_fields(rent_roll_df: pd.DataFrame):
         'lease_end_col': lease_end_col,
         'concession_col': concession_col,
         'escalation_col': escalation_col,
+        'space_type_col': space_type_col,
+        'recovery_col': recovery_col,
+        'base_year_col': base_year_col,
     }
