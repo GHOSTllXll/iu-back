@@ -1,5 +1,6 @@
 # backend/ai_service/excel_generator.py
 import io
+import re
 import datetime
 import numpy as np
 import pandas as pd
@@ -358,6 +359,42 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
 
     property_name_val = safe_get(metrics, 'property_metadata', 'property_name')
     asset_class_val = safe_get(metrics, 'property_metadata', 'asset_class')
+
+    # asset_class is sometimes populated with a BUILDING-CLASS grade
+    # ("Class A/B/C", e.g. our own multifamily mock fixture) rather than an
+    # ARGUS-parseable property TYPE (Office/Retail/Industrial/Multifamily).
+    # That is a different attribute, and ARGUS can't do anything with
+    # "Class C" in a Suite Type cell -- so a building-class-shaped value is
+    # never used as the Suite Type fallback below.
+    BUILDING_CLASS_PATTERN = re.compile(r'^\s*class\s*[abc]\s*[+-]?\s*$', re.IGNORECASE)
+    asset_class_is_building_grade = bool(asset_class_val) and bool(BUILDING_CLASS_PATTERN.match(str(asset_class_val)))
+
+    # Property-level fallback for Suite Type when the Rent Roll has no
+    # per-suite space-type column of its own. Preference order: a real,
+    # non-building-class asset_class value; otherwise the property TYPE
+    # inferred from which metrics block our own extraction actually
+    # populated (a structural fact about the data we already have, not a
+    # guess) -- Industrial / Office / Retail from the matching *_metrics
+    # block, Multifamily when none of those apply but we do have a unit
+    # count. None of this is per-suite: for a genuinely mixed-use property
+    # this is still one value applied to every row (see
+    # SUITE_TYPE_FROM_ASSET_CLASS_COMMENT / SUITE_TYPE_DERIVED_FROM_METRICS_COMMENT
+    # below) -- we do not guess per-suite Office vs. Retail from suite
+    # numbering, since there is no reliable, general signal in a suite ID
+    # string for that.
+    if asset_class_val and not asset_class_is_building_grade:
+        resolved_space_type_fallback = asset_class_val
+    elif safe_get(metrics, 'industrial_metrics', 'rentable_square_footage'):
+        resolved_space_type_fallback = "Industrial"
+    elif safe_get(metrics, 'office_metrics', 'building_total_rsf'):
+        resolved_space_type_fallback = "Office"
+    elif safe_get(metrics, 'retail_metrics', 'center_total_gla'):
+        resolved_space_type_fallback = "Retail"
+    elif safe_get(metrics, 'property_metadata', 'total_unit_count'):
+        resolved_space_type_fallback = "Multifamily"
+    else:
+        resolved_space_type_fallback = None
+
     # Total building-level SF only exists in the schema for industrial,
     # office, or retail properties (see _build_system_prompt in views.py) --
     # there is no building-wide SF field for e.g. multifamily, so this is
@@ -428,6 +465,16 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         "This is a property-level value, not a confirmed per-suite "
         "classification -- verify manually for mixed-use properties."
     )
+    SUITE_TYPE_DERIVED_FROM_METRICS_COMMENT = (
+        "No per-suite space-type column was found in the Rent Roll, and the "
+        "property-level asset_class value was either missing or a building "
+        "class grade (e.g. 'Class B') rather than an ARGUS-parseable "
+        "property type, so every row is filled with the property type "
+        "inferred instead from which metrics block our own extraction "
+        "populated (Industrial / Office / Retail / Multifamily). This is "
+        "still a property-level value, not a confirmed per-suite "
+        "classification -- verify manually for mixed-use properties."
+    )
     MLA_DEFAULT_COMMENT = (
         "Market Leasing Assumptions are configured inside ARGUS itself and "
         "aren't derivable from a rent roll or OM. Previously left blank for "
@@ -453,7 +500,12 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
             ws_argus.cell(row=ARGUS_HEADER_ROW, column=col_idx).comment = Comment(NOT_IN_SOURCE_COMMENT, "Underwriting AI")
 
     if space_type_col is None:
-        comment_text = SUITE_TYPE_FROM_ASSET_CLASS_COMMENT if asset_class_val else NOT_IN_SOURCE_COMMENT
+        if resolved_space_type_fallback is None:
+            comment_text = NOT_IN_SOURCE_COMMENT
+        elif asset_class_val and not asset_class_is_building_grade:
+            comment_text = SUITE_TYPE_FROM_ASSET_CLASS_COMMENT
+        else:
+            comment_text = SUITE_TYPE_DERIVED_FROM_METRICS_COMMENT
         ws_argus.cell(row=ARGUS_HEADER_ROW, column=3).comment = Comment(comment_text, "Underwriting AI")
 
     for col_idx, detected in ((10, concession_col), (11, escalation_col)):
@@ -486,7 +538,7 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         if space_type_col is not None:
             space_type_val = clean_cell_value(src[space_type_col])
         else:
-            space_type_val = asset_class_val or ""
+            space_type_val = resolved_space_type_fallback or ""
         ws_argus.cell(row=r, column=3, value=space_type_val)
 
         sf_val = clean_cell_value(src[sf_col]) if sf_col else ""
