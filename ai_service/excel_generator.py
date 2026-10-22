@@ -172,6 +172,22 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
     rent_roll_df[status_col] = rent_roll_df[status_col].astype(str).str.strip()
     rent_roll_df = rent_roll_df.replace({pd.NaT: None, pd.NA: None, np.nan: None})
 
+    # Detected here (not down by the Argus tab, where this used to live) so
+    # the Rent Roll Analysis tab below can also use lease_start_col /
+    # lease_end_col -- its own Reconciliation Flags column (relocated from
+    # the Argus tab, see note there) needs them for a genuine LEASE EXPIRED
+    # comparison against TODAY().
+    argus_fields = detect_argus_fields(rent_roll_df)
+    suite_col = argus_fields['suite_col']
+    sf_col = argus_fields['sf_col']
+    lease_start_col = argus_fields['lease_start_col']
+    lease_end_col = argus_fields['lease_end_col']
+    concession_col = argus_fields['concession_col']
+    escalation_col = argus_fields['escalation_col']
+    space_type_col = argus_fields['space_type_col']
+    recovery_col = argus_fields['recovery_col']
+    base_year_col = argus_fields['base_year_col']
+
     # ==========================================
     # TAB 3: RENT ROLL ANALYSIS
     # Dynamic row range (NOT hardcoded to row 150 — a property with more units
@@ -197,6 +213,20 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
 
     for row_idx, row in enumerate(rent_roll_df.itertuples(index=False), 2):
         for col_idx, val in enumerate(row, 1):
+            col_name = rent_roll_df.columns[col_idx - 1]
+            # Write real Excel dates (not clean_cell_value's stringified
+            # "YYYY-MM-DD" text) for the lease date columns, so this tab's
+            # own Reconciliation Flags column below can do a genuine
+            # LEASE EXPIRED comparison against TODAY() -- a text cell can't
+            # be compared with < against TODAY() in a formula.
+            if col_name == lease_start_col or col_name == lease_end_col:
+                date_val = pd.to_datetime(val, errors='coerce')
+                if pd.notna(date_val):
+                    date_cell = ws_rr.cell(row=row_idx, column=col_idx, value=date_val.to_pydatetime())
+                    date_cell.number_format = 'yyyy-mm-dd'
+                else:
+                    ws_rr.cell(row=row_idx, column=col_idx, value=None)
+                continue
             cleaned_val = clean_cell_value(val)
             cell = ws_rr.cell(row=row_idx, column=col_idx, value=cleaned_val)
             if col_idx == rent_col_idx:
@@ -206,6 +236,43 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
     last_row = len(rent_roll_df) + 1
     status_letter = get_column_letter(rent_roll_df.columns.get_loc(status_col) + 1)
     rent_letter = get_column_letter(rent_col_idx)
+
+    # Reconciliation Flags -- relocated here from the Argus Rent Roll Export
+    # tab (see the note on that tab) so that tab's columns match ARGUS
+    # Enterprise's import wizard exactly, without losing this data-quality
+    # check. Appended as the last column of the data table, same row range
+    # as the pass-through data above (not the summary rows below). Still
+    # MEDIAN-based, not AVERAGE -- a single extreme rent value skews a mean
+    # badly enough to falsely flag every normal tenant as an outlier.
+    flags_col_idx = len(rent_roll_df.columns) + 1
+    flags_col_letter = get_column_letter(flags_col_idx)
+    flags_header_cell = ws_rr.cell(row=1, column=flags_col_idx, value="Reconciliation Flags")
+    flags_header_cell.font = Font(bold=True)
+    flags_header_cell.comment = Comment(
+        "Per-row data-quality / underwriting flags. Relocated here from the "
+        "Argus Rent Roll Export tab so that tab's column layout matches "
+        "ARGUS Enterprise's import wizard exactly -- this check moved, it "
+        "was not dropped.",
+        "Underwriting AI"
+    )
+    sf_letter_rr = get_column_letter(rent_roll_df.columns.get_loc(sf_col) + 1) if sf_col else None
+    lease_start_letter_rr = get_column_letter(rent_roll_df.columns.get_loc(lease_start_col) + 1) if lease_start_col else None
+    lease_end_letter_rr = get_column_letter(rent_roll_df.columns.get_loc(lease_end_col) + 1) if lease_end_col else None
+    for flag_row in range(2, last_row + 1):
+        flag_parts_rr = [
+            f'IF(AND({status_letter}{flag_row}="Occupied",{rent_letter}{flag_row}>0,{rent_letter}{flag_row}>MEDIAN(${rent_letter}$2:${rent_letter}${last_row})*3),"RENT OUTLIER (HIGH); ","")',
+            f'IF(AND({status_letter}{flag_row}="Occupied",{rent_letter}{flag_row}>0,{rent_letter}{flag_row}<MEDIAN(${rent_letter}$2:${rent_letter}${last_row})*0.3),"RENT OUTLIER (LOW); ","")',
+        ]
+        if sf_letter_rr is not None:
+            flag_parts_rr.append(f'IF(AND({status_letter}{flag_row}="Occupied",{sf_letter_rr}{flag_row}=""),"MISSING SF; ","")')
+        if lease_start_letter_rr is not None:
+            flag_parts_rr.append(f'IF(AND({status_letter}{flag_row}="Occupied",{lease_start_letter_rr}{flag_row}=""),"MISSING LEASE START; ","")')
+        if lease_end_letter_rr is not None:
+            flag_parts_rr.append(f'IF(AND({status_letter}{flag_row}="Occupied",{lease_end_letter_rr}{flag_row}<>"",{lease_end_letter_rr}{flag_row}<TODAY()),"LEASE EXPIRED; ","")')
+            flag_parts_rr.append(f'IF(AND({status_letter}{flag_row}="Occupied",{lease_end_letter_rr}{flag_row}=""),"MISSING LEASE END; ","")')
+        concat_formula_rr = " & ".join(flag_parts_rr)
+        ws_rr.cell(row=flag_row, column=flags_col_idx, value=f'=IF(LEN(TRIM({concat_formula_rr}))=0,"OK",TRIM({concat_formula_rr}))')
+    ws_rr.column_dimensions[flags_col_letter].width = 40
 
     unit_count_row = last_row + 2
     vacant_units_row = last_row + 3
@@ -229,13 +296,19 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
 
     # ==========================================
     # TAB: ARGUS RENT ROLL EXPORT
-    # Per-tenant rows mapped onto 16 fields for ARGUS Enterprise rent-roll
+    # Per-tenant rows mapped onto 15 fields for ARGUS Enterprise rent-roll
     # compatibility: Tenant Name, Suite ID, Suite/Space Type, SF, Lease
     # Start/End, Base Rent, Rent Frequency, Annual Rent, Concessions,
     # Escalation Structure, Recovery Structure, Base Year Details, an MLA
-    # Profile placeholder, Occupancy Status, and a per-row Reconciliation
-    # Flag -- plus two property-level context rows (Property Name/ID, Total
-    # Building Area) above the table, per the latest ARGUS import checklist.
+    # Profile placeholder, and Occupancy Status -- plus two property-level
+    # context rows (Property Name/ID, Total Building Area) above the table,
+    # per the latest ARGUS import checklist.
+    #
+    # Reconciliation Flags is NOT on this tab anymore: the import wizard
+    # expects exactly this fixed column layout, and an extra text/warning
+    # column broke its mapping. The equivalent per-row flag is still
+    # computed -- it moved to the Rent Roll Analysis tab instead, so this is
+    # a relocation, not a removal of the check.
     #
     # Per-tenant fields are sourced from the UPLOADED rent roll via
     # best-effort column detection (detect_argus_fields -- see
@@ -243,11 +316,15 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
     # asset class) come from the AI's own aggregate extraction (`metrics`),
     # since those genuinely are property-level facts, not per-tenant ones.
     # A field that is genuinely absent from the source is left BLANK with an
-    # explanatory cell comment -- NEVER fabricated -- except Concessions and
-    # Escalation, which default to a flat 0 / "0" for import compatibility
-    # (see DEFAULTED_ZERO_COMMENT), and MLA Profile, which is intentionally
-    # always blank because it's configured inside ARGUS itself, not derived
-    # from a rent roll (see MLA_NOT_DERIVED_COMMENT).
+    # explanatory cell comment -- NEVER silently presented as a confirmed
+    # source fact -- except Concessions and Escalation, which default to a
+    # flat 0 / "0" for import compatibility (see DEFAULTED_ZERO_COMMENT),
+    # and MLA Profile, which now defaults to the placeholder string
+    # "General_Market" for the same reason (see MLA_DEFAULT_COMMENT) rather
+    # than being left blank. Lease Start/End Date is also forced blank on
+    # any row marked Vacant, regardless of what the source rent roll says,
+    # since a stale date on a vacant line is misleading and the import
+    # wizard errors on one.
     #
     # FLAT VALUES: per explicit instruction, Base Rent / Annual Rent /
     # Concessions on THIS tab are plain numbers with no currency symbol in
@@ -264,17 +341,10 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
     # follows the field list and structure given for this update; it has not
     # been independently verified against ARGUS's own documentation.
     # ==========================================
-    argus_fields = detect_argus_fields(rent_roll_df)
-    suite_col = argus_fields['suite_col']
-    sf_col = argus_fields['sf_col']
-    lease_start_col = argus_fields['lease_start_col']
-    lease_end_col = argus_fields['lease_end_col']
-    concession_col = argus_fields['concession_col']
-    escalation_col = argus_fields['escalation_col']
-    space_type_col = argus_fields['space_type_col']
-    recovery_col = argus_fields['recovery_col']
-    base_year_col = argus_fields['base_year_col']
-
+    # suite_col / sf_col / lease_start_col / lease_end_col / concession_col /
+    # escalation_col / space_type_col / recovery_col / base_year_col were
+    # already detected above, during pre-processing -- the Rent Roll
+    # Analysis tab's own Reconciliation Flags column needs them too.
     ws_argus = wb.create_sheet("Argus Rent Roll Export")
 
     # Rows 1-2: property-level context, row 3: spacer, row 4: column
@@ -340,7 +410,6 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         "Base Year Details",
         "Market Leasing Assumptions (MLA) Profile",
         "Physical Occupancy Status",
-        "Reconciliation Flags (Forensic Variance Alerts)",
     ]
     NOT_IN_SOURCE_COMMENT = (
         "Not present in the uploaded Rent Roll -- this field typically lives on "
@@ -359,10 +428,20 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         "This is a property-level value, not a confirmed per-suite "
         "classification -- verify manually for mixed-use properties."
     )
-    MLA_NOT_DERIVED_COMMENT = (
+    MLA_DEFAULT_COMMENT = (
         "Market Leasing Assumptions are configured inside ARGUS itself and "
-        "aren't derivable from a rent roll or OM -- left blank intentionally "
-        "for manual assignment in ARGUS, not an extraction gap."
+        "aren't derivable from a rent roll or OM. Previously left blank for "
+        "manual assignment in ARGUS; now DEFAULTED to the literal string "
+        "'General_Market' instead, per explicit instruction, so the import "
+        "wizard doesn't error on a blank cell. This is a PLACEHOLDER label, "
+        "not a confirmed or derived MLA profile -- it still needs to be "
+        "mapped to a real leasing profile inside ARGUS before use."
+    )
+    VACANT_DATE_WIPED_COMMENT = (
+        "The source Rent Roll had a Lease Start/End date on this row, but "
+        "Occupancy Status is Vacant, so the date was cleared rather than "
+        "shown -- a stale lease date on a vacant line would be misleading, "
+        "and ARGUS's own import wizard errors on one."
     )
 
     for col_idx, header in enumerate(ARGUS_HEADERS, 1):
@@ -381,14 +460,14 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         if detected is None:
             ws_argus.cell(row=ARGUS_HEADER_ROW, column=col_idx).comment = Comment(DEFAULTED_ZERO_COMMENT, "Underwriting AI")
 
-    ws_argus.cell(row=ARGUS_HEADER_ROW, column=14).comment = Comment(MLA_NOT_DERIVED_COMMENT, "Underwriting AI")
+    ws_argus.cell(row=ARGUS_HEADER_ROW, column=14).comment = Comment(MLA_DEFAULT_COMMENT, "Underwriting AI")
 
-    # Real datetimes (not formatted strings) so the Reconciliation Flags
-    # formula below can do a genuine <TODAY() comparison on Lease End Date.
+    # Real datetimes (not formatted strings), so the actual Lease Start/End
+    # Date cells below are genuine Excel dates for anyone opening this file
+    # -- also reused by the Rent Roll Analysis tab's Reconciliation Flags
+    # column (see above) for a genuine LEASE EXPIRED comparison.
     lease_start_dates = pd.to_datetime(rent_roll_df[lease_start_col], errors='coerce') if lease_start_col else None
     lease_end_dates = pd.to_datetime(rent_roll_df[lease_end_col], errors='coerce') if lease_end_col else None
-
-    argus_last_row = ARGUS_DATA_START_ROW + len(rent_roll_df) - 1
 
     # Plain, non-currency numeric format for this tab's dollar columns --
     # flat raw numbers, no "$" text anywhere in value or display format.
@@ -397,6 +476,9 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
     for argus_i in range(len(rent_roll_df)):
         r = ARGUS_DATA_START_ROW + argus_i
         src = rent_roll_df.iloc[argus_i]
+
+        row_status_val = clean_cell_value(src[status_col])
+        is_vacant_row = isinstance(row_status_val, str) and row_status_val.strip().lower() == "vacant"
 
         ws_argus.cell(row=r, column=1, value=clean_cell_value(src[tenant_col]) if tenant_col else "")
         ws_argus.cell(row=r, column=2, value=clean_cell_value(src[suite_col]) if suite_col else "")
@@ -412,13 +494,24 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         if isinstance(sf_val, (int, float)):
             sf_cell.number_format = '#,##0'
 
-        if lease_start_dates is not None and pd.notna(lease_start_dates.iloc[argus_i]):
+        # Lease Start/End Date: forced blank on any Vacant row, regardless
+        # of what the source data says -- a stale lease date on a vacant
+        # line is misleading, and ARGUS's own import wizard errors on one.
+        if is_vacant_row:
+            ws_argus.cell(row=r, column=5, value="")
+            if lease_start_dates is not None and pd.notna(lease_start_dates.iloc[argus_i]):
+                ws_argus.cell(row=r, column=5).comment = Comment(VACANT_DATE_WIPED_COMMENT, "Underwriting AI")
+        elif lease_start_dates is not None and pd.notna(lease_start_dates.iloc[argus_i]):
             start_cell = ws_argus.cell(row=r, column=5, value=lease_start_dates.iloc[argus_i].to_pydatetime())
             start_cell.number_format = 'yyyy-mm-dd'
         else:
             ws_argus.cell(row=r, column=5, value="")
 
-        if lease_end_dates is not None and pd.notna(lease_end_dates.iloc[argus_i]):
+        if is_vacant_row:
+            ws_argus.cell(row=r, column=6, value="")
+            if lease_end_dates is not None and pd.notna(lease_end_dates.iloc[argus_i]):
+                ws_argus.cell(row=r, column=6).comment = Comment(VACANT_DATE_WIPED_COMMENT, "Underwriting AI")
+        elif lease_end_dates is not None and pd.notna(lease_end_dates.iloc[argus_i]):
             end_cell = ws_argus.cell(row=r, column=6, value=lease_end_dates.iloc[argus_i].to_pydatetime())
             end_cell.number_format = 'yyyy-mm-dd'
         else:
@@ -453,32 +546,20 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
         ws_argus.cell(row=r, column=12, value=clean_cell_value(src[recovery_col]) if recovery_col else "")
         ws_argus.cell(row=r, column=13, value=clean_cell_value(src[base_year_col]) if base_year_col else "")
 
-        # MLA Profile is always blank -- see MLA_NOT_DERIVED_COMMENT above.
-        ws_argus.cell(row=r, column=14, value="")
+        # MLA Profile -- see MLA_DEFAULT_COMMENT above: defaulted to a
+        # placeholder label, not a real derived assumption.
+        ws_argus.cell(row=r, column=14, value="General_Market")
 
-        ws_argus.cell(row=r, column=15, value=clean_cell_value(src[status_col]))
+        ws_argus.cell(row=r, column=15, value=row_status_val)
 
-        # Reconciliation Flags -- column letters match the 16-column layout
-        # above (status=O, base rent=G, SF=D, lease start/end=E/F). Still
-        # MEDIAN-based, not AVERAGE (see the earlier fix in this file's
-        # history): a single extreme rent value skews a mean badly enough to
-        # falsely flag every normal tenant as an outlier by comparison.
-        flag_parts = [
-            f'IF(AND(O{r}="Occupied",G{r}>0,G{r}>MEDIAN($G${ARGUS_DATA_START_ROW}:$G${argus_last_row})*3),"RENT OUTLIER (HIGH); ","")',
-            f'IF(AND(O{r}="Occupied",G{r}>0,G{r}<MEDIAN($G${ARGUS_DATA_START_ROW}:$G${argus_last_row})*0.3),"RENT OUTLIER (LOW); ","")',
-        ]
-        if sf_col is not None:
-            flag_parts.append(f'IF(AND(O{r}="Occupied",D{r}=""),"MISSING SF; ","")')
-        if lease_start_col is not None:
-            flag_parts.append(f'IF(AND(O{r}="Occupied",E{r}=""),"MISSING LEASE START; ","")')
-        if lease_end_col is not None:
-            flag_parts.append(f'IF(AND(O{r}="Occupied",F{r}<>"",F{r}<TODAY()),"LEASE EXPIRED; ","")')
-            flag_parts.append(f'IF(AND(O{r}="Occupied",F{r}=""),"MISSING LEASE END; ","")')
+        # Reconciliation Flags no longer lives on this tab -- it broke the
+        # ARGUS Enterprise import wizard (the wizard expects exactly this
+        # fixed 15-column layout; an extra text/warning column fails
+        # mapping). The equivalent flag is still computed, just on the Rent
+        # Roll Analysis tab instead -- this is a RELOCATION, not a removal
+        # of the check.
 
-        concat_formula = " & ".join(flag_parts)
-        ws_argus.cell(row=r, column=16, value=f'=IF(LEN(TRIM({concat_formula}))=0,"OK",TRIM({concat_formula}))')
-
-    for col_idx in range(1, 17):
+    for col_idx in range(1, 16):
         ws_argus.column_dimensions[get_column_letter(col_idx)].width = 22
 
     # ==========================================
