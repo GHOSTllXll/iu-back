@@ -6,7 +6,8 @@ from .views import (LoginView, LogoutView, CurrentUserView, AdminCreateUserView,
                     PasswordResetRequestView, PasswordResetConfirmView,
                     AdminCreateMessageView, AdminMessageListView, AdminDeactivateMessageView, ActiveMessagesView,
                     AdminCreateTrialAccountView,
-                    UserReportIssueView, AdminIssueListView, AdminToggleIssueStatusView)
+                    UserReportIssueView, AdminIssueListView, AdminToggleIssueStatusView,
+                    AdminUploadExcelTemplateView, AdminGetExcelTemplateView, AdminDeleteExcelTemplateView)
 from ai_service.urls import urlpatterns as ai_urls
 
 urlpatterns = [
@@ -45,6 +46,11 @@ urlpatterns = [
     path('issues/report/', UserReportIssueView.as_view(), name='user_report_issue'),
     path('admin/issues/', AdminIssueListView.as_view(), name='admin_issue_list'),
     path('admin/issues/<int:issue_id>/toggle-status/', AdminToggleIssueStatusView.as_view(), name='admin_toggle_issue_status'),
+
+    # Custom Excel templates (per-organization)
+    path('admin/organizations/<int:org_id>/excel-template/upload/', AdminUploadExcelTemplateView.as_view(), name='admin_upload_excel_template'),
+    path('admin/organizations/<int:org_id>/excel-template/', AdminGetExcelTemplateView.as_view(), name='admin_get_excel_template'),
+    path('admin/organizations/<int:org_id>/excel-template/delete/', AdminDeleteExcelTemplateView.as_view(), name='admin_delete_excel_template'),
 
     path('ai/', include(ai_urls)),
 

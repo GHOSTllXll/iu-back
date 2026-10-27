@@ -25,6 +25,17 @@ from rest_framework.throttling import AnonRateThrottle, SimpleRateThrottle
 
 import secrets
 import string
+import io
+import openpyxl
+from django.core.files.base import ContentFile
+
+from ai_service.models import ClientExcelTemplate
+from ai_service.custom_template_generator import (
+    validate_template,
+    TemplateValidationError,
+    SCALAR_FIELD_CATALOG,
+    ROW_FIELD_CATALOG,
+)
 
 # Add this near the top level (module scope), alongside the other module-level
 # objects — reused across both views below.
@@ -842,3 +853,186 @@ class AdminToggleIssueStatusView(APIView):
             'status': issue.status,
             'resolved_at': issue.resolved_at.isoformat() if issue.resolved_at else None,
         })
+
+
+# ==========================================
+# CUSTOM EXCEL TEMPLATE (per-organization) — see
+# ai_service/custom_template_generator.py for the generation side and
+# ai_service/models.py's ClientExcelTemplate docstring for the storage
+# model. These three endpoints are the only way a template gets onto an
+# org (no self-serve upload — admin-provisioned, same as account creation
+# itself).
+# ==========================================
+
+# Hard ceiling on an uploaded template's size. Not a fabricated business
+# rule — a plain infrastructure safety limit so a mistaken upload (or an
+# abusive one) can't fill the VPS's private_media volume. 20MB comfortably
+# covers a real master valuation workbook with embedded branding/macros.
+MAX_TEMPLATE_UPLOAD_BYTES = 20 * 1024 * 1024
+
+ALLOWED_TEMPLATE_EXTENSIONS = ('.xlsx', '.xlsm')
+
+
+class AdminUploadExcelTemplateView(APIView):
+    """
+    Uploads (or replaces) an organization's custom Excel template.
+    URL: POST /api/admin/organizations/<org_id>/excel-template/upload/
+    Body: multipart/form-data, field 'file'.
+
+    The uploaded bytes are stored EXACTLY as received -- never re-saved
+    through openpyxl -- so the client's native formulas, macros, and
+    branding are preserved byte-for-byte. openpyxl is only used here to
+    read the workbook's defined names for validation; that in-memory
+    workbook is discarded after validate_template() runs.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, org_id):
+        if not request.user.is_admin:
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            org = Organization.objects.get(id=org_id)
+        except Organization.DoesNotExist:
+            return Response({'detail': 'Organization not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        upload = request.FILES.get('file')
+        if not upload:
+            return Response({'detail': "No file provided (expected form field 'file')."}, status=status.HTTP_400_BAD_REQUEST)
+
+        original_filename = upload.name
+        if not original_filename.lower().endswith(ALLOWED_TEMPLATE_EXTENSIONS):
+            return Response(
+                {'detail': f"Unsupported file type. Expected one of: {', '.join(ALLOWED_TEMPLATE_EXTENSIONS)}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if upload.size > MAX_TEMPLATE_UPLOAD_BYTES:
+            return Response(
+                {'detail': f"File is too large ({upload.size / (1024*1024):.1f}MB). Max allowed is "
+                           f"{MAX_TEMPLATE_UPLOAD_BYTES // (1024*1024)}MB."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        file_bytes = upload.read()
+
+        try:
+            workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=False)
+        except Exception as e:
+            return Response(
+                {'detail': f"Couldn't open this file as an Excel workbook: {e}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            report = validate_template(workbook)
+        except TemplateValidationError as e:
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        finally:
+            workbook.close()
+
+        # Replace any existing template for this org. Deleting the old
+        # physical file FIRST matters: client_template_upload_path() keys
+        # the filename only by organization id, not by the client's own
+        # filename, so without this the storage backend would silently
+        # append a "_1" suffix to the new file rather than overwrite the
+        # old one -- leaving an orphaned stale template on disk.
+        try:
+            existing = ClientExcelTemplate.objects.get(organization=org)
+        except ClientExcelTemplate.DoesNotExist:
+            existing = None
+
+        if existing is not None and existing.file:
+            existing.file.delete(save=False)
+            template = existing
+        else:
+            template = ClientExcelTemplate(organization=org)
+
+        template.file.save(original_filename, ContentFile(file_bytes), save=False)
+        template.original_filename = original_filename
+        template.detected_named_ranges = report['found_fields']
+        template.uploaded_by = request.user
+        template.is_active = True
+        template.save()
+
+        return Response({
+            'detail': f"Custom template uploaded for {org.name}.",
+            'organization_id': org.id,
+            'original_filename': template.original_filename,
+            'uploaded_at': template.uploaded_at.isoformat(),
+            'found_fields': report['found_fields'],
+            'missing_scalar_fields': report['missing_scalar_fields'],
+            'missing_row_fields': report['missing_row_fields'],
+            'row_anchor': report['row_anchor'],
+            'unresolvable_defined_names': report['unresolvable_defined_names'],
+        }, status=status.HTTP_201_CREATED)
+
+
+class AdminGetExcelTemplateView(APIView):
+    """
+    Reports whether an organization has an active custom template, and
+    what our engine can/can't do with it, without re-opening the workbook
+    (detected_named_ranges was captured once, at upload time).
+    URL: GET /api/admin/organizations/<org_id>/excel-template/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, org_id):
+        if not request.user.is_admin:
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            org = Organization.objects.get(id=org_id)
+        except Organization.DoesNotExist:
+            return Response({'detail': 'Organization not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            template = ClientExcelTemplate.objects.get(organization=org)
+        except ClientExcelTemplate.DoesNotExist:
+            return Response({'has_template': False})
+
+        found = set(template.detected_named_ranges or [])
+        missing_scalar = sorted(set(SCALAR_FIELD_CATALOG) - found)
+        missing_row = sorted(set(ROW_FIELD_CATALOG) - found)
+
+        return Response({
+            'has_template': True,
+            'is_active': template.is_active,
+            'original_filename': template.original_filename,
+            'uploaded_at': template.uploaded_at.isoformat(),
+            'uploaded_by': template.uploaded_by.email if template.uploaded_by else None,
+            'detected_named_ranges': sorted(found),
+            'missing_scalar_fields': missing_scalar,
+            'missing_row_fields': missing_row,
+        })
+
+
+class AdminDeleteExcelTemplateView(APIView):
+    """
+    Removes an organization's custom template (file + record). The org
+    falls back to the standard generator on its very next export --
+    UnderwritePropertyDownloadView looks this up fresh on every request,
+    no caching/flag to clear elsewhere.
+    URL: DELETE /api/admin/organizations/<org_id>/excel-template/delete/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, org_id):
+        if not request.user.is_admin:
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            org = Organization.objects.get(id=org_id)
+        except Organization.DoesNotExist:
+            return Response({'detail': 'Organization not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            template = ClientExcelTemplate.objects.get(organization=org)
+        except ClientExcelTemplate.DoesNotExist:
+            return Response({'detail': 'This organization has no custom template.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if template.file:
+            template.file.delete(save=False)
+        template.delete()
+
+        return Response({'detail': f"Custom template removed for {org.name}."}, status=status.HTTP_204_NO_CONTENT)

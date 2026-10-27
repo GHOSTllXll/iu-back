@@ -28,6 +28,11 @@ from .parsers import (
     FileValidationError,
 )
 from .excel_generator import generate_underwriting_excel, ExcelGenerationError, CURRENCY_FORMATS, DEFAULT_CURRENCY_CODE
+from .custom_template_generator import (
+    generate_excel_from_template,
+    TemplateValidationError as CustomTemplateValidationError,
+    TemplateCapacityError,
+)
 from .excel_ppm_generator import build_ppm_master_grid, PPMExcelGenerationError
 from .rent_roll_utils import (
     detect_charge_ledger_columns,
@@ -1491,6 +1496,8 @@ class UnderwritePropertyDownloadView(APIView):
         analysis_id = request.data.get('analysis_id')
         cached = get_cached_analysis(analysis_id) if analysis_id else None
 
+        organization = get_user_organization(request)
+
         if cached:
             metrics, rent_roll_df = cached
         else:
@@ -1515,11 +1522,49 @@ class UnderwritePropertyDownloadView(APIView):
             tier = get_user_tier(request)
             metrics, rent_roll_df, error = process_underwriting_files(
                 om_file, t12_file, rent_roll_file, tier=tier,
-                organization=get_user_organization(request), uploaded_by=request.user
+                organization=organization, uploaded_by=request.user
             )
 
             if error:
                 return error
+
+        # Custom-template branch: if this org has its own proprietary Excel
+        # template on file (see ClientExcelTemplate / custom_template_generator.py),
+        # skip our own standard workbook entirely and fill in THEIRS instead —
+        # same metrics/rent_roll_df, completely different output path. Falls
+        # back to the standard generator below for every org without one.
+        from .models import ClientExcelTemplate
+        custom_template = (
+            ClientExcelTemplate.objects.filter(organization=organization, is_active=True).first()
+            if organization else None
+        )
+
+        if custom_template:
+            try:
+                excel_bytes, template_report = generate_excel_from_template(
+                    custom_template.file, metrics, rent_roll_df, debt_assumptions=debt_assumptions
+                )
+            except (CustomTemplateValidationError, TemplateCapacityError) as e:
+                return Response(
+                    {'error': f"Your organization's custom Excel template couldn't be used for this analysis: {e}"},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            except Exception as e:
+                return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            logger.info("Custom template export for org %s: %s", organization.name, template_report)
+
+            is_macro_enabled = custom_template.original_filename.lower().endswith('.xlsm')
+            response = FileResponse(
+                io.BytesIO(excel_bytes),
+                as_attachment=True,
+                filename=custom_template.original_filename or 'Underwriting_Model.xlsm',
+                content_type=(
+                    'application/vnd.ms-excel.sheet.macroEnabled.12' if is_macro_enabled
+                    else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                )
+            )
+            return response
 
         try:
             excel_bytes = generate_underwriting_excel(metrics, rent_roll_df, debt_assumptions=debt_assumptions, currency_code=currency_code)

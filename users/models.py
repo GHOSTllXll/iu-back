@@ -39,6 +39,16 @@ class Organization(models.Model):
     account_status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     date_created = models.DateTimeField(auto_now_add=True)
 
+    # Informational / bookkeeping only — e.g. "colliers.com" for an
+    # institutional client. Org creation is entirely admin-provisioned (see
+    # AdminCreateUserView / AdminCreateTrialAccountView), not self-serve
+    # signup, so this is NOT used to look up or auto-assign an organization
+    # at login — request.user.organization already does that directly.
+    # This exists purely so the admin org list is easy to scan/search by
+    # client domain, and as a human-readable label next to a custom Excel
+    # template (see ai_service.models.ClientExcelTemplate).
+    email_domain = models.CharField(max_length=255, blank=True, default='')
+
     # Institutional PPM feature gate — separate from subscription_plan on
     # purpose, so PPM access can be granted/revoked independently of tier
     # without needing a new PLAN_CHOICES value.

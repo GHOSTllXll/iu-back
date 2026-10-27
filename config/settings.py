@@ -190,6 +190,16 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
+# Private, non-public storage for files we deliberately keep (unlike every
+# OM/T12/Rent Roll upload — see ProcessedDocument's docstring — those are
+# analyzed once and never stored). First use: a client's own proprietary
+# Excel template (see ai_service.models.ClientExcelTemplate). Deliberately
+# OUTSIDE STATIC_ROOT and never wired to a MEDIA_URL / static() route in
+# urls.py — these are a client's proprietary valuation models, so the only
+# way to read one back is server-side, through an authenticated admin view,
+# never a guessable public URL.
+PRIVATE_MEDIA_ROOT = BASE_DIR / 'private_media'
+
 _extra_cors_origins = [o.strip() for o in os.getenv('DJANGO_CORS_ORIGINS', '').split(',') if o.strip()]
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
