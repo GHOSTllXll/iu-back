@@ -10,6 +10,12 @@ db.sqlite3
 staticfiles/
 media/
 
+# Client-uploaded files (Excel templates, source documents) — never
+# tracked, per the platform's own "files are destroyed/never committed"
+# convention (see ai_service/models.py's ProcessedDocument docstring).
+# Each environment (local/staging/production) has its own real uploads.
+private_media/
+
 # Logs
 logs
 *.log
