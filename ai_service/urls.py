@@ -14,6 +14,12 @@ from .views import (
     PPMUnderwriteView,
     ExportPPMMasterGridView,
     TaskStatusView,
+    PropertyProjectListView,
+    PropertyProjectDetailView,
+    TeamNoteListCreateView,
+    PropertyProjectDownloadView,
+    ExcelOverrideCheckView,
+    ExcelOverrideHistoryView,
 )
 
 urlpatterns = [
@@ -42,4 +48,18 @@ urlpatterns = [
     # Shared polling endpoint for the Celery-backed CRE (underwrite/) and
     # PPM (ppm/underwrite/) tasks above - see TaskStatusView's docstring.
     path('task-status/<str:task_id>/', TaskStatusView.as_view(), name='task_status'),
+
+    # Feature 3 (Enterprise Pipeline & Workflow Dashboard): the Deal
+    # Pipeline. See permissions.py for the visibility rule shared by all
+    # four of these, and views.py's own comment block above
+    # PropertyProjectListView for the full writeup.
+    path('pipeline/projects/', PropertyProjectListView.as_view(), name='pipeline_project_list'),
+    path('pipeline/projects/<int:project_id>/', PropertyProjectDetailView.as_view(), name='pipeline_project_detail'),
+    path('pipeline/projects/<int:project_id>/notes/', TeamNoteListCreateView.as_view(), name='pipeline_project_notes'),
+    path('pipeline/projects/<int:project_id>/download/', PropertyProjectDownloadView.as_view(), name='pipeline_project_download'),
+
+    # Feature 4 (Cell Override Audit Log): "Re-upload Edited Underwriting
+    # File" — see views.py's comment block above ExcelOverrideCheckView.
+    path('pipeline/projects/<int:project_id>/override-check/', ExcelOverrideCheckView.as_view(), name='pipeline_project_override_check'),
+    path('pipeline/projects/<int:project_id>/overrides/', ExcelOverrideHistoryView.as_view(), name='pipeline_project_overrides'),
 ]

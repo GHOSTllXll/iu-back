@@ -7,7 +7,12 @@ from .views import (LoginView, LogoutView, CurrentUserView, AdminCreateUserView,
                     AdminCreateMessageView, AdminMessageListView, AdminDeactivateMessageView, ActiveMessagesView,
                     AdminCreateTrialAccountView,
                     UserReportIssueView, AdminIssueListView, AdminToggleIssueStatusView,
-                    AdminUploadExcelTemplateView, AdminGetExcelTemplateView, AdminDeleteExcelTemplateView)
+                    AdminUploadExcelTemplateView, AdminGetExcelTemplateView, AdminDeleteExcelTemplateView,
+                    MyOrganizationExcelTemplateView,
+                    MyOrganizationWorkspacesView, MyOrganizationWorkspaceDetailView,
+                    MyOrganizationMembersView, MyOrganizationMemberWorkspaceView,
+                    AdminOrganizationWorkspacesView, AdminOrganizationWorkspaceDetailView,
+                    AdminOrganizationUserWorkspaceView, WorkspaceUsageView)
 from ai_service.urls import urlpatterns as ai_urls
 
 urlpatterns = [
@@ -51,6 +56,27 @@ urlpatterns = [
     path('admin/organizations/<int:org_id>/excel-template/upload/', AdminUploadExcelTemplateView.as_view(), name='admin_upload_excel_template'),
     path('admin/organizations/<int:org_id>/excel-template/', AdminGetExcelTemplateView.as_view(), name='admin_get_excel_template'),
     path('admin/organizations/<int:org_id>/excel-template/delete/', AdminDeleteExcelTemplateView.as_view(), name='admin_delete_excel_template'),
+
+    # Self-serve counterpart to the admin-only endpoints above, scoped to the
+    # calling user's own organization (see MyOrganizationExcelTemplateView).
+    path('organization/excel-template/', MyOrganizationExcelTemplateView.as_view(), name='my_excel_template'),
+
+    # Feature 3 (Enterprise Pipeline & Workflow Dashboard): Team Workspace
+    # management — self-serve (scoped to the calling org-admin's own org)
+    # and the platform-admin mirror (scoped by org_id, for YOU to set up on
+    # a client's behalf). See users/views.py for the full pattern writeup.
+    path('organization/workspaces/', MyOrganizationWorkspacesView.as_view(), name='my_workspaces'),
+    path('organization/workspaces/<int:workspace_id>/', MyOrganizationWorkspaceDetailView.as_view(), name='my_workspace_detail'),
+    path('organization/members/', MyOrganizationMembersView.as_view(), name='my_org_members'),
+    path('organization/members/<str:email>/workspace/', MyOrganizationMemberWorkspaceView.as_view(), name='my_org_member_workspace'),
+
+    # Feature 4: workspace-scoped usage metrics for the Head Seat (or org
+    # admin) — see WorkspaceUsageView's docstring for the full gating rule.
+    path('organization/workspaces/<int:workspace_id>/usage/', WorkspaceUsageView.as_view(), name='workspace_usage'),
+
+    path('admin/organizations/<int:org_id>/workspaces/', AdminOrganizationWorkspacesView.as_view(), name='admin_org_workspaces'),
+    path('admin/organizations/<int:org_id>/workspaces/<int:workspace_id>/', AdminOrganizationWorkspaceDetailView.as_view(), name='admin_org_workspace_detail'),
+    path('admin/organizations/<int:org_id>/users/<str:email>/workspace/', AdminOrganizationUserWorkspaceView.as_view(), name='admin_org_user_workspace'),
 
     path('ai/', include(ai_urls)),
 

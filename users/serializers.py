@@ -1,6 +1,6 @@
 # backend/users/serializers.py
 from rest_framework import serializers
-from .models import CustomUser, Organization, ActivityLog
+from .models import CustomUser, Organization, ActivityLog, TeamWorkspace
 
 #  NEW: Serializer for the Accounts Dashboard
 class OrganizationSerializer(serializers.ModelSerializer):
@@ -40,9 +40,23 @@ class UserSerializer(serializers.ModelSerializer):
     # user with no organization at all returns False instead of blowing up.
     has_ppm_access = serializers.SerializerMethodField()
 
+    # Feature 4: drives the Team Workspaces section's "View Usage" link
+    # gating on settings.vue — a workspace Head needs to know THEIR OWN
+    # workspace_id/workspace_role to tell their own workspace apart from
+    # every other one in the list (never trusted for the actual permission
+    # check itself, which WorkspaceUsageView re-derives server-side from
+    # request.user). Declared explicitly rather than left to ModelSerializer
+    # auto-detection — 'workspace_id' is the FK's attname, not its field
+    # name ('workspace'), so it isn't one of the fields ModelSerializer can
+    # build automatically; allow_null=True for the no-workspace case.
+    workspace_id = serializers.IntegerField(read_only=True, allow_null=True)
+
     class Meta:
         model = CustomUser
-        fields = ['email', 'first_name', 'last_name', 'role', 'is_admin', 'is_active', 'date_joined', 'organization_name', 'has_ppm_access']
+        fields = [
+            'email', 'first_name', 'last_name', 'role', 'is_admin', 'is_active', 'date_joined',
+            'organization_name', 'has_ppm_access', 'workspace_id', 'workspace_role',
+        ]
 
     def get_has_ppm_access(self, obj):
         return bool(obj.organization and obj.organization.has_ppm_access)
@@ -99,6 +113,51 @@ class AdminCreateUserSerializer(serializers.ModelSerializer):
             **validated_data
         )
         return user
+
+class AssignUserWorkspaceSerializer(serializers.Serializer):
+    """
+    Feature 3: validates a workspace assignment BEFORE it's applied — the
+    application-layer enforcement (praised in review as "the brilliant
+    application-layer constraint") that a CustomUser's workspace always
+    belongs to that same user's organization. The database can't express
+    this itself (see TeamWorkspace's own docstring for why — it's a
+    constraint across two different FKs). workspace_id=None is valid and
+    means "unassign" — the member then falls back to the own-created-
+    projects-only visibility rule (see ai_service/permissions.py).
+
+    Requires 'organization' in the serializer context — the CALLER's own
+    organization, resolved by the view from request.user.organization (the
+    self-serve endpoint) or the org_id in the URL (the platform-admin
+    mirror) — never trusted from the request body itself.
+
+    Feature 4: also accepts an optional 'workspace_role' ('analyst' or
+    'head') so a single PATCH can set a member's workspace assignment and
+    their seat within it together. Omitting it leaves the member's current
+    workspace_role untouched (the view only applies a key that was actually
+    present in the request - see MyOrganizationMemberWorkspaceView.patch /
+    AdminOrganizationUserWorkspaceView.patch). This field is intentionally
+    NOT validated against workspace_id being non-null here - a head with no
+    workspace assigned is harmless (permissions.py's visible_projects_for
+    requires BOTH workspace_id is not None AND workspace_role == 'head'
+    before granting workspace-wide visibility), so the view is free to
+    accept workspace_role on its own, e.g. to pre-promote someone ahead of
+    assigning their workspace.
+    """
+    workspace_id = serializers.IntegerField(required=False, allow_null=True)
+    workspace_role = serializers.ChoiceField(
+        choices=CustomUser.WORKSPACE_ROLE_CHOICES, required=False
+    )
+
+    def validate_workspace_id(self, value):
+        if value is None:
+            return value
+        organization = self.context['organization']
+        if not TeamWorkspace.objects.filter(pk=value, organization=organization).exists():
+            raise serializers.ValidationError(
+                "This workspace does not belong to this user's organization."
+            )
+        return value
+
 
 class ActivityLogSerializer(serializers.ModelSerializer):
     # Added allow_null=True here

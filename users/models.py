@@ -66,6 +66,45 @@ class Organization(models.Model):
     def __str__(self):
         return self.name
 
+
+class TeamWorkspace(models.Model):
+    """
+    Feature 3 (Enterprise Pipeline & Workflow Dashboard): the middle tier of
+    Company Account -> Team Workspace -> Property Project. Purely additive —
+    a brand-new table, no existing data or behavior touched by its creation.
+
+    A workspace belongs to exactly one Organization. A CustomUser belongs to
+    at most one TeamWorkspace (see CustomUser.workspace below) — not a
+    many-to-many membership table, since nothing in this product currently
+    needs a person to sit in more than one workspace at once; that's a real
+    product decision to make deliberately later; not something to
+    half-support now by guessing.
+
+    Deliberately does NOT itself enforce that a user's workspace belongs to
+    that same user's organization — Django can't express a constraint across
+    two different FKs at the database level. That invariant is enforced at
+    the application layer instead (serializer validation on CustomUser),
+    the same way CustomUser.save() already enforces is_admin at the
+    application layer rather than the database.
+    """
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='workspaces')
+    name = models.CharField(max_length=255)
+
+    created_by = models.ForeignKey(
+        'CustomUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='created_workspaces'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['organization', 'name'], name='unique_workspace_name_per_org'),
+        ]
+        ordering = ['name']
+
+    def __str__(self):
+        return f"{self.name} ({self.organization.name})"
+
+
 class CustomUserManager(BaseUserManager):
     def create_user(self, email, password=None, **extra_fields):
         if not email:
@@ -94,7 +133,43 @@ class CustomUser(AbstractBaseUser, PermissionsMixin):
     
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, null=True, blank=True, related_name='users')
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='member')
-    
+
+    # Feature 3: nullable so every existing account is completely unaffected
+    # until an org admin explicitly assigns them to a workspace. Drives the
+    # Deal Pipeline visibility rule (see ai_service/permissions.py): an org
+    # admin (role='admin') always sees every workspace in their organization
+    # regardless of this field; within a workspace, visibility is further
+    # split by workspace_role below (Feature 4); a member with no workspace
+    # assigned yet (the expected state during rollout) falls back to seeing
+    # only the projects they personally created, rather than either their
+    # whole org or nothing.
+    # Application layer (not the database — see TeamWorkspace's docstring)
+    # enforces that this always belongs to the same organization as the
+    # user themselves.
+    workspace = models.ForeignKey(
+        'TeamWorkspace', on_delete=models.SET_NULL, null=True, blank=True, related_name='members'
+    )
+
+    WORKSPACE_ROLE_CHOICES = [
+        ('analyst', 'Analyst'),             # The analyst seat — own-created deals only.
+        ('head', 'Head of Underwriting'),   # The "Master Seat" — sees every deal in
+                                             # this workspace, plus team usage metrics
+                                             # and every override audit log on the team.
+    ]
+
+    # Feature 4 ("Head of Underwriting" hierarchy): a SECOND, workspace-scoped
+    # permission axis layered on top of `role` above. `role` is org-wide
+    # (billing/admin); this only matters once a user actually has a
+    # workspace, and is simply ignored otherwise — see visible_projects_for
+    # in ai_service/permissions.py for the full precedence (org admin >
+    # workspace head > plain member/no-workspace, both of which fall back to
+    # own-created-only). Default 'analyst' is deliberately the safer choice
+    # for every NEW workspace assignment going forward — but see this
+    # field's migration for why every user who ALREADY had a workspace
+    # before this field existed is backfilled to 'head' instead, so this
+    # rollout doesn't silently shrink anyone's existing visibility.
+    workspace_role = models.CharField(max_length=10, choices=WORKSPACE_ROLE_CHOICES, default='analyst')
+
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
     is_admin = models.BooleanField(default=False) # ONLY FOR YOU

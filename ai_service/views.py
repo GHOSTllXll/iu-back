@@ -6,6 +6,8 @@ import os
 import time
 import uuid
 import tempfile
+import datetime
+import openpyxl
 import pandas as pd
 from datetime import timedelta
 from django.http import FileResponse
@@ -32,6 +34,8 @@ from .custom_template_generator import (
     generate_excel_from_template,
     TemplateValidationError as CustomTemplateValidationError,
     TemplateCapacityError,
+    compute_injected_values_snapshot,
+    extract_defined_names,
 )
 from .excel_ppm_generator import build_ppm_master_grid, PPMExcelGenerationError
 from .rent_roll_utils import (
@@ -60,7 +64,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from django.db import connection, OperationalError, InterfaceError
-from .variance_analysis import run_variance_analysis, VarianceAnalysisSkipped
+from .variance_analysis import run_variance_analysis, run_line_item_anomaly_scan, VarianceAnalysisSkipped
 
 def _db_write_with_retry(fn):
     """
@@ -323,8 +327,50 @@ def _parse_debt_assumptions(request):
         )
  
     assumptions['purchase_price'] = price
- 
+
     return assumptions, None
+
+
+def _dataframe_to_json_safe(df):
+    """
+    Feature 3: converts a pandas DataFrame into a plain JSON-serializable
+    structure (list of dicts) safe to store in a JSONField — via pandas' own
+    to_json (NaN -> null, numpy scalar types -> plain Python types, dates ->
+    ISO 8601 strings) rather than hand-rolling DataFrame -> dict conversion,
+    which silently mishandles exactly those cases (a raw .to_dict() call
+    leaves numpy.int64/float64 and NaN in place, and JSONField's underlying
+    json.dumps() either rejects or mis-renders every one of those).
+
+    Returns [] for None/empty input rather than raising — callers store the
+    result directly on AnalysisReport.rent_roll_data/t12_monthly_data, where
+    "no rows" and "not available" are both legitimately representable as an
+    empty/absent value, not an error.
+    """
+    if df is None or df.empty:
+        return []
+    return json.loads(df.to_json(orient='records', date_format='iso'))
+
+
+def _parse_currency_code(request):
+    """
+    Shared currency_code parsing/validation — used by both
+    UnderwritePropertyDownloadView and PropertyProjectDownloadView (Feature
+    3), pulled out so the two never drift. An omitted field silently
+    defaults to USD (a frontend dropdown that always sends a value, or an
+    old cached client, shouldn't break); an explicitly-sent but unrecognized
+    code IS rejected loudly, since that can only mean a frontend/backend
+    mismatch worth surfacing. Returns (currency_code, error_response) —
+    error_response is None on success.
+    """
+    currency_code = (request.data.get('currency_code') or DEFAULT_CURRENCY_CODE).strip().upper()
+    if currency_code not in CURRENCY_FORMATS:
+        return None, Response(
+            {'error': f"'{currency_code}' is not a supported currency. Supported: {', '.join(sorted(CURRENCY_FORMATS.keys()))}."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    return currency_code, None
+
+
 def get_user_tier(request) -> str:
     """
     Reads the requesting user's subscription tier from their Organization.
@@ -563,6 +609,10 @@ def enforce_tier_entitlements(metrics: dict, tier: str) -> dict:
 
     if tier not in TIERS_WITH_VARIANCE_ANALYSIS:
         metrics.pop("variance_analysis", None)
+        # Same tier gate as Module 7 above — line_item_anomalies is the
+        # generalized counterpart computed alongside it (see 7b.), not a
+        # separately-gated feature.
+        metrics.pop("line_item_anomalies", None)
 
     # reconciliation_claims, uncategorized_items, and source_citations are all
     # intermediate fields the AI populates so Python can process them — none
@@ -656,7 +706,7 @@ def extract_ppm_json_from_ai_response(ai_response: str) -> dict:
 # SHARED PROCESSING FUNCTION (DRY Principle)
 # ==========================================
 def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TIER_BASIC,
-                                 organization=None, uploaded_by=None):
+                                 organization=None, uploaded_by=None, project_id=None):
     """
     Shared logic for processing files and extracting metrics.
     Returns: (metrics_dict, rent_roll_df, error_response)
@@ -668,6 +718,11 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
     `organization`/`uploaded_by` are used purely for History recording — see
     document_history.py. Passing organization=None skips recording entirely
     (e.g. a user with no org attached).
+
+    `project_id` (Feature 3): forwarded as-is to record_analysis_report — see
+    its docstring for exactly how it's resolved. None (the default) means
+    "start a brand-new deal", which is every call site's behavior before
+    this parameter existed.
     """
     # Quota check happens BEFORE any parsing/AI work — an org over their limit
     # gets rejected immediately rather than wasting processing on files that
@@ -848,19 +903,39 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         #     for the full design rationale. Only runs for Excel-format T12s
         #     with real chronological monthly columns; cleanly skipped
         #     otherwise (PDF T12s, annual-only statements).
+        # Feature 3: captured here (module scope of this try block) rather
+        # than only inside the branch below, so it survives to the
+        # record_analysis_report call further down regardless of which
+        # branch ran — None whenever this tier/format combination never
+        # produces a parsed monthly grid in the first place (PDF T12s,
+        # annual-only statements, or tiers without variance analysis at all).
+        t12_df_for_persistence = None
+
         if tier in TIERS_WITH_VARIANCE_ANALYSIS:
             try:
                 t12_ext = os.path.splitext(t12_file.name)[1].lower()
                 if t12_ext in ('.xlsx', '.xls', '.csv'):
                     t12_file.seek(0)  # already consumed once by extract_t12_text() above
                     t12_df = read_excel_with_header_detection(t12_file)
+                    t12_df_for_persistence = t12_df
                     rent_col_va, status_col_va, tenant_col_va = detect_rent_roll_columns(rent_roll_df)
                     variance_result = run_variance_analysis(t12_df, rent_roll_df, unit_col=tenant_col_va)
                     metrics["variance_analysis"] = variance_result
+
+                    # Generalized (any-line-item) anomaly scan feeding the
+                    # workbook's separate 'Monthly Variance' tab — reuses
+                    # this exact same already-parsed t12_df, no extra file
+                    # I/O, and is fully independent of Module 7 above (see
+                    # variance_analysis.run_line_item_anomaly_scan).
+                    metrics["line_item_anomalies"] = run_line_item_anomaly_scan(t12_df)
                 else:
                     metrics["variance_analysis"] = {
                         "skipped": True,
                         "reason": "Reconciliation Skipped: Source Document Lacks Monthly Granularity (PDF T12 not supported for this analysis).",
+                    }
+                    metrics["line_item_anomalies"] = {
+                        "skipped": True,
+                        "reason": "Monthly Variance Skipped: Source Document Lacks Monthly Granularity (PDF T12 not supported for this analysis).",
                     }
             except Exception as e:
                 # Never let this optional module crash the whole analysis —
@@ -868,6 +943,10 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
                 metrics["variance_analysis"] = {
                     "skipped": True,
                     "reason": f"Variance analysis could not run: {str(e)}",
+                }
+                metrics["line_item_anomalies"] = {
+                    "skipped": True,
+                    "reason": f"Monthly variance scan could not run: {str(e)}",
                 }
 
         t_after_module7 = time.perf_counter()
@@ -895,7 +974,10 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
             organization, uploaded_by, om_file, t12_file, rent_roll_file, status='completed'
         ))
         _db_write_with_retry(lambda: record_analysis_report(
-            organization, uploaded_by, metrics, tier, processing_seconds=elapsed_seconds
+            organization, uploaded_by, metrics, tier, processing_seconds=elapsed_seconds,
+            project_id=project_id,
+            rent_roll_data={"rows": _dataframe_to_json_safe(rent_roll_df)},
+            t12_monthly_data={"rows": _dataframe_to_json_safe(t12_df_for_persistence)} if t12_df_for_persistence is not None else None,
         ))
 
         t_after_db = time.perf_counter()
@@ -1432,6 +1514,19 @@ class UnderwritePropertyView(APIView):
 
         tier = get_user_tier(request)
 
+        # Feature 3: present only when this upload came from the "Re-upload &
+        # Re-analyze Files" button inside a specific PropertyProject view —
+        # absent (the default) from every other upload path, which always
+        # starts a brand-new deal. Not validated here beyond basic parsing;
+        # record_analysis_report re-checks it belongs to the caller's own
+        # organization before ever using it, so a bad/foreign id just falls
+        # back to "start a new deal" rather than needing to be rejected here.
+        raw_project_id = request.data.get('project_id')
+        try:
+            project_id = int(raw_project_id) if raw_project_id not in (None, '') else None
+        except (TypeError, ValueError):
+            project_id = None
+
         om_path, om_name = _save_upload_to_temp(om_file)
         t12_path, t12_name = _save_upload_to_temp(t12_file)
         rent_roll_path, rent_roll_name = _save_upload_to_temp(rent_roll_file)
@@ -1439,7 +1534,7 @@ class UnderwritePropertyView(APIView):
         try:
             task = run_cre_underwriting_task.delay(
                 om_path, om_name, t12_path, t12_name, rent_roll_path, rent_roll_name,
-                tier, request.user.pk,
+                tier, request.user.pk, project_id,
             )
         except Exception:
             # Enqueueing itself failed (e.g. Redis unreachable) - the temp
@@ -1453,6 +1548,131 @@ class UnderwritePropertyView(APIView):
                     pass
             raise
         return Response({'task_id': task.id, 'status': 'queued'}, status=status.HTTP_202_ACCEPTED)
+
+def _build_underwriting_excel_response(request, organization, metrics, rent_roll_df, debt_assumptions, currency_code, analysis=None):
+    """
+    Given a fully-resolved metrics/rent_roll_df pair, builds and returns the
+    Excel FileResponse (or an error Response). This is the custom-template-
+    vs-standard branching shared by UnderwritePropertyDownloadView (a fresh
+    or just-cached analysis) and PropertyProjectDownloadView (Feature 3:
+    regenerating from a PropertyProject's persisted history) — pulled out
+    into one place specifically so the two call sites can never drift from
+    each other on this logic.
+
+    `analysis` (Feature 4, Cell Override Audit Log): the AnalysisReport this
+    download is FOR, if the caller has one in hand — only
+    PropertyProjectDownloadView does today. When given, the exact values
+    just written into the generated file (scalars + per-tenant rows) are
+    captured onto analysis.injected_values_snapshot, which a later
+    "Re-upload Edited Underwriting File" diffs against. Deliberately
+    captured HERE (at generation time), not back when the analysis was
+    first created — 3 of the 16 scalar fields are debt assumptions
+    (ltv/rate/amortization) typed in at download time, which this function
+    already has fresh from THIS request, and can differ between repeat
+    downloads of the same analysis. UnderwritePropertyDownloadView doesn't
+    pass one — its direct-download path has no AnalysisReport handle
+    without a larger refactor of process_underwriting_files' return value,
+    and the pipeline download path above is the one this feature's brief
+    actually describes ("weeks later, from the pipeline"). A download made
+    only through that older path simply has no snapshot yet — override
+    tracking becomes available for a deal once it's been downloaded at
+    least once from its PropertyProject view.
+    """
+    # Custom-template branch: if this org has its own proprietary Excel
+    # template on file (see ClientExcelTemplate / custom_template_generator.py),
+    # skip our own standard workbook entirely and fill in THEIRS instead —
+    # same metrics/rent_roll_df, completely different output path. Falls
+    # back to the standard generator below for every org without one.
+    #
+    # template_choice lets the frontend's upload-flow dropdown override
+    # this. Deliberately defaults to 'auto' (preserving the exact
+    # behavior that existed before this parameter did — prefer the org's
+    # custom template whenever one is active) rather than defaulting to
+    # 'standard', so an org already relying on automatic substitution
+    # (e.g. Colliers — see CUSTOM_TEMPLATE_NAMING_GUIDE.md) keeps getting
+    # their own workbook on every existing integration that doesn't send
+    # this field at all, not just ones updated to the new dropdown.
+    template_choice = (request.data.get('template_choice') or 'auto').strip().lower()
+    if template_choice not in ('auto', 'standard', 'custom'):
+        return Response(
+            {'error': f"'{template_choice}' is not a valid template_choice. Use 'auto', 'standard', or 'custom'."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    from .models import ClientExcelTemplate
+    custom_template = (
+        ClientExcelTemplate.objects.filter(organization=organization, is_active=True).first()
+        if organization else None
+    )
+
+    if template_choice == 'custom' and not custom_template:
+        return Response(
+            {'error': "Your organization has no active custom Excel template to use. Upload one in Settings, or choose 'System Standard'."},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # 'standard' is an explicit opt-out even when a custom template IS
+    # active — the one case the pre-existing automatic behavior could
+    # never do at all (there was no way to get the generic workbook for
+    # a template-enabled org). 'auto'/'custom' both use it when present.
+    use_custom_template = custom_template is not None and template_choice != 'standard'
+
+    def _save_injected_values_snapshot():
+        # Feature 4: only when the caller actually has an AnalysisReport to
+        # attach this to (see this function's own docstring) — and only
+        # called AFTER generation has already succeeded below, so a failed
+        # download never overwrites a perfectly good earlier snapshot with
+        # nothing useful.
+        if analysis is None:
+            return
+        analysis.injected_values_snapshot = compute_injected_values_snapshot(
+            metrics, debt_assumptions, rent_roll_df
+        )
+        analysis.save(update_fields=['injected_values_snapshot'])
+
+    if use_custom_template:
+        try:
+            excel_bytes, template_report = generate_excel_from_template(
+                custom_template.file, metrics, rent_roll_df, debt_assumptions=debt_assumptions
+            )
+        except (CustomTemplateValidationError, TemplateCapacityError) as e:
+            return Response(
+                {'error': f"Your organization's custom Excel template couldn't be used for this analysis: {e}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        logger.info("Custom template export for org %s: %s", organization.name, template_report)
+        _save_injected_values_snapshot()
+
+        is_macro_enabled = custom_template.original_filename.lower().endswith('.xlsm')
+        return FileResponse(
+            io.BytesIO(excel_bytes),
+            as_attachment=True,
+            filename=custom_template.original_filename or 'Underwriting_Model.xlsm',
+            content_type=(
+                'application/vnd.ms-excel.sheet.macroEnabled.12' if is_macro_enabled
+                else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
+        )
+
+    try:
+        excel_bytes = generate_underwriting_excel(metrics, rent_roll_df, debt_assumptions=debt_assumptions, currency_code=currency_code)
+    except ExcelGenerationError as e:
+        return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    _save_injected_values_snapshot()
+
+    return FileResponse(
+        io.BytesIO(excel_bytes),
+        as_attachment=True,
+        filename='Underwriting_Model.xlsx',
+        content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+
 
 class UnderwritePropertyDownloadView(APIView):
     """
@@ -1478,20 +1698,9 @@ class UnderwritePropertyDownloadView(APIView):
         if debt_error:
             return debt_error
 
-        # Multi-currency: purely a display/formatting selection for the Excel
-        # export — does not touch AI extraction, reconciliation, or any
-        # numeric value. Missing field silently defaults to USD (this is a
-        # frontend dropdown that always sends a value; an old cached client
-        # or a direct API caller omitting it shouldn't break downloads). An
-        # explicitly-sent but unrecognized code IS rejected loudly, since that
-        # can only mean a frontend/backend mismatch worth surfacing rather
-        # than silently mis-formatting a client's model.
-        currency_code = (request.data.get('currency_code') or DEFAULT_CURRENCY_CODE).strip().upper()
-        if currency_code not in CURRENCY_FORMATS:
-            return Response(
-                {'error': f"'{currency_code}' is not a supported currency. Supported: {', '.join(sorted(CURRENCY_FORMATS.keys()))}."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        currency_code, currency_error = _parse_currency_code(request)
+        if currency_error:
+            return currency_error
 
         analysis_id = request.data.get('analysis_id')
         cached = get_cached_analysis(analysis_id) if analysis_id else None
@@ -1528,58 +1737,9 @@ class UnderwritePropertyDownloadView(APIView):
             if error:
                 return error
 
-        # Custom-template branch: if this org has its own proprietary Excel
-        # template on file (see ClientExcelTemplate / custom_template_generator.py),
-        # skip our own standard workbook entirely and fill in THEIRS instead —
-        # same metrics/rent_roll_df, completely different output path. Falls
-        # back to the standard generator below for every org without one.
-        from .models import ClientExcelTemplate
-        custom_template = (
-            ClientExcelTemplate.objects.filter(organization=organization, is_active=True).first()
-            if organization else None
+        return _build_underwriting_excel_response(
+            request, organization, metrics, rent_roll_df, debt_assumptions, currency_code
         )
-
-        if custom_template:
-            try:
-                excel_bytes, template_report = generate_excel_from_template(
-                    custom_template.file, metrics, rent_roll_df, debt_assumptions=debt_assumptions
-                )
-            except (CustomTemplateValidationError, TemplateCapacityError) as e:
-                return Response(
-                    {'error': f"Your organization's custom Excel template couldn't be used for this analysis: {e}"},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            except Exception as e:
-                return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-            logger.info("Custom template export for org %s: %s", organization.name, template_report)
-
-            is_macro_enabled = custom_template.original_filename.lower().endswith('.xlsm')
-            response = FileResponse(
-                io.BytesIO(excel_bytes),
-                as_attachment=True,
-                filename=custom_template.original_filename or 'Underwriting_Model.xlsm',
-                content_type=(
-                    'application/vnd.ms-excel.sheet.macroEnabled.12' if is_macro_enabled
-                    else 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                )
-            )
-            return response
-
-        try:
-            excel_bytes = generate_underwriting_excel(metrics, rent_roll_df, debt_assumptions=debt_assumptions, currency_code=currency_code)
-        except ExcelGenerationError as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
-        except Exception as e:
-            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        response = FileResponse(
-            io.BytesIO(excel_bytes),
-            as_attachment=True,
-            filename='Underwriting_Model.xlsx',
-            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        )
-        return response
 
 def process_ppm_file(ppm_file, manual_pages, tier, organization=None, uploaded_by=None):
     """
@@ -2126,3 +2286,445 @@ class ProcessedDocumentDeleteView(APIView):
         doc.is_deleted = True
         doc.save(update_fields=['is_deleted'])
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Feature 3 (Enterprise Pipeline & Workflow Dashboard): the Deal Pipeline.
+# Every view below delegates "who can see/manage this deal" entirely to
+# permissions.py (visible_projects_for / can_manage_project) — see that
+# module's docstring for the exact platform-superuser / org-admin /
+# workspace-member / own-projects-only rule. A project that isn't visible
+# 404s rather than 403s — revealing "it exists but you can't see it" is
+# itself information this multi-tenant platform shouldn't leak.
+# ---------------------------------------------------------------------------
+
+def _serialize_project_summary(project):
+    latest = project.analyses.order_by('-created_at').first()
+    return {
+        'id': project.id,
+        'property_name': project.property_name or 'Untitled',
+        'deal_status': project.deal_status,
+        'deal_status_display': project.get_deal_status_display(),
+        'organization': project.organization.name,
+        'workspace': project.workspace.name if project.workspace_id else None,
+        'uploaded_by': (
+            latest.uploaded_by.email if latest and latest.uploaded_by
+            else (project.created_by.email if project.created_by else None)
+        ),
+        'date_processed': latest.created_at.isoformat() if latest else project.created_at.isoformat(),
+        'analysis_count': project.analyses.count(),
+        'can_download': bool(latest and latest.rent_roll_data),
+        'updated_at': project.updated_at.isoformat(),
+    }
+
+
+class PropertyProjectListView(APIView):
+    """
+    The Deal Pipeline dashboard's table: property, uploader, date
+    processed, status, and whether a historical Download is available.
+    Optional ?deal_status=reviewing|approved|archived filter for the
+    dashboard's status tabs/filter dropdown.
+    URL: GET /api/ai/pipeline/projects/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .permissions import visible_projects_for
+
+        projects = visible_projects_for(request.user).select_related('organization', 'workspace', 'created_by')
+
+        deal_status_filter = request.query_params.get('deal_status')
+        if deal_status_filter:
+            projects = projects.filter(deal_status=deal_status_filter)
+
+        return Response([_serialize_project_summary(p) for p in projects])
+
+
+class PropertyProjectDetailView(APIView):
+    """
+    A single deal's full detail for the pipeline side-drawer — latest
+    metrics, every past analysis run (each one individually downloadable
+    when it has persisted rent_roll_data), and its Team Notes. PATCH
+    updates deal_status only — notes have their own endpoint below.
+    URL: GET/PATCH /api/ai/pipeline/projects/<int:project_id>/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def _get_visible_project_or_404(self, request, project_id):
+        from .permissions import visible_projects_for
+        project = visible_projects_for(request.user).select_related(
+            'organization', 'workspace', 'created_by'
+        ).filter(pk=project_id).first()
+        if project is None:
+            return None, Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return project, None
+
+    def get(self, request, project_id):
+        project, error = self._get_visible_project_or_404(request, project_id)
+        if error:
+            return error
+
+        analyses = list(project.analyses.select_related('uploaded_by').order_by('-created_at'))
+        latest = analyses[0] if analyses else None
+        notes = project.notes.select_related('author').order_by('-created_at')
+
+        return Response({
+            **_serialize_project_summary(project),
+            'latest_metrics': latest.metrics if latest else None,
+            'analyses': [
+                {
+                    'id': a.id,
+                    'created_at': a.created_at.isoformat(),
+                    'uploaded_by': a.uploaded_by.email if a.uploaded_by else None,
+                    'tier': a.tier,
+                    'can_download': bool(a.rent_roll_data),
+                }
+                for a in analyses
+            ],
+            'notes': [
+                {
+                    'id': n.id,
+                    'body': n.body,
+                    'author': n.author.email if n.author else None,
+                    'created_at': n.created_at.isoformat(),
+                }
+                for n in notes
+            ],
+        })
+
+    def patch(self, request, project_id):
+        from .permissions import can_manage_project
+        from .models import PropertyProject
+
+        project, error = self._get_visible_project_or_404(request, project_id)
+        if error:
+            return error
+        if not can_manage_project(request.user, project):
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        new_status = request.data.get('deal_status')
+        valid_statuses = dict(PropertyProject.STATUS_CHOICES)
+        if new_status not in valid_statuses:
+            return Response(
+                {'detail': f"'deal_status' must be one of: {', '.join(valid_statuses)}."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        project.deal_status = new_status
+        project.save(update_fields=['deal_status', 'updated_at'])
+
+        return Response(_serialize_project_summary(project))
+
+
+class TeamNoteListCreateView(APIView):
+    """
+    Team Notes on a deal — a flat, unthreaded running log (see TeamNote's
+    own docstring for why; v1 scope, same reasoning as IssueReport). GET/POST
+    both require the same visibility as the project itself — anyone who can
+    see a deal can read and add to its notes.
+    URL: GET/POST /api/ai/pipeline/projects/<int:project_id>/notes/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def _get_visible_project_or_404(self, request, project_id):
+        from .permissions import visible_projects_for
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return None, Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return project, None
+
+    def get(self, request, project_id):
+        project, error = self._get_visible_project_or_404(request, project_id)
+        if error:
+            return error
+
+        notes = project.notes.select_related('author').order_by('-created_at')
+        return Response([
+            {
+                'id': n.id,
+                'body': n.body,
+                'author': n.author.email if n.author else None,
+                'created_at': n.created_at.isoformat(),
+            }
+            for n in notes
+        ])
+
+    def post(self, request, project_id):
+        from .models import TeamNote
+
+        project, error = self._get_visible_project_or_404(request, project_id)
+        if error:
+            return error
+
+        body = (request.data.get('body') or '').strip()
+        if not body:
+            return Response({'detail': 'Note text is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        note = TeamNote.objects.create(project=project, author=request.user, body=body)
+
+        return Response({
+            'id': note.id,
+            'body': note.body,
+            'author': note.author.email if note.author else None,
+            'created_at': note.created_at.isoformat(),
+        }, status=status.HTTP_201_CREATED)
+
+
+class PropertyProjectDownloadView(APIView):
+    """
+    Regenerates an Excel workbook for a PropertyProject's LATEST analysis,
+    from its persisted rent_roll_data/metrics — without needing the
+    original source files again (which are never stored — see
+    ProcessedDocument's docstring). Reuses the exact same template-choice/
+    currency/debt-assumption branching as UnderwritePropertyDownloadView
+    via _build_underwriting_excel_response, so the two paths can never
+    drift from each other.
+
+    Debt assumptions are re-prompted for here (parsed fresh from this
+    request), never persisted on the analysis itself — see
+    AnalysisReport.rent_roll_data's own docstring for why: they're scenario
+    inputs the user may want to vary between downloads, not a fixed
+    property of the analysis.
+    URL: POST /api/ai/pipeline/projects/<int:project_id>/download/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, project_id):
+        from .permissions import visible_projects_for
+
+        project = visible_projects_for(request.user).select_related('organization').filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        analysis = project.analyses.order_by('-created_at').first()
+        if analysis is None:
+            return Response({'detail': 'This deal has no analysis yet.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if not analysis.rent_roll_data:
+            return Response(
+                {'detail': 'Detailed download unavailable for legacy analyses processed prior to system upgrade.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        debt_assumptions, debt_error = _parse_debt_assumptions(request)
+        if debt_error:
+            return debt_error
+
+        currency_code, currency_error = _parse_currency_code(request)
+        if currency_error:
+            return currency_error
+
+        rent_roll_df = pd.DataFrame((analysis.rent_roll_data or {}).get('rows', []))
+
+        return _build_underwriting_excel_response(
+            request, project.organization, analysis.metrics, rent_roll_df, debt_assumptions, currency_code,
+            analysis=analysis,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Feature 4 (Cell Override Audit Log): "Re-upload Edited Underwriting File".
+# Catches an analyst editing a figure locally in Excel AFTER downloading our
+# generated workbook, before it goes any further (a lender, an IC memo).
+# ---------------------------------------------------------------------------
+
+def _normalize_value_for_compare(value):
+    """
+    Normalizes ONE value — either a value already stored in
+    AnalysisReport.injected_values_snapshot (a plain JSON scalar) or a
+    value just read back from a re-uploaded workbook's cell (which
+    openpyxl may hand back as a datetime for a date-formatted cell, or a
+    raw float/int/str) — into a single consistent string, for BOTH the
+    change-detection comparison and the display value stored on
+    ExcelOverrideDelta. Mirrors clean_cell_value's own date formatting
+    (excel_generator.py) so a date stored as an ISO string and the SAME
+    date read back from a live cell compare equal rather than false-positive
+    as "changed" over formatting alone.
+    """
+    if value is None or value == "":
+        return ""
+    if isinstance(value, (pd.Timestamp, datetime.datetime)):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, float):
+        # Collapses float noise (5.0 vs 5.000000000001) without losing a
+        # genuine change — 6dp is far finer than any figure here is ever
+        # meaningfully precise to.
+        return f"{round(value, 6):g}"
+    return str(value).strip()
+
+
+def _serialize_override_upload(upload):
+    return {
+        'id': upload.id,
+        'uploaded_at': upload.uploaded_at.isoformat(),
+        'uploaded_by': upload.uploaded_by.email if upload.uploaded_by else None,
+        'original_filename': upload.original_filename,
+        'deltas': [
+            {
+                'field_name': d.field_name,
+                'row_index': d.row_index,
+                'original_value': d.original_value,
+                'new_value': d.new_value,
+            }
+            for d in upload.deltas.all()
+        ],
+    }
+
+
+class ExcelOverrideCheckView(APIView):
+    """
+    Parses the re-uploaded file's named ranges with the EXACT SAME
+    extract_defined_names() the custom-template path already uses (it has
+    no idea — and doesn't need to know — whether this file came from the
+    custom-template path or the standard generator's own "Source Values
+    (IU)" sheet/Argus tab, see excel_generator.py), reads each tracked
+    field's CURRENT value, and diffs it against
+    analysis.injected_values_snapshot — the values this system itself
+    wrote the last time an Excel was actually generated for this deal.
+    Every detected change is persisted as one ExcelOverrideUpload (the
+    event) with one ExcelOverrideDelta per CHANGED field only — see that
+    model's own docstring for why an unchanged field produces no row.
+
+    Row fields are matched by POSITION ONLY, against exactly as many
+    tenant rows as existed when the snapshot was captured — confirmed
+    acceptable for v1 (position-based matching is standard practice in
+    multifamily underwriting anyway; see ExcelOverrideDelta's docstring).
+    A field whose named range can no longer be found at all in the
+    re-upload (e.g. this platform's reference sheet/named ranges were
+    deleted) is silently skipped, not reported as a change — there's
+    nothing to compare it against.
+
+    Requires only the same visibility as the project itself (like Team
+    Notes below) — not can_manage_project — since re-uploading for a check
+    is an audit action on the deal, not a change to deal_status itself.
+    URL: POST /api/ai/pipeline/projects/<int:project_id>/override-check/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, project_id):
+        from django.db import transaction
+        from .permissions import visible_projects_for
+        from .models import ExcelOverrideUpload, ExcelOverrideDelta
+
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        analysis = project.analyses.order_by('-created_at').first()
+        if analysis is None:
+            return Response({'detail': 'This deal has no analysis yet.'}, status=status.HTTP_404_NOT_FOUND)
+
+        snapshot = analysis.injected_values_snapshot
+        if not snapshot:
+            return Response(
+                {'detail': (
+                    "Override tracking isn't available yet for this deal — "
+                    "download the Excel from this project at least once, "
+                    "then re-uploading an edited copy will work."
+                )},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        uploaded_file = request.FILES.get('file')
+        if not uploaded_file:
+            return Response({'detail': 'Please upload the edited Excel file.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            validate_uploaded_file(uploaded_file, {'.xlsx', '.xlsm'}, label="Edited Underwriting File")
+        except FileValidationError as e:
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            workbook = openpyxl.load_workbook(io.BytesIO(uploaded_file.read()), data_only=False)
+        except Exception as e:
+            return Response(
+                {'detail': f"Couldn't open this file as an Excel workbook: {e}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        resolved_names, _skipped = extract_defined_names(workbook)
+        if not resolved_names:
+            return Response(
+                {'detail': (
+                    "No tracked fields were found in this file — this "
+                    "doesn't look like a workbook generated by this platform."
+                )},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        deltas = []
+
+        # Scalars — one value each, direct compare.
+        for name, original_value in (snapshot.get('scalars') or {}).items():
+            if name not in resolved_names:
+                continue  # named range no longer present — nothing to compare
+            sheet_name, row, col = resolved_names[name]
+            current_value = workbook[sheet_name].cell(row=row, column=col).value
+            original_str = _normalize_value_for_compare(original_value)
+            current_str = _normalize_value_for_compare(current_value)
+            if original_str != current_str:
+                deltas.append({
+                    'field_name': name, 'row_index': None,
+                    'original_value': original_str, 'new_value': current_str,
+                })
+
+        # Rows — same anchor cell as a scalar, one row further down per
+        # tenant position (the same "first data cell, write downward"
+        # convention used everywhere these are written).
+        snapshot_rows = snapshot.get('rows') or []
+        if snapshot_rows:
+            row_field_names = [n for n in snapshot_rows[0].keys() if n in resolved_names]
+            for i, original_row in enumerate(snapshot_rows):
+                for name in row_field_names:
+                    sheet_name, anchor_row, col = resolved_names[name]
+                    current_value = workbook[sheet_name].cell(row=anchor_row + i, column=col).value
+                    original_str = _normalize_value_for_compare(original_row.get(name))
+                    current_str = _normalize_value_for_compare(current_value)
+                    if original_str != current_str:
+                        deltas.append({
+                            'field_name': name, 'row_index': i,
+                            'original_value': original_str, 'new_value': current_str,
+                        })
+
+        with transaction.atomic():
+            upload = ExcelOverrideUpload.objects.create(
+                project=project,
+                analysis=analysis,
+                uploaded_by=request.user,
+                original_filename=getattr(uploaded_file, 'name', '') or '',
+            )
+            ExcelOverrideDelta.objects.bulk_create([
+                ExcelOverrideDelta(
+                    upload=upload,
+                    field_name=d['field_name'],
+                    row_index=d['row_index'],
+                    original_value=d['original_value'],
+                    new_value=d['new_value'],
+                )
+                for d in deltas
+            ])
+
+        return Response({'upload': _serialize_override_upload(upload)}, status=status.HTTP_201_CREATED)
+
+
+class ExcelOverrideHistoryView(APIView):
+    """
+    Every past "Re-upload Edited Underwriting File" event on this deal,
+    newest first — powers the pipeline drawer's "Override Summary" panel.
+    URL: GET /api/ai/pipeline/projects/<int:project_id>/overrides/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, project_id):
+        from .permissions import visible_projects_for
+        from .models import ExcelOverrideUpload
+
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        uploads = ExcelOverrideUpload.objects.filter(project=project).select_related(
+            'uploaded_by'
+        ).prefetch_related('deltas').order_by('-uploaded_at')
+
+        return Response({'uploads': [_serialize_override_upload(u) for u in uploads]})

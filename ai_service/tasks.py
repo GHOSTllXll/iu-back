@@ -63,12 +63,20 @@ def _load_user_and_org(uploaded_by_id):
 
 @shared_task(bind=True, name='ai_service.run_cre_underwriting_task')
 def run_cre_underwriting_task(self, om_path, om_name, t12_path, t12_name,
-                                rent_roll_path, rent_roll_name, tier, uploaded_by_id):
+                                rent_roll_path, rent_roll_name, tier, uploaded_by_id,
+                                project_id=None):
     """
     Background counterpart to the CRE/Multifamily pipeline. Imports
     process_underwriting_files from views.py INSIDE the function body
     (not at module top) to avoid a circular import, since views.py imports
     this module at its own top level to enqueue these tasks.
+
+    project_id (Feature 3): forwarded as-is from UnderwritePropertyView —
+    see process_underwriting_files'/record_analysis_report's own docstrings
+    for exactly how it's resolved. Defaults to None (keyword, with a default)
+    rather than a required positional, so any task already enqueued before
+    this parameter existed — e.g. still sitting in the broker across a
+    deploy — keeps deserializing and running correctly.
     """
     from .views import process_underwriting_files
 
@@ -83,6 +91,7 @@ def run_cre_underwriting_task(self, om_path, om_name, t12_path, t12_name,
             metrics, rent_roll_df, error = process_underwriting_files(
                 om_file, t12_file, rent_roll_file, tier=tier,
                 organization=organization, uploaded_by=uploaded_by,
+                project_id=project_id,
             )
 
         if error:

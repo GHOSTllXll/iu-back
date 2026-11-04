@@ -8,8 +8,10 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.comments import Comment
 from openpyxl.utils import get_column_letter
+from openpyxl.workbook.defined_name import DefinedName
 
 from .rent_roll_utils import detect_rent_roll_columns, ensure_status_column, RentRollColumnError, detect_argus_fields
+from .variance_analysis import LINE_ITEM_ANOMALY_WINDOW_MONTHS, LINE_ITEM_ANOMALY_THRESHOLD_PCT
 
 
 class ExcelGenerationError(Exception):
@@ -1039,6 +1041,85 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
                 next_free_row = dip_row
 
     # ==========================================
+    # Generalized monthly line-item anomaly flagging — independent of
+    # Module 7 above (which only ever looks at revenue, month-over-month
+    # against the single prior month). This flags ANY line item whose
+    # value for a given month deviates from its own trailing N-month
+    # average beyond a threshold, in EITHER direction (spike or drop) —
+    # see variance_analysis.detect_line_item_anomalies() for the full math.
+    #
+    # Written as its OWN tab, not a Dashboard section like Module 7, because
+    # this needs a real monthly grid (one column per month) to show each
+    # flagged cell in context against its neighbors — there's no monthly
+    # grid anywhere else in this workbook (the 'Cleaned T12' tab above is
+    # annual-only; see T12_LINE_ITEMS' docstring). Uses the source
+    # document's own row labels verbatim, NOT this workbook's normalized
+    # 14-category T12_LINE_ITEMS list — mapping arbitrary monthly rows onto
+    # those categories reliably needs real categorization logic, which this
+    # deliberately does not attempt (see conversation history).
+    # ==========================================
+    line_item_anomalies = metrics.get("line_item_anomalies")
+    if line_item_anomalies is not None:
+        ws_variance = wb.create_sheet("Monthly Variance")
+        ws_variance.cell(row=1, column=1, value="MONTHLY VARIANCE — LINE ITEM ANOMALIES").font = Font(bold=True, size=14)
+        ws_variance.cell(
+            row=2, column=1,
+            value=(
+                f"Flags any line item whose month deviates from its own trailing "
+                f"{LINE_ITEM_ANOMALY_WINDOW_MONTHS}-month average by more than "
+                f"{int(LINE_ITEM_ANOMALY_THRESHOLD_PCT * 100)}%, in either direction. "
+                f"Line items are shown exactly as labeled on the source T12 — "
+                f"not normalized to this workbook's standard categories."
+            )
+        ).font = Font(italic=True, color="FF888888")
+
+        if line_item_anomalies.get("skipped"):
+            ws_variance.cell(row=4, column=1, value=line_item_anomalies["reason"]).font = Font(italic=True, color="FF888888")
+        else:
+            monthly_cols = line_item_anomalies.get("monthly_cols", [])
+            anomaly_rows = line_item_anomalies.get("rows", [])
+
+            if not anomaly_rows:
+                ws_variance.cell(
+                    row=4, column=1,
+                    value=(
+                        f"No line items deviated from their trailing {LINE_ITEM_ANOMALY_WINDOW_MONTHS}-month "
+                        f"average by more than {int(LINE_ITEM_ANOMALY_THRESHOLD_PCT * 100)}%."
+                    )
+                ).font = Font(italic=True, color="FF888888")
+            else:
+                header_row = 4
+                ws_variance.cell(row=header_row, column=1, value="Line Item (as labeled on source T12)").font = Font(bold=True)
+                for col_idx, month in enumerate(monthly_cols, start=2):
+                    ws_variance.cell(row=header_row, column=col_idx, value=month).font = Font(bold=True)
+
+                # Yellow for a spike, the same light-red Module 7 already uses
+                # for a drop — same visual vocabulary as the rest of the
+                # workbook, not a new color scheme invented just for this tab.
+                spike_fill = PatternFill(start_color="FFFFF3CD", end_color="FFFFF3CD", fill_type="solid")
+                drop_fill = PatternFill(start_color="FFF8D7DA", end_color="FFF8D7DA", fill_type="solid")
+
+                data_row = header_row + 1
+                for row_entry in anomaly_rows:
+                    ws_variance.cell(row=data_row, column=1, value=row_entry["label"])
+
+                    for col_idx, month in enumerate(monthly_cols, start=2):
+                        val = row_entry["values"].get(month)
+                        cell = ws_variance.cell(row=data_row, column=col_idx, value=val)
+                        cell.number_format = '#,##0'
+
+                        anomaly = row_entry["anomalies"].get(month)
+                        if anomaly:
+                            cell.fill = spike_fill if anomaly["direction"] == "spike" else drop_fill
+                            cell.comment = Comment(anomaly["detail"], "Variance Analysis Engine")
+
+                    data_row += 1
+
+                ws_variance.column_dimensions["A"].width = 34
+                for col_idx in range(2, 2 + len(monthly_cols)):
+                    ws_variance.column_dimensions[get_column_letter(col_idx)].width = 13
+
+    # ==========================================
     # TAB: INDUSTRIAL ANALYSIS (Industrial & Logistics assets only)
     # Purely additive: only created when the AI extraction actually returned
     # industrial-specific data (rentable_square_footage / annual_base_rent /
@@ -1305,6 +1386,80 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
 
         ws_ret.column_dimensions['A'].width = 34
         ws_ret.column_dimensions['B'].width = 22
+
+    # ==========================================
+    # FEATURE 4 (Cell Override Audit Log): Named Ranges
+    #
+    # Deferred import, not a module-level one: custom_template_generator.py
+    # already imports safe_get/clean_cell_value FROM this module, so a
+    # module-level import back from THIS module into that one would make
+    # the two load-order-dependent on each other (a genuine circular
+    # import). By the time this function is actually CALLED, both modules
+    # have already finished loading in full, so a local import here is
+    # completely safe and carries no such risk.
+    #
+    # Scoped STRICTLY to the same 16 scalar + 13 row fields the
+    # custom-template path already tracks (SCALAR_FIELD_CATALOG /
+    # ROW_FIELD_CATALOG) — not the rest of this workbook's many sheets,
+    # most of which are live FORMULAS or derived outputs (DSCR, NER,
+    # Cash-on-Cash) where "override tracking" wouldn't mean anything; only
+    # genuine input assumptions get a name here.
+    #
+    # Scalars get a brand-new, dedicated static-value sheet rather than
+    # piggybacking on Dashboard Summary's existing cells: several of those
+    # (Total Unit Count, Physical Occupancy %, etc.) are live cross-sheet
+    # FORMULAS, and a formula cell's .value (read with data_only=False, the
+    # only reliable way to read a file that was never re-opened in real
+    # Excel) is the formula TEXT, not its calculated result — unusable for
+    # a plain value diff. A separate sheet of literal values sidesteps that
+    # entirely, with zero risk to this report's existing look.
+    #
+    # Row fields need no new writes at all: the Argus Rent Roll Export
+    # tab's own per-tenant columns already match ROW_FIELD_CATALOG 1:1 (same
+    # column order: tenant, suite, space_type, sf, lease_start, lease_end,
+    # base_rent, [literal "Monthly"], annual_rent, concessions, escalation,
+    # recovery, base_year, mla_profile, occupancy_status) — those just get a
+    # defined name pointing at their EXISTING first-data-row cell.
+    # ==========================================
+    from .custom_template_generator import SCALAR_FIELD_CATALOG, ROW_FIELD_CATALOG
+
+    ws_src = wb.create_sheet("Source Values (IU)")
+    ws_src.cell(row=1, column=1, value="FIELD").font = Font(bold=True)
+    ws_src.cell(row=1, column=2, value="VALUE").font = Font(bold=True)
+    ws_src.cell(row=2, column=1, value=(
+        "Reference values for this platform's Cell Override tracker — not "
+        "part of the underwriting report itself. Safe to ignore. Please "
+        "don't delete this sheet if you want override tracking to keep "
+        "working if you re-upload this file after editing it."
+    )).font = Font(italic=True, size=9, color="FF888888")
+    ws_src.column_dimensions['A'].width = 30
+    ws_src.column_dimensions['B'].width = 40
+
+    for i, (name, resolver) in enumerate(SCALAR_FIELD_CATALOG.items()):
+        src_row = 4 + i
+        value = resolver(metrics, debt_assumptions)
+        ws_src.cell(row=src_row, column=1, value=name)
+        ws_src.cell(row=src_row, column=2, value=value if value not in (None, "") else "")
+        wb.defined_names[name] = DefinedName(name, attr_text=f"'Source Values (IU)'!$B${src_row}")
+
+    ARGUS_ROW_FIELD_COLUMNS = {
+        'IU_Row_TenantName': 1, 'IU_Row_SuiteID': 2, 'IU_Row_SpaceType': 3,
+        'IU_Row_SF': 4, 'IU_Row_LeaseStart': 5, 'IU_Row_LeaseEnd': 6,
+        'IU_Row_BaseRent': 7, 'IU_Row_AnnualRent': 9, 'IU_Row_Concessions': 10,
+        'IU_Row_Escalation': 11, 'IU_Row_RecoveryStructure': 12,
+        'IU_Row_BaseYear': 13, 'IU_Row_MLAProfile': 14,
+        'IU_Row_OccupancyStatus': 15,
+    }
+    assert set(ARGUS_ROW_FIELD_COLUMNS) == set(ROW_FIELD_CATALOG), (
+        "ARGUS_ROW_FIELD_COLUMNS has drifted out of sync with "
+        "ROW_FIELD_CATALOG — update this map if a row field was "
+        "added, renamed, or removed."
+    )
+    for name, col in ARGUS_ROW_FIELD_COLUMNS.items():
+        wb.defined_names[name] = DefinedName(
+            name,
+            attr_text=f"'Argus Rent Roll Export'!${get_column_letter(col)}${ARGUS_DATA_START_ROW}",
+        )
 
     output = io.BytesIO()
     wb.save(output)

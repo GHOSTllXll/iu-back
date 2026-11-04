@@ -91,7 +91,8 @@ def record_processed_ppm_document(organization, uploaded_by, ppm_file, status: s
 
 
 def record_analysis_report(organization, uploaded_by, metrics: dict, tier: str,
-                            processing_seconds: float = None, document_type: str = 'CRE'):
+                            processing_seconds: float = None, document_type: str = 'CRE',
+                            project_id=None, rent_roll_data=None, t12_monthly_data=None):
     """
     Saves a completed analysis result for later review on the Outputs page.
     Also the source of truth for upload-quota counting (see views.py) — one
@@ -102,8 +103,39 @@ def record_analysis_report(organization, uploaded_by, metrics: dict, tier: str,
 
     document_type defaults to 'CRE' so every existing call site (the
     OM/T12/Rent Roll pipeline) keeps working unchanged without passing it.
+
+    Feature 3 (Enterprise Pipeline & Workflow Dashboard): AnalysisReport.project
+    is a REQUIRED field (see models.py / migration 0009) — every row created
+    from here on must have one, so this function resolves one unconditionally:
+
+    - project_id, when given, links this run to an EXISTING PropertyProject —
+      the "Re-upload & Re-analyze Files" flow, clicked from inside a specific
+      project's view. It's looked up scoped to THIS organization, same
+      reasoning as the workspace/organization match enforced elsewhere — a
+      project_id ultimately comes from client input and must never be
+      trusted to belong to the caller's own org just because it was sent.
+      An id that doesn't resolve (wrong org, deleted, or simply made up)
+      falls through to creating a new project below exactly as if none had
+      been given, rather than erroring the whole analysis out over it.
+    - Otherwise (the default — e.g. a fresh upload from the main dashboard,
+      or any PPM analysis, which has no pipeline UI of its own) a brand-new
+      single-analysis PropertyProject is created automatically, per the
+      approved UX: uploads from the main dashboard always start a new deal.
+
+    A newly-created project inherits uploaded_by's workspace (None if they
+    don't have one yet) — without this, a member's own new deal would be
+    invisible to their own teammates in the same workspace, defeating the
+    point of workspaces. An EXISTING project (project_id path) keeps
+    whatever workspace it already has; re-analyzing a deal never moves it.
+
+    rent_roll_data/t12_monthly_data are the raw, JSON-serializable inputs
+    this run's Excel output was built from — see AnalysisReport's own field
+    docstrings for exactly what each holds. Optional (None when not
+    applicable/available — e.g. PPM analyses, or a T12 format Module 7 can't
+    parse monthly columns from); a row missing one simply can't support
+    historical regeneration of that part later.
     """
-    from .models import AnalysisReport
+    from .models import AnalysisReport, PropertyProject
 
     if organization is None:
         return
@@ -116,13 +148,28 @@ def record_analysis_report(organization, uploaded_by, metrics: dict, tier: str,
     else:
         property_name = (metrics.get('property_metadata') or {}).get('property_name') or ''
 
+    project = None
+    if project_id is not None:
+        project = PropertyProject.objects.filter(pk=project_id, organization=organization).first()
+
+    if project is None:
+        project = PropertyProject.objects.create(
+            organization=organization,
+            workspace=getattr(uploaded_by, 'workspace', None),
+            property_name=property_name,
+            created_by=uploaded_by,
+        )
+
     AnalysisReport.objects.create(
         organization=organization,
         uploaded_by=uploaded_by,
+        project=project,
         property_name=property_name,
         tier=tier,
         document_type=document_type,
         metrics=metrics,
         processing_seconds=processing_seconds,
         status='ready',
+        rent_roll_data=rent_roll_data,
+        t12_monthly_data=t12_monthly_data,
     )

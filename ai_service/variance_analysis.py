@@ -292,3 +292,149 @@ def run_variance_analysis(t12_df: pd.DataFrame, rent_roll_df: pd.DataFrame, unit
         "delinquent_units": delinquent_units,
         "delinquency_column_found": delinquency_col is not None,
     }
+
+
+# ==========================================
+# Generalized line-item anomaly flagging — independent of everything above.
+# run_variance_analysis()/Module 7 only ever looks at ONE row (revenue),
+# only ever checks for a DROP, only ever compares against the single PRIOR
+# month, and cross-references the Rent Roll to explain WHY. This instead
+# flags ANY row in the raw monthly T12 data, in EITHER direction (spike or
+# drop), against its own TRAILING multi-month average, and never attempts
+# to explain why — it's a QA flag, not a forensic finding.
+#
+# Deliberately uses the source document's own row labels verbatim, NOT this
+# platform's normalized 14-category T12_LINE_ITEMS list (see
+# excel_generator.py) — that list is for ANNUAL totals only (the AI
+# extraction schema doesn't produce a monthly breakdown mapped to those
+# categories; monthly data only exists here, read directly off the raw
+# source document, the same way Module 7 above already does). Mapping
+# arbitrary monthly rows onto a fixed category list reliably needs real
+# categorization logic, which this intentionally does not attempt.
+# ==========================================
+LINE_ITEM_ANOMALY_WINDOW_MONTHS = 5   # trailing months averaged for comparison
+LINE_ITEM_ANOMALY_THRESHOLD_PCT = 0.30  # +/- deviation from that average that triggers a flag
+
+
+def detect_line_item_anomalies(t12_df: pd.DataFrame, monthly_cols: list, label_col):
+    """
+    For every row (line item) in t12_df, and every month from the
+    (window+1)th onward, compares that month's value against the TRAILING
+    LINE_ITEM_ANOMALY_WINDOW_MONTHS-month average of the months immediately
+    before it (never including the month itself, never "centered" — this
+    only ever looks backward, same convention as compute_monthly_deltas
+    above). Flags it when the deviation exceeds
+    LINE_ITEM_ANOMALY_THRESHOLD_PCT in EITHER direction.
+
+    Returns a list of row-level dicts, one per line item with at least one
+    flagged month (a row with zero flagged months is omitted entirely —
+    nothing downstream needs a "this row was checked and is fine" entry):
+        {
+            "label": "...",
+            "values": {month_col: value_or_None, ...},   # the FULL monthly
+                # series for this row, in monthly_cols order — kept even for
+                # non-flagged months so the output can show real surrounding
+                # context next to the flagged cell, not just that cell alone.
+            "anomalies": {
+                month_col: {
+                    "direction": "spike" | "drop",
+                    "pct_change": ...,      # signed, already *100 (percent)
+                    "trailing_avg": ...,
+                    "flag": "...",          # short label for the cell
+                    "detail": "...",        # longer text for a cell Comment
+                },
+                ...
+            },
+        }
+
+    Skips a (row, month) comparison entirely (no flag, no error) rather than
+    guessing when: there isn't a full trailing window of real numbers behind
+    it (missing/non-numeric source cell), or the trailing average is exactly
+    zero (can't compute a meaningful % deviation off nothing) — same "never
+    fabricate" discipline as the rest of this module.
+    """
+    rows = []
+    if len(monthly_cols) <= LINE_ITEM_ANOMALY_WINDOW_MONTHS:
+        # Not enough trailing history for even one comparison, anywhere.
+        return rows
+
+    for _, row in t12_df.iterrows():
+        label = str(row.get(label_col, '')).strip()
+        if not label:
+            continue
+
+        values = []
+        for col in monthly_cols:
+            try:
+                values.append(float(row[col]))
+            except (ValueError, TypeError):
+                values.append(None)
+
+        row_anomalies = {}
+        for i in range(LINE_ITEM_ANOMALY_WINDOW_MONTHS, len(monthly_cols)):
+            window_vals = values[i - LINE_ITEM_ANOMALY_WINDOW_MONTHS:i]
+            curr_val = values[i]
+            if curr_val is None or any(v is None for v in window_vals):
+                continue
+
+            trailing_avg = sum(window_vals) / len(window_vals)
+            if trailing_avg == 0:
+                continue
+
+            pct_change = (curr_val - trailing_avg) / abs(trailing_avg)
+            if abs(pct_change) < LINE_ITEM_ANOMALY_THRESHOLD_PCT:
+                continue
+
+            direction = "spike" if pct_change > 0 else "drop"
+            month = monthly_cols[i]
+            row_anomalies[month] = {
+                "direction": direction,
+                "pct_change": round(pct_change * 100, 1),
+                "trailing_avg": round(trailing_avg, 2),
+                "flag": f"{direction.capitalize()} vs. {LINE_ITEM_ANOMALY_WINDOW_MONTHS}-Mo. Avg",
+                "detail": (
+                    f"System Flag: {label} {'spiked' if direction == 'spike' else 'dropped'} "
+                    f"{abs(pct_change) * 100:.1f}% in {month} compared to its trailing "
+                    f"{LINE_ITEM_ANOMALY_WINDOW_MONTHS}-month average (${trailing_avg:,.2f})."
+                ),
+            }
+
+        if row_anomalies:
+            rows.append({
+                "label": label,
+                "values": {col: (round(v, 2) if v is not None else None) for col, v in zip(monthly_cols, values)},
+                "anomalies": row_anomalies,
+            })
+
+    return rows
+
+
+def run_line_item_anomaly_scan(t12_df: pd.DataFrame):
+    """
+    Entry point mirroring run_variance_analysis()'s shape/conventions, for
+    the generalized (any-line-item) scan that feeds the output workbook's
+    separate 'Monthly Variance' tab (see excel_generator.py). Fully
+    independent of run_variance_analysis()/Module 7 above — never crashes
+    the caller; "nothing flagged" and "couldn't run" are both valid,
+    expected outcomes, same as that function.
+
+    Returns:
+        {"skipped": True, "reason": "..."} — if the T12 lacks monthly data
+        {"skipped": False, "monthly_cols": [...], "rows": [...]} — see
+        detect_line_item_anomalies() above for the shape of "rows".
+    """
+    monthly_cols = detect_monthly_t12_columns(t12_df)
+    if not monthly_cols:
+        return {
+            "skipped": True,
+            "reason": "Monthly Variance Skipped: Source Document Lacks Monthly Granularity.",
+        }
+
+    label_col = t12_df.columns[0]
+    rows = detect_line_item_anomalies(t12_df, monthly_cols, label_col)
+
+    return {
+        "skipped": False,
+        "monthly_cols": [str(c) for c in monthly_cols],
+        "rows": rows,
+    }

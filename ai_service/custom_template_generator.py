@@ -308,6 +308,74 @@ def _build_row_contexts(rent_roll_df):
 
 
 # ==========================================
+# SNAPSHOT COMPUTATION (Feature 4: Cell Override Audit Log)
+# ==========================================
+def _json_safe_scalar(value):
+    """
+    Defensive final pass before a value goes into a JSONField. In practice
+    every SCALAR_FIELD_CATALOG/ROW_FIELD_CATALOG value already arrived as a
+    plain JSON-safe type (metrics came from a JSONField; debt_assumptions
+    came from a parsed request body) — this exists so a stray numpy/
+    Timestamp type slipping through some future metrics-schema change fails
+    safe (gets normalized) rather than silently breaking the snapshot save.
+    Mirrors clean_cell_value's own normalization in excel_generator.py.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (pd.Timestamp, datetime.datetime)):
+        return value.strftime("%Y-%m-%d")
+    if hasattr(value, 'item'):  # numpy scalar types (np.integer/np.floating/np.bool_)
+        return value.item()
+    return value
+
+
+def compute_injected_values_snapshot(metrics, debt_assumptions, rent_roll_df):
+    """
+    Computes exactly the same {name: value} mapping _write_scalars/
+    _write_rows below would write into a client's named cells — reused as
+    the literal source of truth rather than re-derived separately, so the
+    audit log's "what should be here" and the generator's "what we actually
+    wrote" can never drift into two independently-maintained copies of the
+    same logic.
+
+    Called once per ACTUAL Excel generation (custom-template or standard —
+    see excel_generator.py's own use of this same function), not once per
+    analysis — see AnalysisReport.injected_values_snapshot's docstring for
+    why: debt_assumptions (3 of the 16 scalar fields) aren't known until
+    download time and can vary between repeat downloads of one analysis.
+
+    Returns a JSON-safe {"scalars": {name: value, ...}, "rows": [{name:
+    value, ...}, one dict per tenant]} ready to store directly on
+    AnalysisReport.injected_values_snapshot. A rent roll this build can't
+    read (RentRollColumnError, surfaced here as TemplateValidationError)
+    simply produces no row-level snapshot rather than a guessed one — the
+    scalar snapshot is still saved regardless, since it's independent.
+    """
+    scalars = {
+        name: _json_safe_scalar(resolver(metrics, debt_assumptions))
+        for name, resolver in SCALAR_FIELD_CATALOG.items()
+    }
+
+    rows = []
+    if rent_roll_df is not None and len(rent_roll_df) > 0:
+        try:
+            contexts = _build_row_contexts(rent_roll_df)
+        except TemplateValidationError:
+            contexts = []
+
+        for ctx in contexts:
+            row = {}
+            for name, (lookup_key, is_date) in ROW_FIELD_CATALOG.items():
+                value = ctx.get(lookup_key)
+                if is_date and isinstance(value, datetime.datetime):
+                    value = value.strftime("%Y-%m-%d")
+                row[name] = _json_safe_scalar(value)
+            rows.append(row)
+
+    return {"scalars": scalars, "rows": rows}
+
+
+# ==========================================
 # WRITING
 # ==========================================
 def _write_scalars(workbook, resolved_names, metrics, debt_assumptions):

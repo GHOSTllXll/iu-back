@@ -12,8 +12,11 @@ from django.utils import timezone
 from datetime import timedelta
 
 from .utils import log_activity
-from .models import CustomUser, Organization, ActivityLog, SystemMessage, IssueReport
-from .serializers import LoginSerializer, UserSerializer, AdminCreateUserSerializer, OrganizationSerializer, ActivityLogSerializer
+from .models import CustomUser, Organization, ActivityLog, SystemMessage, IssueReport, TeamWorkspace
+from .serializers import (
+    LoginSerializer, UserSerializer, AdminCreateUserSerializer, OrganizationSerializer,
+    ActivityLogSerializer, AssignUserWorkspaceSerializer,
+)
 
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
 from django.utils.encoding import force_bytes, force_str
@@ -29,7 +32,7 @@ import io
 import openpyxl
 from django.core.files.base import ContentFile
 
-from ai_service.models import ClientExcelTemplate
+from ai_service.models import ClientExcelTemplate, PropertyProject, AnalysisReport
 from ai_service.custom_template_generator import (
     validate_template,
     TemplateValidationError,
@@ -1036,3 +1039,566 @@ class AdminDeleteExcelTemplateView(APIView):
         template.delete()
 
         return Response({'detail': f"Custom template removed for {org.name}."}, status=status.HTTP_204_NO_CONTENT)
+
+
+class MyOrganizationExcelTemplateView(APIView):
+    """
+    Self-serve counterpart to the three Admin*ExcelTemplate views above,
+    scoped to the CALLING USER's own organization — no org_id in the URL
+    at all, so there is no way for one org's admin to ever reach another
+    org's template by guessing/passing a different id. This is the first
+    endpoint in the codebase that grants an org's OWN admin (role='admin'
+    on CustomUser) write access to something, as distinct from
+    request.user.is_admin, which is the hardcoded platform-superuser flag
+    (see CustomUser.save()) used by every Admin* view above — those are
+    unchanged and remain for platform support/ops use.
+
+    GET is intentionally open to ANY authenticated member of the org, not
+    just its admin: a regular team member needs to know whether a custom
+    template exists (and whether it's active) to make sense of the
+    "System Standard vs. Custom Template" choice in the upload flow. Only
+    POST (upload/replace) and DELETE require the org's own admin role —
+    installing or removing the org's proprietary template is treated the
+    same way as any other organization-level setting.
+
+    Deliberately reuses validate_template()/ClientExcelTemplate exactly as
+    the platform-admin views do — no new matching/validation logic, per
+    the decision to keep the named-range engine exactly as-is and only
+    change who can reach it and from where.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def _forbidden_unless_org_admin(self, request):
+        if request.user.organization_id is None:
+            return Response({'detail': 'This account has no organization.'}, status=status.HTTP_400_BAD_REQUEST)
+        if request.user.role != 'admin':
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+        return None
+
+    def get(self, request):
+        org = request.user.organization
+        if org is None:
+            return Response({'detail': 'This account has no organization.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            template = ClientExcelTemplate.objects.get(organization=org)
+        except ClientExcelTemplate.DoesNotExist:
+            return Response({'has_template': False})
+
+        found = set(template.detected_named_ranges or [])
+        missing_scalar = sorted(set(SCALAR_FIELD_CATALOG) - found)
+        missing_row = sorted(set(ROW_FIELD_CATALOG) - found)
+
+        return Response({
+            'has_template': True,
+            'is_active': template.is_active,
+            'original_filename': template.original_filename,
+            'uploaded_at': template.uploaded_at.isoformat(),
+            'uploaded_by': template.uploaded_by.email if template.uploaded_by else None,
+            'detected_named_ranges': sorted(found),
+            'missing_scalar_fields': missing_scalar,
+            'missing_row_fields': missing_row,
+        })
+
+    def post(self, request):
+        denied = self._forbidden_unless_org_admin(request)
+        if denied:
+            return denied
+        org = request.user.organization
+
+        upload = request.FILES.get('file')
+        if not upload:
+            return Response({'detail': "No file provided (expected form field 'file')."}, status=status.HTTP_400_BAD_REQUEST)
+
+        original_filename = upload.name
+        if not original_filename.lower().endswith(ALLOWED_TEMPLATE_EXTENSIONS):
+            return Response(
+                {'detail': f"Unsupported file type. Expected one of: {', '.join(ALLOWED_TEMPLATE_EXTENSIONS)}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if upload.size > MAX_TEMPLATE_UPLOAD_BYTES:
+            return Response(
+                {'detail': f"File is too large ({upload.size / (1024*1024):.1f}MB). Max allowed is "
+                           f"{MAX_TEMPLATE_UPLOAD_BYTES // (1024*1024)}MB."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        file_bytes = upload.read()
+
+        try:
+            workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=False)
+        except Exception as e:
+            return Response(
+                {'detail': f"Couldn't open this file as an Excel workbook: {e}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            report = validate_template(workbook)
+        except TemplateValidationError as e:
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        finally:
+            workbook.close()
+
+        try:
+            existing = ClientExcelTemplate.objects.get(organization=org)
+        except ClientExcelTemplate.DoesNotExist:
+            existing = None
+
+        if existing is not None and existing.file:
+            existing.file.delete(save=False)
+            template = existing
+        else:
+            template = ClientExcelTemplate(organization=org)
+
+        template.file.save(original_filename, ContentFile(file_bytes), save=False)
+        template.original_filename = original_filename
+        template.detected_named_ranges = report['found_fields']
+        template.uploaded_by = request.user
+        template.is_active = True
+        template.save()
+
+        return Response({
+            'detail': "Custom template uploaded.",
+            'original_filename': template.original_filename,
+            'uploaded_at': template.uploaded_at.isoformat(),
+            'found_fields': report['found_fields'],
+            'missing_scalar_fields': report['missing_scalar_fields'],
+            'missing_row_fields': report['missing_row_fields'],
+            'row_anchor': report['row_anchor'],
+            'unresolvable_defined_names': report['unresolvable_defined_names'],
+        }, status=status.HTTP_201_CREATED)
+
+    def delete(self, request):
+        denied = self._forbidden_unless_org_admin(request)
+        if denied:
+            return denied
+        org = request.user.organization
+
+        try:
+            template = ClientExcelTemplate.objects.get(organization=org)
+        except ClientExcelTemplate.DoesNotExist:
+            return Response({'detail': 'Your organization has no custom template.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if template.file:
+            template.file.delete(save=False)
+        template.delete()
+
+        return Response({'detail': "Custom template removed."}, status=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Feature 3 (Enterprise Pipeline & Workflow Dashboard): Team Workspace
+# management. Two parallel surfaces, same pattern used for Excel templates
+# above — a self-serve one scoped to the calling org-admin's own
+# organization (My*), and a platform-admin mirror scoped by org_id in the
+# URL (Admin*) for when YOU need to set this up on a client's behalf. Both
+# ultimately touch the same TeamWorkspace/CustomUser rows.
+# ---------------------------------------------------------------------------
+
+def _serialize_workspace(workspace):
+    return {
+        'id': workspace.id,
+        'name': workspace.name,
+        'member_count': workspace.members.count(),
+        'project_count': workspace.property_projects.filter(is_deleted=False).count(),
+        'created_at': workspace.created_at.isoformat(),
+    }
+
+
+class MyOrganizationWorkspacesView(APIView):
+    """
+    Self-serve Team Workspace list/create, scoped to the calling user's own
+    organization — mirrors MyOrganizationExcelTemplateView's pattern
+    exactly: GET open to any authenticated member of the org (everyone
+    benefits from seeing what workspaces exist), POST (create) gated to the
+    org's own admin (role='admin').
+    """
+    permission_classes = [IsAuthenticated]
+
+    def _forbidden_unless_org_admin(self, request):
+        if request.user.organization_id is None:
+            return Response({'detail': 'This account has no organization.'}, status=status.HTTP_400_BAD_REQUEST)
+        if request.user.role != 'admin':
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+        return None
+
+    def get(self, request):
+        if request.user.organization_id is None:
+            return Response({'detail': 'This account has no organization.'}, status=status.HTTP_400_BAD_REQUEST)
+        workspaces = TeamWorkspace.objects.filter(organization_id=request.user.organization_id)
+        return Response([_serialize_workspace(w) for w in workspaces])
+
+    def post(self, request):
+        denied = self._forbidden_unless_org_admin(request)
+        if denied:
+            return denied
+
+        name = (request.data.get('name') or '').strip()
+        if not name:
+            return Response({'detail': 'A workspace name is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if TeamWorkspace.objects.filter(organization_id=request.user.organization_id, name=name).exists():
+            return Response(
+                {'detail': f"A workspace named '{name}' already exists."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        workspace = TeamWorkspace.objects.create(
+            organization=request.user.organization,
+            name=name,
+            created_by=request.user,
+        )
+        return Response(_serialize_workspace(workspace), status=status.HTTP_201_CREATED)
+
+
+class MyOrganizationWorkspaceDetailView(APIView):
+    """Rename/delete ONE workspace within the calling org-admin's own org."""
+    permission_classes = [IsAuthenticated]
+
+    def _get_workspace_or_404(self, request, workspace_id):
+        try:
+            return TeamWorkspace.objects.get(pk=workspace_id, organization_id=request.user.organization_id), None
+        except TeamWorkspace.DoesNotExist:
+            return None, Response({'detail': 'Workspace not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    def _forbidden_unless_org_admin(self, request):
+        if request.user.organization_id is None:
+            return Response({'detail': 'This account has no organization.'}, status=status.HTTP_400_BAD_REQUEST)
+        if request.user.role != 'admin':
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+        return None
+
+    def patch(self, request, workspace_id):
+        denied = self._forbidden_unless_org_admin(request)
+        if denied:
+            return denied
+
+        workspace, error = self._get_workspace_or_404(request, workspace_id)
+        if error:
+            return error
+
+        name = (request.data.get('name') or '').strip()
+        if not name:
+            return Response({'detail': 'A workspace name is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if TeamWorkspace.objects.filter(
+            organization_id=request.user.organization_id, name=name
+        ).exclude(pk=workspace.pk).exists():
+            return Response(
+                {'detail': f"A workspace named '{name}' already exists."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        workspace.name = name
+        workspace.save(update_fields=['name'])
+        return Response(_serialize_workspace(workspace))
+
+    def delete(self, request, workspace_id):
+        denied = self._forbidden_unless_org_admin(request)
+        if denied:
+            return denied
+
+        workspace, error = self._get_workspace_or_404(request, workspace_id)
+        if error:
+            return error
+
+        # Both CustomUser.workspace and PropertyProject.workspace use
+        # SET_NULL (see TeamWorkspace's own docstring) — deleting a
+        # workspace never cascades into deleting members OR deals, it just
+        # un-assigns them (members fall back to the own-created-projects-
+        # only visibility rule; projects become visible only to the org
+        # admin and whoever created them).
+        workspace.delete()
+        return Response({'detail': 'Workspace deleted.'})
+
+
+class MyOrganizationMembersView(APIView):
+    """
+    Self-serve roster of the calling org-admin's own team, with each
+    member's current workspace — the list the assignment UI picks from.
+    Org-admin only (unlike MyOrganizationExcelTemplateView's GET, this
+    reveals every teammate's info, not just a yes/no status — a regular
+    member doesn't need this).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        if request.user.organization_id is None:
+            return Response({'detail': 'This account has no organization.'}, status=status.HTTP_400_BAD_REQUEST)
+        if request.user.role != 'admin':
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        members = CustomUser.objects.filter(
+            organization_id=request.user.organization_id
+        ).order_by('first_name', 'last_name')
+
+        return Response([
+            {
+                'email': m.email,
+                'first_name': m.first_name,
+                'last_name': m.last_name,
+                'role': m.role,
+                'is_active': m.is_active,
+                'workspace_id': m.workspace_id,
+                'workspace_name': m.workspace.name if m.workspace_id else None,
+                'workspace_role': m.workspace_role,
+            }
+            for m in members
+        ])
+
+
+class MyOrganizationMemberWorkspaceView(APIView):
+    """
+    Org-admin assigns (or clears, via workspace_id=null) ONE of their own
+    team member's workspace. Enforces the same-organization constraint at
+    this layer via AssignUserWorkspaceSerializer — see TeamWorkspace's own
+    docstring for why the database itself can't express it.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, email):
+        if request.user.organization_id is None:
+            return Response({'detail': 'This account has no organization.'}, status=status.HTTP_400_BAD_REQUEST)
+        if request.user.role != 'admin':
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        decoded_email = urllib.parse.unquote(email)
+        try:
+            member = CustomUser.objects.get(email=decoded_email, organization_id=request.user.organization_id)
+        except CustomUser.DoesNotExist:
+            return Response({'detail': 'Team member not found in your organization.'}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = AssignUserWorkspaceSerializer(
+            data=request.data, context={'organization': request.user.organization}
+        )
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        # Feature 4: apply each field only if it was actually present in this
+        # request. Both fields are optional on the serializer so a caller can
+        # PATCH workspace_role alone (e.g. promoting someone to Head without
+        # re-sending their existing workspace_id) - falling back to .get()
+        # with a None default here would silently unassign the workspace on
+        # a workspace_role-only request.
+        update_fields = []
+        if 'workspace_id' in serializer.validated_data:
+            member.workspace_id = serializer.validated_data['workspace_id']
+            update_fields.append('workspace')
+        if 'workspace_role' in serializer.validated_data:
+            member.workspace_role = serializer.validated_data['workspace_role']
+            update_fields.append('workspace_role')
+
+        if update_fields:
+            member.save(update_fields=update_fields)
+
+        return Response({
+            'email': member.email,
+            'workspace_id': member.workspace_id,
+            'workspace_name': member.workspace.name if member.workspace_id else None,
+            'workspace_role': member.workspace_role,
+        })
+
+
+class AdminOrganizationWorkspacesView(APIView):
+    """Platform-admin mirror of MyOrganizationWorkspacesView, scoped by org_id in the URL."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, org_id):
+        if not request.user.is_admin:
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+        try:
+            org = Organization.objects.get(id=org_id)
+        except Organization.DoesNotExist:
+            return Response({'detail': 'Organization not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        workspaces = TeamWorkspace.objects.filter(organization=org)
+        return Response([_serialize_workspace(w) for w in workspaces])
+
+    def post(self, request, org_id):
+        if not request.user.is_admin:
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+        try:
+            org = Organization.objects.get(id=org_id)
+        except Organization.DoesNotExist:
+            return Response({'detail': 'Organization not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        name = (request.data.get('name') or '').strip()
+        if not name:
+            return Response({'detail': 'A workspace name is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if TeamWorkspace.objects.filter(organization=org, name=name).exists():
+            return Response(
+                {'detail': f"A workspace named '{name}' already exists."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        workspace = TeamWorkspace.objects.create(organization=org, name=name, created_by=request.user)
+        return Response(_serialize_workspace(workspace), status=status.HTTP_201_CREATED)
+
+
+class AdminOrganizationWorkspaceDetailView(APIView):
+    """Platform-admin mirror of MyOrganizationWorkspaceDetailView, scoped by org_id in the URL."""
+    permission_classes = [IsAuthenticated]
+
+    def _get_workspace_or_404(self, org_id, workspace_id):
+        try:
+            return TeamWorkspace.objects.get(pk=workspace_id, organization_id=org_id), None
+        except TeamWorkspace.DoesNotExist:
+            return None, Response({'detail': 'Workspace not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    def patch(self, request, org_id, workspace_id):
+        if not request.user.is_admin:
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        workspace, error = self._get_workspace_or_404(org_id, workspace_id)
+        if error:
+            return error
+
+        name = (request.data.get('name') or '').strip()
+        if not name:
+            return Response({'detail': 'A workspace name is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if TeamWorkspace.objects.filter(organization_id=org_id, name=name).exclude(pk=workspace.pk).exists():
+            return Response(
+                {'detail': f"A workspace named '{name}' already exists."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        workspace.name = name
+        workspace.save(update_fields=['name'])
+        return Response(_serialize_workspace(workspace))
+
+    def delete(self, request, org_id, workspace_id):
+        if not request.user.is_admin:
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        workspace, error = self._get_workspace_or_404(org_id, workspace_id)
+        if error:
+            return error
+
+        workspace.delete()
+        return Response({'detail': 'Workspace deleted.'})
+
+
+class AdminOrganizationUserWorkspaceView(APIView):
+    """Platform-admin mirror of MyOrganizationMemberWorkspaceView, scoped by org_id in the URL."""
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, org_id, email):
+        if not request.user.is_admin:
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            org = Organization.objects.get(id=org_id)
+        except Organization.DoesNotExist:
+            return Response({'detail': 'Organization not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        decoded_email = urllib.parse.unquote(email)
+        try:
+            member = CustomUser.objects.get(email=decoded_email, organization=org)
+        except CustomUser.DoesNotExist:
+            return Response({'detail': 'User not found in this organization.'}, status=status.HTTP_404_NOT_FOUND)
+
+        serializer = AssignUserWorkspaceSerializer(data=request.data, context={'organization': org})
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        # See MyOrganizationMemberWorkspaceView.patch - same reasoning for
+        # only applying a field that was actually present in the request.
+        update_fields = []
+        if 'workspace_id' in serializer.validated_data:
+            member.workspace_id = serializer.validated_data['workspace_id']
+            update_fields.append('workspace')
+        if 'workspace_role' in serializer.validated_data:
+            member.workspace_role = serializer.validated_data['workspace_role']
+            update_fields.append('workspace_role')
+
+        if update_fields:
+            member.save(update_fields=update_fields)
+
+        return Response({
+            'email': member.email,
+            'workspace_id': member.workspace_id,
+            'workspace_name': member.workspace.name if member.workspace_id else None,
+            'workspace_role': member.workspace_role,
+        })
+
+
+class WorkspaceUsageView(APIView):
+    """
+    Feature 4 ("Head of Underwriting" role hierarchy): workspace-scoped
+    usage metrics — the Head Seat's "clear view of their specific team's
+    activity" the stakeholder brief asked for.
+
+    Scoped by PropertyProject.workspace_id, NOT by which members currently
+    have this workspace set on their account — the same choice
+    ai_service/permissions.py's visible_projects_for makes for a workspace
+    Head's deal visibility, and for the same reason: a deal's workspace is
+    a property of the PROJECT. That keeps this view honest in the two cases
+    where "who's in the workspace today" and "whose work happened in the
+    workspace" diverge: a member who created deals here and has since been
+    moved to a different workspace (or had their workspace cleared) still
+    shows up against the deals they created while they were here, and a
+    project that's since been reassigned to a different workspace moves
+    with it rather than staying attributed to this one.
+
+    URL: GET /api/organization/workspaces/<int:workspace_id>/usage/
+    Gated to: the org's own admin (role='admin'), OR a member of THIS
+    workspace with workspace_role='head'. Never any other workspace's head
+    — matching the "no cross-workspace access, ever" decision locked in
+    for this feature.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, workspace_id):
+        from django.db.models import Count
+
+        if request.user.organization_id is None:
+            return Response({'detail': 'This account has no organization.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            workspace = TeamWorkspace.objects.get(pk=workspace_id, organization_id=request.user.organization_id)
+        except TeamWorkspace.DoesNotExist:
+            return Response({'detail': 'Workspace not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        is_this_workspaces_head = (
+            request.user.workspace_id == workspace.id and request.user.workspace_role == 'head'
+        )
+        if request.user.role != 'admin' and not is_this_workspaces_head:
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        projects = PropertyProject.objects.filter(workspace=workspace, is_deleted=False)
+
+        deals_by_status = {choice_value: 0 for choice_value, _ in PropertyProject.STATUS_CHOICES}
+        for row in projects.values('deal_status').annotate(count=Count('id')):
+            deals_by_status[row['deal_status']] = row['count']
+
+        analyses = AnalysisReport.objects.filter(project__workspace=workspace, is_deleted=False)
+
+        now = timezone.now()
+        thirty_days_ago = now - timedelta(days=30)
+
+        members = CustomUser.objects.filter(workspace=workspace).order_by('first_name', 'last_name')
+
+        per_member = [
+            {
+                'email': member.email,
+                'first_name': member.first_name,
+                'last_name': member.last_name,
+                'workspace_role': member.workspace_role,
+                'deals_created': projects.filter(created_by_id=member.pk).count(),
+                'analyses_run': analyses.filter(uploaded_by_id=member.pk).count(),
+            }
+            for member in members
+        ]
+
+        return Response({
+            'workspace_id': workspace.id,
+            'workspace_name': workspace.name,
+            'member_count': members.count(),
+            'deals_total': projects.count(),
+            'deals_by_status': deals_by_status,
+            'analyses_total': analyses.count(),
+            'analyses_last_30_days': analyses.filter(created_at__gte=thirty_days_ago).count(),
+            'members': per_member,
+        })
