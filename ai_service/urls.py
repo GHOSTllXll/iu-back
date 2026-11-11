@@ -16,10 +16,12 @@ from .views import (
     TaskStatusView,
     PropertyProjectListView,
     PropertyProjectDetailView,
+    ApproveLockBaselineView,
     TeamNoteListCreateView,
     PropertyProjectDownloadView,
     ExcelOverrideCheckView,
     ExcelOverrideHistoryView,
+    OverrideAlertFeedView,
 )
 
 urlpatterns = [
@@ -55,6 +57,11 @@ urlpatterns = [
     # PropertyProjectListView for the full writeup.
     path('pipeline/projects/', PropertyProjectListView.as_view(), name='pipeline_project_list'),
     path('pipeline/projects/<int:project_id>/', PropertyProjectDetailView.as_view(), name='pipeline_project_detail'),
+
+    # Feature 2 (Immutable Snapshots): "Approve & Lock Baseline" — see
+    # views.py's comment block above ApproveLockBaselineView.
+    path('pipeline/projects/<int:project_id>/lock/', ApproveLockBaselineView.as_view(), name='pipeline_project_lock'),
+
     path('pipeline/projects/<int:project_id>/notes/', TeamNoteListCreateView.as_view(), name='pipeline_project_notes'),
     path('pipeline/projects/<int:project_id>/download/', PropertyProjectDownloadView.as_view(), name='pipeline_project_download'),
 
@@ -62,4 +69,11 @@ urlpatterns = [
     # File" — see views.py's comment block above ExcelOverrideCheckView.
     path('pipeline/projects/<int:project_id>/override-check/', ExcelOverrideCheckView.as_view(), name='pipeline_project_override_check'),
     path('pipeline/projects/<int:project_id>/overrides/', ExcelOverrideHistoryView.as_view(), name='pipeline_project_overrides'),
+
+    # Feature 1 (Variance & Change Ledger) extension: firm-wide proactive
+    # alert feed (GPR/OpEx/NOI, >2.0% variance) — see views.py's comment
+    # block above OverrideAlertFeedView. Not project-scoped — intentionally
+    # above the override-check/overrides list so it's clear this one spans
+    # every visible deal at once.
+    path('pipeline/override-alerts/', OverrideAlertFeedView.as_view(), name='pipeline_override_alerts'),
 ]

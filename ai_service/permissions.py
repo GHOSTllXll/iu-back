@@ -80,3 +80,35 @@ def can_manage_project(user, project) -> bool:
     if user.workspace_id is not None and user.workspace_role == 'head':
         return project.workspace_id == user.workspace_id
     return project.created_by_id == user.pk
+
+
+def can_lock_project(user, project) -> bool:
+    """
+    Feature 2 (Immutable Snapshots): whether `user` may "Approve & Lock
+    Baseline" on THIS already-fetched project. Deliberately STRICTER than
+    can_manage_project above — it omits that function's final
+    "own-created" fallback entirely, per the client's explicit decision:
+    locking is gated to role='admin' (Org Admin) OR workspace_role='head'
+    (Workspace Head) only. A plain analyst can manage their own deal's
+    status and notes (can_manage_project), but can never lock it — not
+    even a deal they created themselves.
+
+    Otherwise mirrors can_manage_project's org/workspace scoping exactly:
+    an org admin (or platform superuser) can lock any deal in their org; a
+    Workspace Head can lock only a deal in THEIR OWN workspace, never
+    cross-workspace — same "need-to-know" hierarchy as every other
+    permission check in this module, per the client's Feature 4 decision
+    to stick strictly to the existing Org -> Workspace -> Analyst/Head
+    hierarchy rather than build a parallel permission system for this.
+    """
+    if not getattr(user, 'is_authenticated', False):
+        return False
+    if user.is_admin:
+        return True
+    if user.organization_id is None or project.organization_id != user.organization_id:
+        return False
+    if user.role == 'admin':
+        return True
+    if user.workspace_id is not None and user.workspace_role == 'head':
+        return project.workspace_id == user.workspace_id
+    return False

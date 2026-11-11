@@ -284,7 +284,7 @@ class AnalysisReport(models.Model):
     # custom_template_generator.compute_injected_values_snapshot() against
     # this row's own metrics/rent_roll_data/debt assumptions, and (re)written
     # every time a download actually happens — NOT once at analysis time —
-    # because 3 of the 16 scalar fields (IU_DebtLTVPct/InterestRatePct/
+    # because 3 of the 18 scalar fields (IU_DebtLTVPct/InterestRatePct/
     # AmortizationYears) are debt assumptions typed in at download time, not
     # known until then, and can legitimately differ between repeat downloads
     # of the same analysis. ExcelOverrideUpload/-Delta below diff a
@@ -345,6 +345,17 @@ class ExcelOverrideUpload(models.Model):
     )
     original_filename = models.CharField(max_length=255, blank=True, default='')
     uploaded_at = models.DateTimeField(auto_now_add=True)
+    # Feature 2 (Immutable Snapshots) extension: true when this project
+    # already had an ExcelBaselineLock AT THE MOMENT this upload happened.
+    # Set once, at creation, never recomputed later — whether a deal gets
+    # locked AFTER this upload already happened shouldn't retroactively
+    # relabel history. Purely a display hint ("this is a child version
+    # branch on top of the locked baseline, not an edit to the baseline
+    # itself") — it changes nothing about how the diff itself is computed;
+    # see ExcelBaselineLock's own docstring for why the diff target
+    # (analysis.injected_values_snapshot) is already frozen by that point
+    # regardless of this flag.
+    is_post_lock_revision = models.BooleanField(default=False)
 
     class Meta:
         ordering = ['-uploaded_at']
@@ -394,6 +405,16 @@ class ExcelOverrideDelta(models.Model):
     row_index = models.IntegerField(null=True, blank=True)
     original_value = models.TextField(blank=True, default='')
     new_value = models.TextField(blank=True, default='')
+    # Feature 1 (Variance & Change Ledger) extension: percentage change
+    # between original_value and new_value, computed ONLY when both sides
+    # were a real non-boolean number with a non-zero original — see
+    # _variance_pct() in views.py. Null for every other change (a text/date
+    # field like IU_PropertyName or IU_Row_LeaseStart, or a zero baseline a
+    # percentage can't meaningfully describe) rather than a fabricated
+    # number — same "never guess" discipline as everything else in this
+    # audit log. Powers both the per-deal delta display and the firm-wide
+    # override-alerts feed's >2.0% threshold check.
+    variance_pct = models.FloatField(null=True, blank=True)
 
     class Meta:
         ordering = ['row_index', 'field_name']
@@ -401,6 +422,79 @@ class ExcelOverrideDelta(models.Model):
     def __str__(self):
         target = f"{self.field_name}[{self.row_index}]" if self.row_index is not None else self.field_name
         return f"{target}: {self.original_value!r} -> {self.new_value!r}"
+
+
+class ExcelBaselineLock(models.Model):
+    """
+    Feature 2 (Immutable Snapshots): "Approve & Lock Baseline" — once this
+    row exists for a PropertyProject, that deal's current analysis
+    snapshot is permanently frozen as its official underwriting baseline.
+
+    Exactly what locking means, per the client's own explicit scope
+    decision (narrow by design, not an accident):
+      - AnalysisReport.injected_values_snapshot stops being overwritten on
+        every subsequent Excel download — see the guard in
+        _save_injected_values_snapshot() in views.py. A post-lock
+        re-upload of an edited file is still diffed and recorded as usual
+        (ExcelOverrideUpload/-Delta), it just diffs against the now-frozen
+        snapshot forever, instead of a snapshot that could otherwise still
+        legitimately move (see AnalysisReport.injected_values_snapshot's
+        own docstring on why it's normally re-written every download).
+      - The locked AnalysisReport can no longer be soft-deleted — see the
+        guard in AnalysisReportDetailView's DELETE handler in views.py.
+        (PropertyProject itself has no delete endpoint at all today — see
+        that view's own comment — so this is the one real deletion path
+        that could otherwise destroy the data a lock exists to protect.)
+      - deal_status and Team Notes are DELIBERATELY left fully editable —
+        locking freezes the financial baseline, not the deal's workflow.
+        The team can still move a locked deal through Reviewing ->
+        Approved -> Archived and keep adding notes.
+      - A post-lock Excel RE-UPLOAD that would otherwise need to replace
+        the locked baseline instead becomes a separate child version
+        branch (see ExcelOverrideUpload.is_post_lock_revision below) — the
+        locked JSON snapshot itself is never touched, so the original
+        baseline stays intact for audit history no matter what gets
+        re-uploaded afterward.
+
+    One lock per PropertyProject (OneToOneField) — a deliberately one-way,
+    one-time action for v1: there is no "unlock" endpoint. Baseline
+    integrity is the entire point of this feature, so undoing a lock is a
+    real product decision to make deliberately later, not something to
+    half-support now by guessing at a safe unlock story.
+
+    `analysis` is on_delete=PROTECT, not CASCADE — the specific
+    AnalysisReport whose snapshot got frozen must never be deletable out
+    from under an existing lock; attempting to would raise ProtectedError
+    rather than silently orphaning (or worse, cascading away) the audit
+    record this entire feature exists to preserve. The project's own
+    "latest" analysis can still move on past this one via re-analysis —
+    this FK deliberately stays pointed at the ORIGINAL locked analysis,
+    never implicitly re-pointed to a newer one.
+
+    snapshot_sha256: per the client's explicit instruction, hashes ONLY
+    analysis.injected_values_snapshot (the JSON field) — never the .xlsx
+    file bytes and never the full AnalysisReport.metrics blob. Consistent
+    with this platform's zero-retention policy for uploaded/generated
+    Excel (see ClientExcelTemplate's docstring below for the one
+    deliberate, unrelated exception to that policy) — a locked deal's
+    Excel file itself is still never stored, only a hash of the JSON
+    values it was generated from.
+    """
+    project = models.OneToOneField(
+        PropertyProject, on_delete=models.CASCADE, related_name='baseline_lock'
+    )
+    analysis = models.ForeignKey(
+        AnalysisReport, on_delete=models.PROTECT, related_name='baseline_locks'
+    )
+    locked_by = models.ForeignKey(
+        'users.CustomUser', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='locked_baselines'
+    )
+    locked_at = models.DateTimeField(auto_now_add=True)
+    snapshot_sha256 = models.CharField(max_length=64)
+
+    def __str__(self):
+        return f"Locked baseline for {self.project} @ {self.locked_at:%Y-%m-%d}"
 
 
 class ClientExcelTemplate(models.Model):

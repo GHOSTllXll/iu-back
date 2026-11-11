@@ -10,12 +10,12 @@ the same data that drives the Excel formulas. Python performs the comparison.
 The AI never checks its own math, so a flag here means an actual document
 mismatch, not the AI disagreeing with itself.
 
-Coverage note: this implements OCCUPANCY_MISMATCH and REVENUE_MISMATCH fully.
-CONCESSION_HIDING is best-effort — it checks for a rent-roll column that looks
-concession-related and flags a WARNING if found alongside a zero/missing T12
-concessions figure. It does not do exhaustive text scanning for concession
-mentions buried in free-text cells; treat it as a prompt for manual review,
-not a guarantee of detection.
+Coverage note: this implements OCCUPANCY_MISMATCH, REVENUE_MISMATCH, and
+VACANCY_LOSS_VS_OCCUPANCY ("Rule B") fully. CONCESSION_HIDING is best-effort —
+it checks for a rent-roll column that looks concession-related and flags a
+WARNING if found alongside a zero/missing T12 concessions figure. It does not
+do exhaustive text scanning for concession mentions buried in free-text
+cells; treat it as a prompt for manual review, not a guarantee of detection.
 """
 import pandas as pd
 
@@ -86,6 +86,60 @@ def _check_revenue(ground_truth: dict, t12_revenue_expenses: dict) -> dict | Non
         "claimed_value": claimed_income,
         "actual_value": round(actual_income, 2),
         "variance_pct": round(variance_pct, 2),
+    }
+
+
+PHYSICAL_OCCUPANCY_HIGH_THRESHOLD_PCT = 95.0  # percentage points
+VACANCY_LOSS_HIGH_THRESHOLD_PCT = 8.0  # percentage points, as stated on the T12
+
+
+def _check_vacancy_loss_vs_occupancy(ground_truth: dict, document_claims: dict) -> dict | None:
+    """
+    Rule B: flags the specific anomaly pattern where a property LOOKS fully
+    occupied on the Rent Roll but the T12 itself reports meaningfully higher
+    vacancy/concession loss than that would suggest — a mismatch that often
+    points to delinquency being miscoded as "vacancy", a stale Rent Roll, or
+    concessions masking weaker real economic performance.
+
+    Unlike the other checks in this module, this isn't a single-value
+    variance comparison (there's no one "true" number both sides should
+    agree on) — it's a conjunction of two independent conditions, each
+    checked against its own fixed threshold. Severity is derived from how
+    far the T12's claimed vacancy loss exceeds its own 8% threshold, reusing
+    _severity_for_variance for a consistent WARNING/CRITICAL split with the
+    rest of this module rather than inventing a parallel scale.
+    """
+    actual_occupancy_pct = ground_truth.get("physical_occupancy_pct")
+    claimed_vacancy_loss_pct = document_claims.get("t12_claimed_vacancy_loss_pct")
+
+    if actual_occupancy_pct is None or claimed_vacancy_loss_pct is None:
+        return None  # rent roll had no rows, or the T12 didn't state a figure
+
+    occupancy_points = actual_occupancy_pct * 100
+    vacancy_loss_points = claimed_vacancy_loss_pct * 100
+
+    if occupancy_points <= PHYSICAL_OCCUPANCY_HIGH_THRESHOLD_PCT:
+        return None  # not a "looks fully occupied" property — Rule B doesn't apply
+    if vacancy_loss_points <= VACANCY_LOSS_HIGH_THRESHOLD_PCT:
+        return None  # vacancy loss is in line with high occupancy — no anomaly
+
+    excess_pct = vacancy_loss_points - VACANCY_LOSS_HIGH_THRESHOLD_PCT
+    severity = _severity_for_variance(excess_pct)
+
+    return {
+        "metric": "t12_claimed_vacancy_loss_pct",
+        "severity": severity,
+        "message": (
+            f"Rent Roll shows {occupancy_points:.1f}% physical occupancy (a fully-occupied "
+            f"property), but the T12 reports {vacancy_loss_points:.1f}% economic vacancy/"
+            f"concession loss — above the {VACANCY_LOSS_HIGH_THRESHOLD_PCT:.0f}% threshold "
+            f"expected at this occupancy level. Worth checking whether delinquency is being "
+            f"coded as vacancy, the Rent Roll is stale, or concessions are masking weaker "
+            f"economic performance."
+        ),
+        "claimed_value": claimed_vacancy_loss_pct,
+        "actual_value": actual_occupancy_pct,
+        "variance_pct": round(excess_pct, 2),
     }
 
 
@@ -216,6 +270,7 @@ def run_reconciliation(metrics: dict, rent_roll_df: pd.DataFrame, ground_truth: 
     for check in (
         _check_occupancy(ground_truth, document_claims),
         _check_revenue(ground_truth, t12_revenue_expenses),
+        _check_vacancy_loss_vs_occupancy(ground_truth, document_claims),
         _check_concessions(rent_roll_df, rent_roll_metrics),
     ):
         if check is not None:

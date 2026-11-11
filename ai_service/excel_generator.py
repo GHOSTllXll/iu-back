@@ -1398,7 +1398,7 @@ def generate_underwriting_excel(metrics: dict, rent_roll_df: pd.DataFrame, debt_
     # have already finished loading in full, so a local import here is
     # completely safe and carries no such risk.
     #
-    # Scoped STRICTLY to the same 16 scalar + 13 row fields the
+    # Scoped STRICTLY to the same 18 scalar + 13 row fields the
     # custom-template path already tracks (SCALAR_FIELD_CATALOG /
     # ROW_FIELD_CATALOG) — not the rest of this workbook's many sheets,
     # most of which are live FORMULAS or derived outputs (DSCR, NER,

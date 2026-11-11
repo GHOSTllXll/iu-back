@@ -106,6 +106,15 @@ SCALAR_FIELD_CATALOG = {
     'IU_AnnualizedGPR': lambda m, d: safe_get(m, 'rent_roll_metrics', 'annualized_gpr'),
     'IU_TotalAnnualConcessions': lambda m, d: safe_get(m, 'rent_roll_metrics', 'total_annual_concessions'),
     'IU_NetRentalIncome': lambda m, d: safe_get(m, 't12_revenue_expenses', 'net_rental_income'),
+    # Feature 1 (Variance & Change Ledger) extension: OpEx and NOI added
+    # alongside the pre-existing GPR/NetRentalIncome tracking specifically so
+    # the firm-wide proactive alert feed (see views.py's override-alerts
+    # endpoint) has a real tracked field to diff for all three of GPR, OpEx,
+    # and NOI — NOI wasn't previously a named/tracked field at all (only Net
+    # Rental Income was), so this also newly brings NOI into Cell Override
+    # tracking, not just OpEx.
+    'IU_TotalOperatingExpenses': lambda m, d: safe_get(m, 't12_revenue_expenses', 'total_operating_expenses'),
+    'IU_NetOperatingIncome': lambda m, d: safe_get(m, 't12_revenue_expenses', 'net_operating_income'),
     # Buyer-entered financing assumptions (see _parse_debt_assumptions in
     # views.py) — not derived from source documents, same caveat that
     # applies to these three everywhere else they're used.
@@ -341,7 +350,7 @@ def compute_injected_values_snapshot(metrics, debt_assumptions, rent_roll_df):
     Called once per ACTUAL Excel generation (custom-template or standard —
     see excel_generator.py's own use of this same function), not once per
     analysis — see AnalysisReport.injected_values_snapshot's docstring for
-    why: debt_assumptions (3 of the 16 scalar fields) aren't known until
+    why: debt_assumptions (3 of the 18 scalar fields) aren't known until
     download time and can vary between repeat downloads of one analysis.
 
     Returns a JSON-safe {"scalars": {name: value, ...}, "rows": [{name:

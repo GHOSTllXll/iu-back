@@ -2,6 +2,7 @@
 import io
 import re
 import json
+import hashlib
 import os
 import time
 import uuid
@@ -474,8 +475,15 @@ def get_mock_metrics(tier: str) -> dict:
     if tier in TIERS_WITH_RECONCILIATION:
         # Deliberately mismatched vs the mock rent roll's real numbers, so mock
         # mode actually exercises the reconciliation flagging logic instead of
-        # silently passing every time.
-        metrics["reconciliation_claims"] = {"om_claimed_occupancy_pct": 0.96}
+        # silently passing every time. t12_claimed_vacancy_loss_pct is a
+        # plausible non-triggering value included only for schema shape —
+        # the mock rent roll's actual physical occupancy is 65%, so Rule B
+        # (which requires >95%) never fires in mock mode regardless of this
+        # figure; exercising Rule B specifically needs a real/manual test.
+        metrics["reconciliation_claims"] = {
+            "om_claimed_occupancy_pct": 0.96,
+            "t12_claimed_vacancy_loss_pct": 0.03,
+        }
     if tier in TIERS_WITH_STANDARDIZATION:
         # Non-empty on purpose, so mock mode exercises the standardization
         # display/Excel logic instead of always showing the empty-state path.
@@ -1140,21 +1148,31 @@ def _build_system_prompt(tier: str = TIER_BASIC) -> str:
 
     reconciliation_claims_section = """,
       "reconciliation_claims": {
-        "om_claimed_occupancy_pct": number
+        "om_claimed_occupancy_pct": number,
+        "t12_claimed_vacancy_loss_pct": number
       }""" if include_reconciliation else ''
 
     reconciliation_guidance = """
 
     CRITICAL — "reconciliation_claims" section:
     This section is NOT for your own calculations. It exists so our system can
-    cross-check the OM's stated claims against the actual Rent Roll data
-    independently.
+    cross-check the OM's/T12's stated claims against independently-computed
+    ground truth from the Rent Roll.
     - "om_claimed_occupancy_pct": Extract EXACTLY the physical occupancy
       percentage stated in the OM itself (e.g. on its cover page, loan details
       section, or property summary) — as a decimal (e.g. 0.96 for 96%). Do NOT
       calculate this yourself from the Rent Roll. Only report what the OM
       document literally states. If the OM does not explicitly state an
-      occupancy percentage, set this to null.""" if include_reconciliation else ''
+      occupancy percentage, set this to null.
+    - "t12_claimed_vacancy_loss_pct": Extract EXACTLY the economic vacancy
+      loss / vacancy & concession loss percentage AS STATED on the T12 itself
+      — this is commonly a line item near the top of the statement (e.g.
+      "Vacancy Loss", "Economic Vacancy", "Vacancy & Concessions") shown as a
+      percentage of Gross Potential Rent, as a decimal (e.g. 0.08 for 8%). Do
+      NOT derive or calculate this from other figures — only report a
+      percentage that is literally printed on the T12. If the T12 only shows
+      this as a dollar amount with no percentage stated, or doesn't show it at
+      all, set this to null.""" if include_reconciliation else ''
 
     standardization_section = """,
       "uncategorized_items": [
@@ -1566,7 +1584,7 @@ def _build_underwriting_excel_response(request, organization, metrics, rent_roll
     captured onto analysis.injected_values_snapshot, which a later
     "Re-upload Edited Underwriting File" diffs against. Deliberately
     captured HERE (at generation time), not back when the analysis was
-    first created — 3 of the 16 scalar fields are debt assumptions
+    first created — 3 of the 18 scalar fields are debt assumptions
     (ltv/rate/amortization) typed in at download time, which this function
     already has fresh from THIS request, and can differ between repeat
     downloads of the same analysis. UnderwritePropertyDownloadView doesn't
@@ -1624,6 +1642,18 @@ def _build_underwriting_excel_response(request, organization, metrics, rent_roll
         # download never overwrites a perfectly good earlier snapshot with
         # nothing useful.
         if analysis is None:
+            return
+        # Feature 2 (Immutable Snapshots): once THIS analysis's snapshot
+        # has been locked as a deal's permanent baseline (see
+        # ExcelBaselineLock's own docstring), never overwrite it again —
+        # re-downloading a locked analysis's Excel (e.g. to send another
+        # copy to IC) must keep reproducing the EXACT frozen baseline, not
+        # silently drift if a re-entered debt assumption differs between
+        # downloads. A deal can still be re-analyzed after locking — that
+        # creates a BRAND NEW AnalysisReport, which is free to have its own
+        # snapshot computed normally; only this specific, already-locked
+        # row is frozen.
+        if analysis.baseline_locks.exists():
             return
         analysis.injected_values_snapshot = compute_injected_values_snapshot(
             metrics, debt_assumptions, rent_roll_df
@@ -2183,7 +2213,19 @@ class AnalysisReportDetailView(APIView):
             report = AnalysisReport.objects.get(id=report_id, organization=organization, is_deleted=False)
         except AnalysisReport.DoesNotExist:
             return Response({'error': 'Report not found.'}, status=status.HTTP_404_NOT_FOUND)
- 
+
+        # Feature 2 (Immutable Snapshots): once this specific analysis has
+        # been locked as a deal's permanent baseline (ExcelBaselineLock),
+        # it can never be deleted — soft or otherwise — through this
+        # endpoint. This is an explicit application-layer check, not just
+        # the model's on_delete=PROTECT (which only guards a real DB-level
+        # .delete(), and this view only ever sets is_deleted=True).
+        if report.baseline_locks.exists():
+            return Response(
+                {'error': "This analysis is a locked deal baseline and can't be deleted."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         report.is_deleted = True
         report.save(update_fields=['is_deleted'])
         return Response(status=status.HTTP_204_NO_CONTENT)
@@ -2298,8 +2340,15 @@ class ProcessedDocumentDeleteView(APIView):
 # itself information this multi-tenant platform shouldn't leak.
 # ---------------------------------------------------------------------------
 
-def _serialize_project_summary(project):
+def _serialize_project_summary(project, user=None):
+    from .permissions import can_lock_project
+
     latest = project.analyses.order_by('-created_at').first()
+    # Feature 2 (Immutable Snapshots): OneToOneField reverse accessor —
+    # Django raises RelatedObjectDoesNotExist (an AttributeError subclass,
+    # specifically so getattr's default works) rather than returning None
+    # when this project has never been locked.
+    lock = getattr(project, 'baseline_lock', None)
     return {
         'id': project.id,
         'property_name': project.property_name or 'Untitled',
@@ -2315,6 +2364,14 @@ def _serialize_project_summary(project):
         'analysis_count': project.analyses.count(),
         'can_download': bool(latest and latest.rent_roll_data),
         'updated_at': project.updated_at.isoformat(),
+        # Feature 2 (Immutable Snapshots): `user` is optional (None) rather
+        # than required, so every pre-existing call site that didn't yet
+        # know about this feature still works unchanged — it just gets
+        # can_lock=False, which is the safe default for an unknown caller.
+        'is_locked': lock is not None,
+        'locked_at': lock.locked_at.isoformat() if lock else None,
+        'locked_by': lock.locked_by.email if lock and lock.locked_by else None,
+        'can_lock': lock is None and user is not None and can_lock_project(user, project),
     }
 
 
@@ -2331,13 +2388,15 @@ class PropertyProjectListView(APIView):
     def get(self, request):
         from .permissions import visible_projects_for
 
-        projects = visible_projects_for(request.user).select_related('organization', 'workspace', 'created_by')
+        projects = visible_projects_for(request.user).select_related(
+            'organization', 'workspace', 'created_by', 'baseline_lock', 'baseline_lock__locked_by'
+        )
 
         deal_status_filter = request.query_params.get('deal_status')
         if deal_status_filter:
             projects = projects.filter(deal_status=deal_status_filter)
 
-        return Response([_serialize_project_summary(p) for p in projects])
+        return Response([_serialize_project_summary(p, user=request.user) for p in projects])
 
 
 class PropertyProjectDetailView(APIView):
@@ -2369,7 +2428,7 @@ class PropertyProjectDetailView(APIView):
         notes = project.notes.select_related('author').order_by('-created_at')
 
         return Response({
-            **_serialize_project_summary(project),
+            **_serialize_project_summary(project, user=request.user),
             'latest_metrics': latest.metrics if latest else None,
             'analyses': [
                 {
@@ -2413,7 +2472,91 @@ class PropertyProjectDetailView(APIView):
         project.deal_status = new_status
         project.save(update_fields=['deal_status', 'updated_at'])
 
-        return Response(_serialize_project_summary(project))
+        return Response(_serialize_project_summary(project, user=request.user))
+
+
+class ApproveLockBaselineView(APIView):
+    """
+    Feature 2 (Immutable Snapshots): "Approve & Lock Baseline" — freezes
+    this deal's CURRENT analysis snapshot as its permanent underwriting
+    baseline. See ExcelBaselineLock's own docstring for exactly what
+    locking does, and deliberately does NOT do (deal_status and Team
+    Notes stay fully editable either way).
+
+    Gated to can_lock_project() — role='admin' (Org Admin) or
+    workspace_role='head' (Workspace Head) only; see that function's
+    docstring for why this is deliberately stricter than every other
+    pipeline endpoint's can_manage_project. A plain analyst gets a 403
+    even on a deal they created themselves.
+
+    Requires the project's latest analysis to already have a captured
+    injected_values_snapshot — i.e. its Excel has been downloaded at
+    least once — there's nothing to freeze otherwise. Locking an
+    already-locked project 400s rather than silently no-op'ing or
+    re-locking to a newer analysis — this is a one-way action with no
+    "re-lock" story in v1 (see the model's own docstring on why).
+    URL: POST /api/ai/pipeline/projects/<int:project_id>/lock/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, project_id):
+        from django.db import transaction
+        from .permissions import visible_projects_for, can_lock_project
+        from .models import ExcelBaselineLock
+
+        project = visible_projects_for(request.user).select_related('workspace').filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if not can_lock_project(request.user, project):
+            return Response(
+                {'detail': (
+                    "Only an Org Admin or this deal's Workspace Head can approve "
+                    "and lock a baseline."
+                )},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        existing_lock = getattr(project, 'baseline_lock', None)
+        if existing_lock is not None:
+            return Response(
+                {'detail': f"This deal's baseline was already locked on {existing_lock.locked_at:%Y-%m-%d}."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        analysis = project.latest_analysis
+        if analysis is None or not analysis.injected_values_snapshot:
+            return Response(
+                {'detail': (
+                    "This deal has no downloaded Excel yet to lock as a baseline — "
+                    "download it at least once, then lock it."
+                )},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Per the client's explicit instruction: hash ONLY the JSON
+        # snapshot (never the .xlsx bytes, never the full metrics blob —
+        # see ExcelBaselineLock's own docstring). sort_keys=True so the
+        # hash is stable regardless of dict insertion/JSONField round-trip
+        # ordering — the same logical snapshot must always hash identically.
+        snapshot_json = json.dumps(analysis.injected_values_snapshot, sort_keys=True)
+        snapshot_sha256 = hashlib.sha256(snapshot_json.encode('utf-8')).hexdigest()
+
+        with transaction.atomic():
+            lock = ExcelBaselineLock.objects.create(
+                project=project,
+                analysis=analysis,
+                locked_by=request.user,
+                snapshot_sha256=snapshot_sha256,
+            )
+
+        return Response({
+            'id': lock.id,
+            'locked_at': lock.locked_at.isoformat(),
+            'locked_by': request.user.email,
+            'analysis_id': analysis.id,
+            'snapshot_sha256': lock.snapshot_sha256,
+        }, status=status.HTTP_201_CREATED)
 
 
 class TeamNoteListCreateView(APIView):
@@ -2553,18 +2696,45 @@ def _normalize_value_for_compare(value):
     return str(value).strip()
 
 
+def _variance_pct(original_value, current_value):
+    """
+    Feature 1 (Variance & Change Ledger) extension: percentage change
+    between a tracked field's snapshotted value and its re-uploaded
+    current value — fed the RAW values (before _normalize_value_for_compare
+    stringifies them), so a real int/float is still recognizable as one.
+
+    Returns None — never a fabricated number — for anything that isn't a
+    genuine before/after percentage comparison: either side missing or not
+    a real number, either side a bool (bool is technically an int subclass
+    in Python, but "True -> False" is not a percentage change), or a zero
+    original (a %-change FROM zero is undefined, not infinite-and-worth-
+    flagging). This covers every text/date tracked field (IU_PropertyName,
+    IU_Row_LeaseStart, etc.) automatically, with no field-name allowlist to
+    maintain — they just never produce a variance_pct.
+    """
+    if isinstance(original_value, bool) or isinstance(current_value, bool):
+        return None
+    if not isinstance(original_value, (int, float)) or not isinstance(current_value, (int, float)):
+        return None
+    if original_value == 0:
+        return None
+    return round(abs(current_value - original_value) / abs(original_value) * 100, 2)
+
+
 def _serialize_override_upload(upload):
     return {
         'id': upload.id,
         'uploaded_at': upload.uploaded_at.isoformat(),
         'uploaded_by': upload.uploaded_by.email if upload.uploaded_by else None,
         'original_filename': upload.original_filename,
+        'is_post_lock_revision': upload.is_post_lock_revision,
         'deltas': [
             {
                 'field_name': d.field_name,
                 'row_index': d.row_index,
                 'original_value': d.original_value,
                 'new_value': d.new_value,
+                'variance_pct': d.variance_pct,
             }
             for d in upload.deltas.all()
         ],
@@ -2666,6 +2836,7 @@ class ExcelOverrideCheckView(APIView):
                 deltas.append({
                     'field_name': name, 'row_index': None,
                     'original_value': original_str, 'new_value': current_str,
+                    'variance_pct': _variance_pct(original_value, current_value),
                 })
 
         # Rows — same anchor cell as a scalar, one row further down per
@@ -2678,12 +2849,14 @@ class ExcelOverrideCheckView(APIView):
                 for name in row_field_names:
                     sheet_name, anchor_row, col = resolved_names[name]
                     current_value = workbook[sheet_name].cell(row=anchor_row + i, column=col).value
-                    original_str = _normalize_value_for_compare(original_row.get(name))
+                    original_raw = original_row.get(name)
+                    original_str = _normalize_value_for_compare(original_raw)
                     current_str = _normalize_value_for_compare(current_value)
                     if original_str != current_str:
                         deltas.append({
                             'field_name': name, 'row_index': i,
                             'original_value': original_str, 'new_value': current_str,
+                            'variance_pct': _variance_pct(original_raw, current_value),
                         })
 
         with transaction.atomic():
@@ -2692,6 +2865,15 @@ class ExcelOverrideCheckView(APIView):
                 analysis=analysis,
                 uploaded_by=request.user,
                 original_filename=getattr(uploaded_file, 'name', '') or '',
+                # Feature 2 (Immutable Snapshots) extension: labels this
+                # upload as a post-lock "child version branch" when the
+                # deal already has a baseline lock at the moment of this
+                # re-upload — see ExcelOverrideUpload.is_post_lock_revision
+                # and ExcelBaselineLock's own docstring. Checked via
+                # hasattr rather than a query — baseline_lock is a
+                # OneToOneField reverse accessor that raises
+                # RelatedObjectDoesNotExist (not returning None) when unset.
+                is_post_lock_revision=hasattr(project, 'baseline_lock'),
             )
             ExcelOverrideDelta.objects.bulk_create([
                 ExcelOverrideDelta(
@@ -2700,6 +2882,7 @@ class ExcelOverrideCheckView(APIView):
                     row_index=d['row_index'],
                     original_value=d['original_value'],
                     new_value=d['new_value'],
+                    variance_pct=d['variance_pct'],
                 )
                 for d in deltas
             ])
@@ -2728,3 +2911,80 @@ class ExcelOverrideHistoryView(APIView):
         ).prefetch_related('deltas').order_by('-uploaded_at')
 
         return Response({'uploads': [_serialize_override_upload(u) for u in uploads]})
+
+
+# Feature 1 (Variance & Change Ledger) extension: per the client's explicit
+# decision, the firm-wide PROACTIVE alert feed below is deliberately
+# narrower than the full 18-scalar/13-row Cell Override Audit Log (every
+# tracked field keeps being diffed and logged per-deal regardless — see
+# ExcelOverrideCheckView above) — only these three fields, labeled for
+# display, ever surface here.
+OVERRIDE_ALERT_TRACKED_FIELDS = {
+    'IU_AnnualizedGPR': 'Annualized GPR',
+    'IU_TotalOperatingExpenses': 'Total Operating Expenses',
+    'IU_NetOperatingIncome': 'Net Operating Income',
+}
+OVERRIDE_ALERT_THRESHOLD_PCT = 2.0
+
+
+class OverrideAlertFeedView(APIView):
+    """
+    Feature 1 (Variance & Change Ledger) extension: a firm-wide, proactive
+    feed of Cell Override changes that (a) touch GPR, OpEx, or NOI and (b)
+    exceed OVERRIDE_ALERT_THRESHOLD_PCT — surfaced here so a Master/Head
+    dashboard can show "something worth a second look happened somewhere
+    in the pipeline" WITHOUT opening individual deals, exactly as scoped.
+
+    Reuses visible_projects_for() verbatim rather than inventing a new
+    permission function or a parallel isolation system — that's the
+    client's own explicit decision on the related Feature 4 ("our existing
+    Org -> Team Workspace -> Analyst/Head hierarchy already gives us the
+    exact 'need-to-know' isolation we want"), and it applies just as
+    cleanly here: for an org admin or workspace head, "firm-wide" already
+    means every deal in their org/workspace through that same function;
+    for a plain analyst it means only their own deals. No special case.
+
+    Capped at the 200 most recent qualifying changes — a dashboard feed,
+    not a full export (ExcelOverrideHistoryView above already gives the
+    complete, uncapped per-deal history for anyone who opens a deal).
+    URL: GET /api/ai/pipeline/override-alerts/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .permissions import visible_projects_for
+        from .models import ExcelOverrideDelta
+
+        projects = visible_projects_for(request.user)
+
+        deltas = (
+            ExcelOverrideDelta.objects
+            .filter(
+                field_name__in=OVERRIDE_ALERT_TRACKED_FIELDS,
+                variance_pct__isnull=False,
+                variance_pct__gt=OVERRIDE_ALERT_THRESHOLD_PCT,
+                upload__project__in=projects,
+            )
+            .select_related('upload', 'upload__uploaded_by', 'upload__project', 'upload__project__workspace')
+            .order_by('-upload__uploaded_at')[:200]
+        )
+
+        alerts = [
+            {
+                'delta_id': d.id,
+                'upload_id': d.upload_id,
+                'uploaded_at': d.upload.uploaded_at.isoformat(),
+                'uploaded_by': d.upload.uploaded_by.email if d.upload.uploaded_by else None,
+                'project_id': d.upload.project_id,
+                'property_name': d.upload.project.property_name,
+                'workspace_name': d.upload.project.workspace.name if d.upload.project.workspace_id else None,
+                'field_name': d.field_name,
+                'field_label': OVERRIDE_ALERT_TRACKED_FIELDS[d.field_name],
+                'original_value': d.original_value,
+                'new_value': d.new_value,
+                'variance_pct': d.variance_pct,
+            }
+            for d in deltas
+        ]
+
+        return Response({'alerts': alerts, 'threshold_pct': OVERRIDE_ALERT_THRESHOLD_PCT})
