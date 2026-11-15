@@ -1197,6 +1197,74 @@ class MyOrganizationExcelTemplateView(APIView):
 # ultimately touch the same TeamWorkspace/CustomUser rows.
 # ---------------------------------------------------------------------------
 
+class MyOrganizationDebtAssumptionsView(APIView):
+    """
+    Sprint "Workflow Upgrades" Feature 5 (Automatic Loan Sizing & DSCR
+    Check): org-wide debt sizing defaults (target_ltv, interest_rate,
+    amortization_years, min_dscr) — see Organization.debt_assumptions /
+    get_debt_assumptions() in models.py. Mirrors
+    MyOrganizationExcelTemplateView's pattern exactly: GET open to any
+    authenticated member of the org (an analyst needs to see the same
+    assumptions the DSCR figures on a deal were computed with), PATCH
+    (edit) gated to the org's own admin (role='admin') in Workspace
+    Settings.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def _forbidden_unless_org_admin(self, request):
+        if request.user.organization_id is None:
+            return Response({'detail': 'This account has no organization.'}, status=status.HTTP_400_BAD_REQUEST)
+        if request.user.role != 'admin':
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+        return None
+
+    def get(self, request):
+        if request.user.organization_id is None:
+            return Response({'detail': 'This account has no organization.'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(request.user.organization.get_debt_assumptions())
+
+    def patch(self, request):
+        denied = self._forbidden_unless_org_admin(request)
+        if denied:
+            return denied
+
+        org = request.user.organization
+        current = org.get_debt_assumptions()
+        # Each bound deliberately generous (not just ">0") — these feed
+        # a mortgage-constant/DSCR formula on every future deal in the
+        # org, so a typo (e.g. a 0.065% rate instead of 6.5%) is caught
+        # here rather than silently producing a nonsensical max loan on
+        # every deal until someone notices.
+        field_bounds = {
+            'target_ltv': (0.0, 100.0, "a percentage from 0-100"),
+            'interest_rate': (0.0, 30.0, "a percentage from 0-30"),
+            'amortization_years': (1, 50, "a whole number of years from 1-50"),
+            'min_dscr': (0.5, 5.0, "a number from 0.5-5"),
+        }
+        updated = dict(current)
+        errors = {}
+        for key, (lo, hi, hint) in field_bounds.items():
+            if key not in request.data:
+                continue
+            raw = request.data.get(key)
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                errors[key] = f"Must be a number ({hint})."
+                continue
+            if value < lo or value > hi:
+                errors[key] = f"Must be {hint}."
+                continue
+            updated[key] = int(value) if key == 'amortization_years' else value
+
+        if errors:
+            return Response({'detail': 'Invalid debt assumptions.', 'errors': errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        org.debt_assumptions = updated
+        org.save(update_fields=['debt_assumptions'])
+        return Response(org.get_debt_assumptions())
+
+
 def _serialize_workspace(workspace):
     return {
         'id': workspace.id,

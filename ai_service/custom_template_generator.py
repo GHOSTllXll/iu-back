@@ -115,6 +115,15 @@ SCALAR_FIELD_CATALOG = {
     # tracking, not just OpEx.
     'IU_TotalOperatingExpenses': lambda m, d: safe_get(m, 't12_revenue_expenses', 'total_operating_expenses'),
     'IU_NetOperatingIncome': lambda m, d: safe_get(m, 't12_revenue_expenses', 'net_operating_income'),
+    # Sprint "Workflow Upgrades" Feature 2 (Seller vs. Underwritten table):
+    # EGI (Effective Gross Income) wasn't previously a named/tracked field —
+    # total_operating_revenue already IS the T12's EGI figure
+    # (net_rental_income + other_income), it just had no IU_* named range of
+    # its own yet. Adding it here is what makes it trackable/overridable via
+    # Cell Override the same way GPR/OpEx/NOI already are, so the Seller vs.
+    # Underwritten table can show a real "latest re-uploaded" EGI value
+    # rather than only ever showing the frozen baseline.
+    'IU_TotalOperatingRevenue': lambda m, d: safe_get(m, 't12_revenue_expenses', 'total_operating_revenue'),
     # Buyer-entered financing assumptions (see _parse_debt_assumptions in
     # views.py) — not derived from source documents, same caveat that
     # applies to these three everywhere else they're used.

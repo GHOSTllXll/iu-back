@@ -12,7 +12,8 @@ from .views import (LoginView, LogoutView, CurrentUserView, AdminCreateUserView,
                     MyOrganizationWorkspacesView, MyOrganizationWorkspaceDetailView,
                     MyOrganizationMembersView, MyOrganizationMemberWorkspaceView,
                     AdminOrganizationWorkspacesView, AdminOrganizationWorkspaceDetailView,
-                    AdminOrganizationUserWorkspaceView, WorkspaceUsageView)
+                    AdminOrganizationUserWorkspaceView, WorkspaceUsageView,
+                    MyOrganizationDebtAssumptionsView)
 from ai_service.urls import urlpatterns as ai_urls
 
 urlpatterns = [
@@ -60,6 +61,10 @@ urlpatterns = [
     # Self-serve counterpart to the admin-only endpoints above, scoped to the
     # calling user's own organization (see MyOrganizationExcelTemplateView).
     path('organization/excel-template/', MyOrganizationExcelTemplateView.as_view(), name='my_excel_template'),
+
+    # Sprint "Workflow Upgrades" Feature 5: org-wide debt sizing defaults —
+    # see MyOrganizationDebtAssumptionsView's docstring.
+    path('organization/debt-assumptions/', MyOrganizationDebtAssumptionsView.as_view(), name='my_debt_assumptions'),
 
     # Feature 3 (Enterprise Pipeline & Workflow Dashboard): Team Workspace
     # management — self-serve (scoped to the calling org-admin's own org)

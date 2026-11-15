@@ -92,7 +92,8 @@ def record_processed_ppm_document(organization, uploaded_by, ppm_file, status: s
 
 def record_analysis_report(organization, uploaded_by, metrics: dict, tier: str,
                             processing_seconds: float = None, document_type: str = 'CRE',
-                            project_id=None, rent_roll_data=None, t12_monthly_data=None):
+                            project_id=None, rent_roll_data=None, t12_monthly_data=None,
+                            asking_price=None, documents_provided=None):
     """
     Saves a completed analysis result for later review on the Outputs page.
     Also the source of truth for upload-quota counting (see views.py) — one
@@ -134,6 +135,19 @@ def record_analysis_report(organization, uploaded_by, metrics: dict, tier: str,
     applicable/available — e.g. PPM analyses, or a T12 format Module 7 can't
     parse monthly columns from); a row missing one simply can't support
     historical regeneration of that part later.
+
+    Sprint "Workflow Upgrades" Feature 1:
+
+    - asking_price: the analyst's own entered/confirmed price for THIS deal
+      (from the upload screen's "Target Purchase Price" field, or the
+      download screen's). None means "the analyst didn't enter one for this
+      run" — never written over an existing PropertyProject.asking_price in
+      that case, so a later run with no price typed in doesn't blank out a
+      price an earlier run already recorded. Only applied when truthy.
+    - documents_provided: {"om": bool, "t12": bool, "rent_roll": bool} for
+      THIS run specifically — see AnalysisReport.documents_provided's own
+      docstring in models.py. Defaults to {} (not None) on the row so
+      reader code's dict.get(...) calls never hit a None.
     """
     from .models import AnalysisReport, PropertyProject
 
@@ -158,7 +172,14 @@ def record_analysis_report(organization, uploaded_by, metrics: dict, tier: str,
             workspace=getattr(uploaded_by, 'workspace', None),
             property_name=property_name,
             created_by=uploaded_by,
+            asking_price=asking_price,
         )
+    elif asking_price:
+        # Existing project, re-analyzed: only overwrite when THIS run
+        # actually supplied a price — never null out a previously-recorded
+        # one just because this particular re-upload left the field blank.
+        project.asking_price = asking_price
+        project.save(update_fields=['asking_price'])
 
     AnalysisReport.objects.create(
         organization=organization,
@@ -172,4 +193,5 @@ def record_analysis_report(organization, uploaded_by, metrics: dict, tier: str,
         status='ready',
         rent_roll_data=rent_roll_data,
         t12_monthly_data=t12_monthly_data,
+        documents_provided=documents_provided or {},
     )

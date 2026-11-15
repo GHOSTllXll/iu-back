@@ -110,7 +110,17 @@ def extract_document_text(doc_file) -> str:
     """
     Routes a document (OM or T12) to the right parser based on its extension.
     Supports: .pdf, .doc, .docx
+
+    Sprint "Workflow Upgrades" Feature 1 (Missing Doc Check): doc_file may
+    now legitimately be None — a partial submission (1 or 2 of the 3 core
+    documents) that process_underwriting_files allows through. Returns ""
+    immediately rather than crashing on doc_file.name; the caller is
+    responsible for substituting an explicit "[NOT PROVIDED]" marker in
+    the AI prompt so missing fields come back null rather than guessed.
     """
+    if doc_file is None:
+        return ""
+
     ext = validate_uploaded_file(doc_file, ALLOWED_DOC_EXTENSIONS, label=doc_file.name)
 
     if ext == '.pdf':
@@ -125,7 +135,13 @@ def extract_document_text(doc_file) -> str:
 def extract_t12_text(t12_file) -> str:
     """
     T12 can legitimately be a PDF/Word doc OR an Excel/CSV file — route based on extension.
+
+    Sprint "Workflow Upgrades" Feature 1: same None-tolerance as
+    extract_document_text above, and for the same reason.
     """
+    if t12_file is None:
+        return ""
+
     ext = os.path.splitext(t12_file.name)[1].lower()
 
     if ext in ALLOWED_EXCEL_EXTENSIONS:

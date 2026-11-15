@@ -25,6 +25,7 @@ failed task never leaks a file on disk.
 """
 import os
 import logging
+import contextlib
 
 from celery import shared_task
 from django.core.files import File
@@ -64,7 +65,7 @@ def _load_user_and_org(uploaded_by_id):
 @shared_task(bind=True, name='ai_service.run_cre_underwriting_task')
 def run_cre_underwriting_task(self, om_path, om_name, t12_path, t12_name,
                                 rent_roll_path, rent_roll_name, tier, uploaded_by_id,
-                                project_id=None):
+                                project_id=None, asking_price=None):
     """
     Background counterpart to the CRE/Multifamily pipeline. Imports
     process_underwriting_files from views.py INSIDE the function body
@@ -77,21 +78,40 @@ def run_cre_underwriting_task(self, om_path, om_name, t12_path, t12_name,
     rather than a required positional, so any task already enqueued before
     this parameter existed — e.g. still sitting in the broker across a
     deploy — keeps deserializing and running correctly.
+
+    Sprint "Workflow Upgrades" Feature 1 (Missing Doc Check): any of
+    om_path/t12_path/rent_roll_path (and its matching _name) may now be
+    None — _save_upload_to_temp (views.py) returns (None, None) for a
+    document the analyst didn't submit, rather than always writing all 3
+    temp files. Opened conditionally below via contextlib.ExitStack, since
+    a plain `with open(a) as x, open(b) as y:` can't skip one of its
+    managers when that path is None.
+
+    asking_price: forwarded as-is to process_underwriting_files — see its
+    own docstring for exactly how it's used/persisted. None (the default)
+    matches every task already enqueued before this parameter existed,
+    same reasoning as project_id above.
     """
     from .views import process_underwriting_files
 
     uploaded_by, organization = _load_user_and_org(uploaded_by_id)
 
     try:
-        with open(om_path, 'rb') as f_om, open(t12_path, 'rb') as f_t12, open(rent_roll_path, 'rb') as f_rr:
-            om_file = File(f_om, name=om_name)
-            t12_file = File(f_t12, name=t12_name)
-            rent_roll_file = File(f_rr, name=rent_roll_name)
+        with contextlib.ExitStack() as stack:
+            om_file = None
+            if om_path:
+                om_file = File(stack.enter_context(open(om_path, 'rb')), name=om_name)
+            t12_file = None
+            if t12_path:
+                t12_file = File(stack.enter_context(open(t12_path, 'rb')), name=t12_name)
+            rent_roll_file = None
+            if rent_roll_path:
+                rent_roll_file = File(stack.enter_context(open(rent_roll_path, 'rb')), name=rent_roll_name)
 
-            metrics, rent_roll_df, error = process_underwriting_files(
+            metrics, rent_roll_df, error, deal_scorecard = process_underwriting_files(
                 om_file, t12_file, rent_roll_file, tier=tier,
                 organization=organization, uploaded_by=uploaded_by,
-                project_id=project_id,
+                project_id=project_id, asking_price=asking_price,
             )
 
         if error:
@@ -103,7 +123,13 @@ def run_cre_underwriting_task(self, om_path, om_name, t12_path, t12_name,
             return {'error': True, 'status_code': error.status_code, 'data': error.data}
 
         analysis_id = store_analysis(metrics, rent_roll_df)
-        return {'error': False, 'metrics': metrics, 'tier': tier, 'analysis_id': analysis_id}
+        return {
+            'error': False, 'metrics': metrics, 'tier': tier, 'analysis_id': analysis_id,
+            # Sprint "Workflow Upgrades" Feature 1: the 10-second Kill-or-
+            # Proceed Scorecard — TaskStatusView passes this dict straight
+            # through to the frontend unchanged (see its own docstring).
+            'deal_scorecard': deal_scorecard,
+        }
     finally:
         _cleanup_temp_files(om_path, t12_path, rent_roll_path)
 

@@ -47,6 +47,7 @@ from .rent_roll_utils import (
     detect_rent_roll_columns,
     ensure_status_column,
     compute_ground_truth,
+    detect_argus_fields,
     RentRollColumnError,
 )
 from .reconciliation import run_reconciliation, run_ppm_reconciliation
@@ -714,10 +715,11 @@ def extract_ppm_json_from_ai_response(ai_response: str) -> dict:
 # SHARED PROCESSING FUNCTION (DRY Principle)
 # ==========================================
 def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TIER_BASIC,
-                                 organization=None, uploaded_by=None, project_id=None):
+                                 organization=None, uploaded_by=None, project_id=None,
+                                 asking_price=None):
     """
     Shared logic for processing files and extracting metrics.
-    Returns: (metrics_dict, rent_roll_df, error_response)
+    Returns: (metrics_dict, rent_roll_df, error_response, deal_scorecard)
 
     `tier` controls whether the 33rd metric (DST/Capex Budget) is requested from
     the AI and whether it's allowed to survive in the response — Basic gets 32
@@ -731,71 +733,130 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
     its docstring for exactly how it's resolved. None (the default) means
     "start a brand-new deal", which is every call site's behavior before
     this parameter existed.
+
+    Sprint "Workflow Upgrades" Feature 1 (10-Second "Kill or Proceed"
+    Scorecard & Missing Doc Check):
+
+    - om_file/t12_file/rent_roll_file may now each individually be None —
+      any NON-EMPTY subset of the three is accepted (at least one document),
+      not just all-three-or-nothing. This lets an analyst run an initial
+      screen on a partial submission (e.g. a broker sends only a Rent Roll
+      + T12, no OM yet) instead of being blocked until every document
+      arrives. Every step below that depends on a specific missing file is
+      skipped cleanly (not an error), and the AI is told exactly which
+      document(s) are absent via a "[NOT PROVIDED]" marker in its prompt —
+      it already has a standing instruction (see _build_system_prompt,
+      "If a metric cannot be found, set its value to null") to null out
+      whatever that marker makes unknowable, rather than guessing.
+    - asking_price: the analyst's own entered/confirmed price for this deal
+      (NOT the AI-extracted deal_valuation.target_purchase_price) —
+      threaded through to the Scorecard's cap-rate/price-per-unit math and
+      persisted onto the PropertyProject record. None when the analyst
+      didn't enter one for this run.
+    - The 4th return value, deal_scorecard, is the 10-second "kill or
+      proceed" read-out itself — see _compute_deal_scorecard's own
+      docstring. Callers that don't need it (the Excel-download path, which
+      always has all 3 files anyway) simply discard it.
+
+    NOTE: this loosened gate applies ONLY to this function (the Analyze/
+    Scorecard path). UnderwritePropertyDownloadView's own direct-
+    reprocessing gate deliberately still requires all 3 files, unchanged —
+    full Excel generation is structurally dependent on a real rent roll
+    DataFrame and isn't part of this feature's scope.
     """
     # Quota check happens BEFORE any parsing/AI work — an org over their limit
     # gets rejected immediately rather than wasting processing on files that
     # were never going to be allowed through.
     quota_error = check_upload_quota(organization, tier)
     if quota_error:
-        return None, None, quota_error
+        return None, None, quota_error, None
+
+    if not any([om_file, t12_file, rent_roll_file]):
+        return None, None, Response(
+            {'error': 'At least one document (OM, T12, or Rent Roll) is required.'},
+            status=status.HTTP_400_BAD_REQUEST
+        ), None
+
+    documents_provided = {
+        'om': om_file is not None,
+        't12': t12_file is not None,
+        'rent_roll': rent_roll_file is not None,
+    }
 
     pipeline_start_time = time.perf_counter()
 
     try:
-        # 1. Parse documents
+        # 1. Parse documents — extract_document_text/extract_t12_text
+        #    (parsers.py) are already None-tolerant and return "" immediately
+        #    for a missing file. extract_data_from_excel is NOT (it's also
+        #    used standalone elsewhere where a rent roll is always required),
+        #    so it's guarded here explicitly instead.
         om_text = extract_document_text(om_file)
         t_after_om = time.perf_counter()
         t12_text = extract_t12_text(t12_file)
         t_after_t12 = time.perf_counter()
-        rent_roll_text = extract_data_from_excel(rent_roll_file)
+        rent_roll_text = extract_data_from_excel(rent_roll_file) if rent_roll_file is not None else ""
         t_after_rr_text = time.perf_counter()
+
         # 2. Parse Excel into DataFrame — uses header-row detection instead of
         #    blindly assuming row 0 (real rent rolls often have a title row
-        #    above the actual column headers).
-        rent_roll_df = read_excel_with_header_detection(rent_roll_file)
-        rent_roll_df = rent_roll_df.dropna(how='all').dropna(axis=1, how='all')
-
-        if rent_roll_df.empty:
-            raise FileValidationError("Rent roll has no usable rows after cleaning.")
-
-        # 2a. Detect + reshape "charge ledger" format rent rolls (multiple
-        # rows per unit, one per charge type) into the standard one-row-
-        # per-unit shape. Applies to all tiers — this is format support,
-        # not a premium feature. If the file isn't in this format,
-        # detect_charge_ledger_columns returns None and nothing changes.
-        ledger_cols = detect_charge_ledger_columns(rent_roll_df)
-        if ledger_cols and 'rent' not in [str(c).lower() for c in rent_roll_df.columns]:
-            # Only reshape if there's no ALREADY-simple rent column — a file
-            # that has both a real "Rent" column AND coincidentally a
-            # "Charge"/"Amount" pair (unlikely, but possible) shouldn't be
-            # reshaped unnecessarily.
-            reshaped = reshape_charge_ledger(rent_roll_df, ledger_cols)
-            if not reshaped.empty:
-                rent_roll_df = reshaped
-        # 2b. Strip likely totals/summary rows (e.g. a trailing "Totals" row
-        # with a SUM-of-all-units rent value that would otherwise corrupt
-        # AVERAGE()-based metrics). Applied for every tier, not just
-        # Enterprise — this is a data-integrity fix, not a premium feature.
-        rent_col_for_cleanup = detect_rent_column(rent_roll_df)
-        rent_roll_df, excluded_rows = strip_rent_outlier_rows(rent_roll_df, rent_col_for_cleanup)
+        #    above the actual column headers). Skipped entirely when no rent
+        #    roll was submitted: rent_roll_df stays an EMPTY DataFrame, which
+        #    every downstream consumer below is made to tolerate explicitly.
         rent_roll_cleanup_note = None
-        if excluded_rows:
-            rent_roll_cleanup_note = (
-                f"{len(excluded_rows)} row(s) were excluded from the rent roll as likely "
-                f"totals/summary rows (rent value far above the median of other rows) — "
-                f"not counted as real units."
-            )
+        if rent_roll_file is not None:
+            rent_roll_df = read_excel_with_header_detection(rent_roll_file)
+            rent_roll_df = rent_roll_df.dropna(how='all').dropna(axis=1, how='all')
+
+            if rent_roll_df.empty:
+                raise FileValidationError("Rent roll has no usable rows after cleaning.")
+
+            # 2a. Detect + reshape "charge ledger" format rent rolls (multiple
+            # rows per unit, one per charge type) into the standard one-row-
+            # per-unit shape. Applies to all tiers — this is format support,
+            # not a premium feature. If the file isn't in this format,
+            # detect_charge_ledger_columns returns None and nothing changes.
+            ledger_cols = detect_charge_ledger_columns(rent_roll_df)
+            if ledger_cols and 'rent' not in [str(c).lower() for c in rent_roll_df.columns]:
+                # Only reshape if there's no ALREADY-simple rent column — a file
+                # that has both a real "Rent" column AND coincidentally a
+                # "Charge"/"Amount" pair (unlikely, but possible) shouldn't be
+                # reshaped unnecessarily.
+                reshaped = reshape_charge_ledger(rent_roll_df, ledger_cols)
+                if not reshaped.empty:
+                    rent_roll_df = reshaped
+            # 2b. Strip likely totals/summary rows (e.g. a trailing "Totals" row
+            # with a SUM-of-all-units rent value that would otherwise corrupt
+            # AVERAGE()-based metrics). Applied for every tier, not just
+            # Enterprise — this is a data-integrity fix, not a premium feature.
+            rent_col_for_cleanup = detect_rent_column(rent_roll_df)
+            rent_roll_df, excluded_rows = strip_rent_outlier_rows(rent_roll_df, rent_col_for_cleanup)
+            if excluded_rows:
+                rent_roll_cleanup_note = (
+                    f"{len(excluded_rows)} row(s) were excluded from the rent roll as likely "
+                    f"totals/summary rows (rent value far above the median of other rows) — "
+                    f"not counted as real units."
+                )
+        else:
+            rent_roll_df = pd.DataFrame()
         t_after_rr_processing = time.perf_counter()
+
+        _NOT_PROVIDED_MARKER = (
+            "[NOT PROVIDED — this document was not submitted for this run. "
+            "Per your instructions, set every field that depends on it to "
+            "null rather than estimating or inferring it from the other "
+            "documents.]"
+        )
 
         combined_context = f"""
         OFFERING MEMORANDUM (OM) EXTRACT:
-        {om_text}
+        {om_text if om_file is not None else _NOT_PROVIDED_MARKER}
 
         T12 STATEMENT EXTRACT:
-        {t12_text}
+        {t12_text if t12_file is not None else _NOT_PROVIDED_MARKER}
 
         RENT ROLL EXTRACT:
-        {rent_roll_text}
+        {rent_roll_text if rent_roll_file is not None else _NOT_PROVIDED_MARKER}
         """
 
         system_prompt = _build_system_prompt(tier)
@@ -825,30 +886,38 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         #    same data source the Excel formulas use — so a flag here reflects
         #    a real document mismatch, not the AI disagreeing with itself.
         if tier in TIERS_WITH_RECONCILIATION:
-            try:
-                rent_col, status_col, tenant_col = detect_rent_roll_columns(rent_roll_df)
-                status_col, was_inferred = ensure_status_column(rent_roll_df, status_col, tenant_col)
-                ground_truth = compute_ground_truth(rent_roll_df, rent_col, status_col)
-                flags = run_reconciliation(metrics, rent_roll_df, ground_truth)
-                metrics["reconciliation"] = {"flags": flags}
-                if was_inferred:
-                    # Occupancy wasn't explicitly stated in the rent roll — it was
-                    # inferred from whether the Tenant field was populated. Real,
-                    # but a genuine inference rather than a stated fact, so the
-                    # user should know the ground truth carries that caveat.
-                    metrics["reconciliation"]["note"] = (
-                        "Occupancy was inferred from the Tenant column (no explicit "
-                        "Status column found in the rent roll) — populated tenant name "
-                        "= occupied, blank/vacant = vacant."
-                    )
-            except RentRollColumnError as e:
-                # Don't fail the whole request over reconciliation specifically —
-                # the core extraction still succeeded. Surface it as a soft note
-                # instead. (Excel generation will raise its own clear error later
-                # if the rent roll truly can't be mapped.)
+            if rent_roll_file is not None:
+                try:
+                    rent_col, status_col, tenant_col = detect_rent_roll_columns(rent_roll_df)
+                    status_col, was_inferred = ensure_status_column(rent_roll_df, status_col, tenant_col)
+                    ground_truth = compute_ground_truth(rent_roll_df, rent_col, status_col)
+                    flags = run_reconciliation(metrics, rent_roll_df, ground_truth)
+                    metrics["reconciliation"] = {"flags": flags}
+                    if was_inferred:
+                        # Occupancy wasn't explicitly stated in the rent roll — it was
+                        # inferred from whether the Tenant field was populated. Real,
+                        # but a genuine inference rather than a stated fact, so the
+                        # user should know the ground truth carries that caveat.
+                        metrics["reconciliation"]["note"] = (
+                            "Occupancy was inferred from the Tenant column (no explicit "
+                            "Status column found in the rent roll) — populated tenant name "
+                            "= occupied, blank/vacant = vacant."
+                        )
+                except RentRollColumnError as e:
+                    # Don't fail the whole request over reconciliation specifically —
+                    # the core extraction still succeeded. Surface it as a soft note
+                    # instead. (Excel generation will raise its own clear error later
+                    # if the rent roll truly can't be mapped.)
+                    metrics["reconciliation"] = {
+                        "flags": [],
+                        "note": f"Reconciliation could not run: {str(e)}"
+                    }
+            else:
+                # Sprint "Workflow Upgrades" Feature 1: no rent roll submitted —
+                # there's no ground truth to reconcile against at all.
                 metrics["reconciliation"] = {
                     "flags": [],
-                    "note": f"Reconciliation could not run: {str(e)}"
+                    "note": "Reconciliation skipped: no rent roll was submitted.",
                 }
 
         t_after_module1 = time.perf_counter()
@@ -920,42 +989,57 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         t12_df_for_persistence = None
 
         if tier in TIERS_WITH_VARIANCE_ANALYSIS:
-            try:
-                t12_ext = os.path.splitext(t12_file.name)[1].lower()
-                if t12_ext in ('.xlsx', '.xls', '.csv'):
-                    t12_file.seek(0)  # already consumed once by extract_t12_text() above
-                    t12_df = read_excel_with_header_detection(t12_file)
-                    t12_df_for_persistence = t12_df
-                    rent_col_va, status_col_va, tenant_col_va = detect_rent_roll_columns(rent_roll_df)
-                    variance_result = run_variance_analysis(t12_df, rent_roll_df, unit_col=tenant_col_va)
-                    metrics["variance_analysis"] = variance_result
+            if t12_file is None or rent_roll_file is None:
+                # Sprint "Workflow Upgrades" Feature 1: this module pairs a
+                # parsed T12 monthly grid against the rent roll — needs BOTH,
+                # so a partial submission missing either one skips cleanly
+                # rather than crashing on a None file.
+                _missing_for_variance = [
+                    label for file_obj, label in ((t12_file, "T12"), (rent_roll_file, "Rent Roll"))
+                    if file_obj is None
+                ]
+                _variance_skip_reason = (
+                    f"Skipped: {' and '.join(_missing_for_variance)} not submitted for this run."
+                )
+                metrics["variance_analysis"] = {"skipped": True, "reason": _variance_skip_reason}
+                metrics["line_item_anomalies"] = {"skipped": True, "reason": _variance_skip_reason}
+            else:
+                try:
+                    t12_ext = os.path.splitext(t12_file.name)[1].lower()
+                    if t12_ext in ('.xlsx', '.xls', '.csv'):
+                        t12_file.seek(0)  # already consumed once by extract_t12_text() above
+                        t12_df = read_excel_with_header_detection(t12_file)
+                        t12_df_for_persistence = t12_df
+                        rent_col_va, status_col_va, tenant_col_va = detect_rent_roll_columns(rent_roll_df)
+                        variance_result = run_variance_analysis(t12_df, rent_roll_df, unit_col=tenant_col_va)
+                        metrics["variance_analysis"] = variance_result
 
-                    # Generalized (any-line-item) anomaly scan feeding the
-                    # workbook's separate 'Monthly Variance' tab — reuses
-                    # this exact same already-parsed t12_df, no extra file
-                    # I/O, and is fully independent of Module 7 above (see
-                    # variance_analysis.run_line_item_anomaly_scan).
-                    metrics["line_item_anomalies"] = run_line_item_anomaly_scan(t12_df)
-                else:
+                        # Generalized (any-line-item) anomaly scan feeding the
+                        # workbook's separate 'Monthly Variance' tab — reuses
+                        # this exact same already-parsed t12_df, no extra file
+                        # I/O, and is fully independent of Module 7 above (see
+                        # variance_analysis.run_line_item_anomaly_scan).
+                        metrics["line_item_anomalies"] = run_line_item_anomaly_scan(t12_df)
+                    else:
+                        metrics["variance_analysis"] = {
+                            "skipped": True,
+                            "reason": "Reconciliation Skipped: Source Document Lacks Monthly Granularity (PDF T12 not supported for this analysis).",
+                        }
+                        metrics["line_item_anomalies"] = {
+                            "skipped": True,
+                            "reason": "Monthly Variance Skipped: Source Document Lacks Monthly Granularity (PDF T12 not supported for this analysis).",
+                        }
+                except Exception as e:
+                    # Never let this optional module crash the whole analysis —
+                    # same principle as Module 1's RentRollColumnError handling.
                     metrics["variance_analysis"] = {
                         "skipped": True,
-                        "reason": "Reconciliation Skipped: Source Document Lacks Monthly Granularity (PDF T12 not supported for this analysis).",
+                        "reason": f"Variance analysis could not run: {str(e)}",
                     }
                     metrics["line_item_anomalies"] = {
                         "skipped": True,
-                        "reason": "Monthly Variance Skipped: Source Document Lacks Monthly Granularity (PDF T12 not supported for this analysis).",
+                        "reason": f"Monthly variance scan could not run: {str(e)}",
                     }
-            except Exception as e:
-                # Never let this optional module crash the whole analysis —
-                # same principle as Module 1's RentRollColumnError handling.
-                metrics["variance_analysis"] = {
-                    "skipped": True,
-                    "reason": f"Variance analysis could not run: {str(e)}",
-                }
-                metrics["line_item_anomalies"] = {
-                    "skipped": True,
-                    "reason": f"Monthly variance scan could not run: {str(e)}",
-                }
 
         t_after_module7 = time.perf_counter()
 
@@ -966,6 +1050,15 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         # is transparency about data quality, not a gated feature.
         if rent_roll_cleanup_note:
             metrics["data_quality_note"] = rent_roll_cleanup_note
+
+        # Sprint "Workflow Upgrades" Feature 1: the 10-second Kill-or-Proceed
+        # Scorecard — missing-document flags, rent-roll data-quality flags,
+        # and the three quick ratios (in-place cap rate / price-per-unit-or-
+        # SF / opex ratio) — computed from the SAME metrics/rent_roll_df this
+        # run just produced. Re-derived read-only from persisted data later,
+        # whenever this deal's pipeline drawer is reopened (see
+        # PropertyProjectDetailView.get() + _compute_deal_scorecard itself).
+        deal_scorecard = _compute_deal_scorecard(metrics, rent_roll_df, documents_provided, asking_price)
 
         # elapsed_seconds is measured BEFORE the DB writes below, matching
         # the original behavior exactly — this is what powers the "Avg
@@ -984,8 +1077,15 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         _db_write_with_retry(lambda: record_analysis_report(
             organization, uploaded_by, metrics, tier, processing_seconds=elapsed_seconds,
             project_id=project_id,
-            rent_roll_data={"rows": _dataframe_to_json_safe(rent_roll_df)},
+            # Sprint "Workflow Upgrades" Feature 1: explicitly None (NOT an
+            # empty-rows dict) when no rent roll was submitted — can_download
+            # (PropertyProjectDetailView / _serialize_project_summary) relies
+            # on this being falsy for "no rent roll on this run", not merely
+            # an empty one.
+            rent_roll_data={"rows": _dataframe_to_json_safe(rent_roll_df)} if rent_roll_file is not None else None,
             t12_monthly_data={"rows": _dataframe_to_json_safe(t12_df_for_persistence)} if t12_df_for_persistence is not None else None,
+            asking_price=asking_price,
+            documents_provided=documents_provided,
         ))
 
         t_after_db = time.perf_counter()
@@ -1009,11 +1109,11 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
             f"TOTAL (excl. DB writes): {elapsed_seconds:.1f}s"
         )
 
-        return metrics, rent_roll_df, None
+        return metrics, rent_roll_df, None, deal_scorecard
 
     except FileValidationError as e:
         _safe_record_failure(organization, uploaded_by, om_file, t12_file, rent_roll_file)
-        return None, None, Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return None, None, Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST), None
     except AIRateLimitExhausted:
         # Deliberately NOT recorded as 'failed' — this is a transient capacity
         # issue, not something wrong with the documents themselves. The user
@@ -1022,10 +1122,10 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
         return None, None, Response({
             'error': "We're experiencing high demand right now. Please try again in a minute or two.",
             'retryable': True
-        }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        }, status=status.HTTP_503_SERVICE_UNAVAILABLE), None
     except Exception as e:
         _safe_record_failure(organization, uploaded_by, om_file, t12_file, rent_roll_file)
-        return None, None, Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return None, None, Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR), None
 def _build_system_prompt(tier: str = TIER_BASIC) -> str:
     include_dst_capex = tier in TIERS_WITH_DST_CAPEX
     include_reconciliation = tier in TIERS_WITH_RECONCILIATION
@@ -1423,7 +1523,16 @@ def _save_upload_to_temp(uploaded_file):
     the Celery task, which re-wraps the file in django.core.files.File
     (restoring the .name/.seek() interface the existing parsers expect) and
     deletes the temp file once it's done with it.
+
+    Sprint "Workflow Upgrades" Feature 1 (Missing Doc Check): uploaded_file
+    may now legitimately be None — a partial submission (1 or 2 of the 3
+    core documents). Returns (None, None) immediately in that case rather
+    than crashing on uploaded_file.name; the Celery task (run_cre_
+    underwriting_task) is responsible for not opening a None path.
     """
+    if uploaded_file is None:
+        return None, None
+
     os.makedirs(PENDING_UPLOAD_DIR, exist_ok=True)
     ext = os.path.splitext(uploaded_file.name)[1]
     temp_path = os.path.join(PENDING_UPLOAD_DIR, f"{uuid.uuid4().hex}{ext}")
@@ -1527,8 +1636,19 @@ class UnderwritePropertyView(APIView):
         t12_file = request.FILES.get('t12_file')
         rent_roll_file = request.FILES.get('rent_roll_file')
 
-        if not all([om_file, t12_file, rent_roll_file]):
-            return Response({'error': 'All three files are required.'}, status=status.HTTP_400_BAD_REQUEST)
+        # Sprint "Workflow Upgrades" Feature 1 (Missing Doc Check): loosened
+        # from "all three required" to "at least one" — an analyst can run
+        # an initial screen on a partial submission (e.g. a broker sends
+        # only a Rent Roll + T12, no OM yet). process_underwriting_files
+        # (via the Celery task below) handles whichever subset arrives,
+        # nulling out whatever a missing document makes unknowable rather
+        # than guessing, and the Scorecard it returns flags exactly what's
+        # still missing.
+        if not any([om_file, t12_file, rent_roll_file]):
+            return Response(
+                {'error': 'At least one document (OM, T12, or Rent Roll) is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         tier = get_user_tier(request)
 
@@ -1545,6 +1665,18 @@ class UnderwritePropertyView(APIView):
         except (TypeError, ValueError):
             project_id = None
 
+        # Sprint "Workflow Upgrades" Feature 1: the analyst's own entered/
+        # confirmed asking price for this deal (the upload screen's
+        # "Target Purchase Price" field) — optional, and distinct from
+        # whatever price the OM itself states (see process_underwriting_
+        # files' own docstring, or PropertyProject.asking_price in
+        # models.py, for exactly why these are kept separate).
+        raw_asking_price = request.data.get('asking_price')
+        try:
+            asking_price = float(raw_asking_price) if raw_asking_price not in (None, '') else None
+        except (TypeError, ValueError):
+            asking_price = None
+
         om_path, om_name = _save_upload_to_temp(om_file)
         t12_path, t12_name = _save_upload_to_temp(t12_file)
         rent_roll_path, rent_roll_name = _save_upload_to_temp(rent_roll_file)
@@ -1552,14 +1684,19 @@ class UnderwritePropertyView(APIView):
         try:
             task = run_cre_underwriting_task.delay(
                 om_path, om_name, t12_path, t12_name, rent_roll_path, rent_roll_name,
-                tier, request.user.pk, project_id,
+                tier, request.user.pk, project_id, asking_price,
             )
         except Exception:
             # Enqueueing itself failed (e.g. Redis unreachable) - the temp
             # files we just wrote will never be picked up by a task to clean
             # them, so remove them ourselves rather than leaking them until
-            # the hourly stale-upload cron sweep catches them.
+            # the hourly stale-upload cron sweep catches them. Any of the
+            # three may be None now (Feature 1: partial submissions) —
+            # os.remove(None) would raise TypeError, not OSError, so skip
+            # a None path entirely rather than attempting it.
             for p in (om_path, t12_path, rent_roll_path):
+                if not p:
+                    continue
                 try:
                     os.remove(p)
                 except OSError:
@@ -1759,7 +1896,11 @@ class UnderwritePropertyDownloadView(APIView):
                 )
 
             tier = get_user_tier(request)
-            metrics, rent_roll_df, error = process_underwriting_files(
+            # Sprint "Workflow Upgrades" Feature 1: process_underwriting_files
+            # now returns a 4th value (deal_scorecard) — discarded here, since
+            # this gate above still requires all 3 files unchanged, and Excel
+            # download has no use for the Scorecard anyway.
+            metrics, rent_roll_df, error, _deal_scorecard = process_underwriting_files(
                 om_file, t12_file, rent_roll_file, tier=tier,
                 organization=organization, uploaded_by=request.user
             )
@@ -2364,6 +2505,11 @@ def _serialize_project_summary(project, user=None):
         'analysis_count': project.analyses.count(),
         'can_download': bool(latest and latest.rent_roll_data),
         'updated_at': project.updated_at.isoformat(),
+        # Sprint "Workflow Upgrades" Feature 1: the analyst's own entered/
+        # confirmed price for this deal — see PropertyProject.asking_price's
+        # own docstring in models.py for how this differs from the AI-
+        # extracted deal_valuation.target_purchase_price inside metrics.
+        'asking_price': project.asking_price,
         # Feature 2 (Immutable Snapshots): `user` is optional (None) rather
         # than required, so every pre-existing call site that didn't yet
         # know about this feature still works unchanged — it just gets
@@ -2426,10 +2572,42 @@ class PropertyProjectDetailView(APIView):
         analyses = list(project.analyses.select_related('uploaded_by').order_by('-created_at'))
         latest = analyses[0] if analyses else None
         notes = project.notes.select_related('author').order_by('-created_at')
+        # Feature 2 (Immutable Snapshots) reverse accessor — see
+        # _serialize_project_summary's own comment on why getattr(default)
+        # is required here instead of a plain attribute access.
+        lock = getattr(project, 'baseline_lock', None)
 
         return Response({
             **_serialize_project_summary(project, user=request.user),
             'latest_metrics': latest.metrics if latest else None,
+            # Sprint "Workflow Upgrades" Feature 4 (Broker Offer Email):
+            # the LOCKED analysis's metrics specifically — deliberately
+            # NOT latest.metrics, which can move on past the lock via a
+            # later re-analysis. Null whenever this deal isn't locked.
+            'locked_metrics': lock.analysis.metrics if lock else None,
+            # Sprint "Workflow Upgrades" Feature 2: "Seller vs. Underwritten"
+            # table — see _compute_seller_vs_underwritten()'s own docstring.
+            'seller_vs_underwritten': _compute_seller_vs_underwritten(project, latest),
+            # Sprint "Workflow Upgrades" Feature 5: DSCR-constrained (and,
+            # now that Feature 1 persists an asking_price, LTV-constrained
+            # too) max loan sizing — see _compute_debt_sizing()'s docstring.
+            'debt_sizing': _compute_debt_sizing(
+                project.organization, latest.metrics if latest else None, asking_price=project.asking_price
+            ),
+            # Sprint "Workflow Upgrades" Feature 1: the 10-second Kill-or-
+            # Proceed Scorecard, re-derived from the latest analysis's
+            # PERSISTED data (not re-run against the original files) every
+            # time this deal's pipeline drawer is reopened — see
+            # _compute_deal_scorecard()'s own docstring. rent_roll_df is
+            # rebuilt from AnalysisReport.rent_roll_data the same way the
+            # Cell-Override flow above does (see _compute_seller_vs_underwritten's
+            # neighboring helpers); None-safe when there's no analysis yet.
+            'deal_scorecard': _compute_deal_scorecard(
+                latest.metrics if latest else None,
+                pd.DataFrame((latest.rent_roll_data or {}).get('rows', [])) if latest else None,
+                latest.documents_provided if latest else None,
+                project.asking_price,
+            ),
             'analyses': [
                 {
                     'id': a.id,
@@ -2696,6 +2874,310 @@ def _normalize_value_for_compare(value):
     return str(value).strip()
 
 
+# Sprint "Workflow Upgrades" Feature 2 ("Seller vs. Underwritten" table):
+# the 5 rows shown on the Deal View, in display order. "Vacancy /
+# Concessions" uses IU_TotalAnnualConcessions as its tracked value — the
+# only vacancy-loss-adjacent dollar figure Cell Override already tracks
+# (there's no separately-tracked vacancy-loss-$ field, only the
+# IU_PhysicalOccupancyPct/IU_EconomicOccupancyPct percentages, which aren't
+# dollar figures this table can line up against GPR/EGI/OpEx/NOI).
+SELLER_VS_UNDERWRITTEN_FIELDS = {
+    'IU_AnnualizedGPR': 'GPR',
+    'IU_TotalAnnualConcessions': 'Vacancy / Concessions',
+    'IU_TotalOperatingRevenue': 'EGI',
+    'IU_TotalOperatingExpenses': 'OpEx',
+    'IU_NetOperatingIncome': 'NOI',
+}
+
+
+def _parse_numeric_display_value(display_value):
+    """
+    ExcelOverrideDelta.new_value is intentionally just a stringified
+    display value (see that model's own docstring) — never a second copy
+    of the raw number. For the 5 fields above, which are always currency
+    figures, parse it back to a float for variance math; returns None for
+    anything that isn't cleanly numeric (blank, a date, text) rather than
+    guessing.
+    """
+    if display_value is None or display_value == "":
+        return None
+    try:
+        return float(display_value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compute_seller_vs_underwritten(project, analysis):
+    """
+    Sprint "Workflow Upgrades" Feature 2: Column A (Baseline Extracted) vs
+    Column B (Latest Re-Uploaded/Post-Lock) vs Column C ($/% variance) for
+    the 5 fields in SELLER_VS_UNDERWRITTEN_FIELDS.
+
+    Baseline comes straight from analysis.injected_values_snapshot['scalars']
+    — the values this system itself wrote the last time an Excel was
+    generated, the same source of truth ExcelOverrideCheckView diffs
+    against. "Latest" is the most recent ExcelOverrideDelta for that
+    specific field across EVERY override upload ever submitted for this
+    project/analysis — not just whichever upload is newest overall, since
+    different fields can have last changed on different re-uploads —
+    falling back to the baseline value itself for a field that was never
+    overridden at all. Unlike _variance_pct() below (deliberately
+    unsigned, since it only feeds a ">threshold" alert check), the $/%
+    variance here is signed, since this table's whole point is showing
+    which direction a number moved.
+    """
+    from .models import ExcelOverrideDelta
+
+    if analysis is None or not analysis.injected_values_snapshot:
+        return []
+
+    baseline_scalars = analysis.injected_values_snapshot.get('scalars') or {}
+
+    latest_deltas = {}
+    deltas_qs = (
+        ExcelOverrideDelta.objects
+        .filter(
+            upload__project=project,
+            upload__analysis=analysis,
+            row_index__isnull=True,
+            field_name__in=SELLER_VS_UNDERWRITTEN_FIELDS,
+        )
+        .order_by('-upload__uploaded_at', '-id')
+    )
+    for delta in deltas_qs:
+        latest_deltas.setdefault(delta.field_name, delta)
+
+    rows = []
+    for field_name, label in SELLER_VS_UNDERWRITTEN_FIELDS.items():
+        baseline_value = baseline_scalars.get(field_name)
+        latest_delta = latest_deltas.get(field_name)
+        if latest_delta is not None:
+            current_value = _parse_numeric_display_value(latest_delta.new_value)
+        else:
+            current_value = baseline_value
+
+        dollar_variance = None
+        pct_variance = None
+        if (
+            isinstance(baseline_value, (int, float)) and not isinstance(baseline_value, bool)
+            and isinstance(current_value, (int, float)) and not isinstance(current_value, bool)
+        ):
+            dollar_variance = round(current_value - baseline_value, 2)
+            if baseline_value != 0:
+                pct_variance = round((current_value - baseline_value) / abs(baseline_value) * 100, 2)
+
+        rows.append({
+            'field_name': field_name,
+            'label': label,
+            'baseline_value': baseline_value,
+            'current_value': current_value,
+            'dollar_variance': dollar_variance,
+            'pct_variance': pct_variance,
+        })
+    return rows
+
+
+def _compute_deal_scorecard(metrics, rent_roll_df, documents_provided, asking_price):
+    """
+    Sprint "Workflow Upgrades" Feature 1 (10-Second "Kill or Proceed"
+    Scorecard & Missing Doc Check): the quick read-out an analyst sees
+    immediately after an Analyze run (or whenever a deal's pipeline drawer
+    is reopened later) — which core documents/data points are missing, plus
+    the handful of ratios that can usually be computed even from a partial
+    submission.
+
+    Called from two places with slightly different inputs:
+    - Right after extraction (process_underwriting_files), with the
+      freshly-built rent_roll_df and this run's own documents_provided.
+    - Later, read-only, from PropertyProjectDetailView.get(), rebuilding
+      rent_roll_df from the latest AnalysisReport's persisted rent_roll_data
+      JSON (same pd.DataFrame(... .get('rows', [])) pattern used elsewhere
+      in this file) and its persisted documents_provided/asking_price.
+
+    Every figure here is computed in PYTHON from the underlying extracted
+    numbers — never from an AI-self-reported ratio — same "don't trust a
+    total the AI might also report" principle Module 1/Module 2 above
+    already follow. Anything that can't be computed (a missing input) is
+    None, never estimated.
+
+    metrics/rent_roll_df/documents_provided may each be None/empty (e.g. a
+    brand-new project with no analysis yet) — every branch below tolerates
+    that and simply produces more Nones/flags rather than raising.
+    """
+    metrics = metrics or {}
+    documents_provided = documents_provided or {}
+    rent_roll_df = rent_roll_df if rent_roll_df is not None else pd.DataFrame()
+
+    DOC_LABELS = (('om', 'Offering Memorandum (OM)'), ('t12', 'T12 (Trailing 12-Month Statement)'), ('rent_roll', 'Rent Roll'))
+    # .get(key, True): an ABSENT key means "was provided" — correct for
+    # every row that predates partial uploads (see AnalysisReport.
+    # documents_provided's own docstring in models.py), not just a
+    # coincidental default.
+    missing_documents = [label for key, label in DOC_LABELS if not documents_provided.get(key, True)]
+
+    data_quality_flags = []
+    rent_roll_was_submitted = documents_provided.get('rent_roll', True)
+
+    if rent_roll_was_submitted and not rent_roll_df.empty:
+        try:
+            detect_rent_column(rent_roll_df)
+        except RentRollColumnError:
+            data_quality_flags.append({
+                'code': 'missing_rent_column',
+                'message': "Rent roll has no identifiable in-place contract-rent column.",
+                'email_bullet': "The in-place contract-rent column on the rent roll",
+            })
+
+        try:
+            argus_fields = detect_argus_fields(rent_roll_df)
+        except Exception:
+            argus_fields = {}
+        lease_end_col = argus_fields.get('lease_end_col')
+        total_rows = len(rent_roll_df)
+        if lease_end_col is None:
+            data_quality_flags.append({
+                'code': 'no_lease_end_column',
+                'message': "Rent roll has no identifiable lease-expiration-date column.",
+                'email_bullet': "Lease expiration dates on the rent roll",
+            })
+        elif total_rows > 0:
+            missing_lease_end = int(rent_roll_df[lease_end_col].isna().sum())
+            if missing_lease_end / total_rows > 0.20:
+                pct = round(missing_lease_end / total_rows * 100)
+                data_quality_flags.append({
+                    'code': 'missing_lease_dates',
+                    'message': (
+                        f"{missing_lease_end} of {total_rows} rent roll rows ({pct}%) are "
+                        f"missing a lease-expiration date."
+                    ),
+                    'email_bullet': "Lease expiration dates for the units missing them on the rent roll",
+                })
+
+    t12_section = metrics.get('t12_revenue_expenses') or {}
+    noi = t12_section.get('net_operating_income')
+    opex = t12_section.get('total_operating_expenses')
+    egi = t12_section.get('total_operating_revenue')
+
+    def _is_number(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    opex_ratio = round(opex / egi * 100, 2) if _is_number(opex) and _is_number(egi) and egi else None
+
+    has_asking_price = _is_number(asking_price) and asking_price > 0
+    in_place_cap_rate = round(noi / asking_price * 100, 2) if _is_number(noi) and has_asking_price else None
+
+    property_metadata = metrics.get('property_metadata') or {}
+    total_units = property_metadata.get('total_unit_count')
+    total_sf = (
+        (metrics.get('industrial_metrics') or {}).get('rentable_square_footage')
+        or (metrics.get('office_metrics') or {}).get('building_total_rsf')
+        or (metrics.get('retail_metrics') or {}).get('center_total_gla')
+    )
+
+    price_per_unit_or_sf = None
+    price_per_unit_or_sf_basis = None
+    if has_asking_price and _is_number(total_units) and total_units > 0:
+        price_per_unit_or_sf = round(asking_price / total_units, 2)
+        price_per_unit_or_sf_basis = 'unit'
+    elif has_asking_price and _is_number(total_sf) and total_sf > 0:
+        price_per_unit_or_sf = round(asking_price / total_sf, 2)
+        price_per_unit_or_sf_basis = 'sf'
+
+    return {
+        'documents_provided': {
+            'om': documents_provided.get('om', True),
+            't12': documents_provided.get('t12', True),
+            'rent_roll': documents_provided.get('rent_roll', True),
+        },
+        'missing_documents': missing_documents,
+        'data_quality_flags': data_quality_flags,
+        'asking_price': asking_price,
+        'noi': noi,
+        'in_place_cap_rate': in_place_cap_rate,
+        'price_per_unit_or_sf': price_per_unit_or_sf,
+        'price_per_unit_or_sf_basis': price_per_unit_or_sf_basis,
+        'opex_ratio': opex_ratio,
+        # Convenience for the frontend's "Copy Broker Request Email" button —
+        # every missing-document label plus every data-quality flag's own
+        # bullet text, already in one flat list. Empty means nothing's
+        # missing, i.e. this deal is ready to move past the initial screen.
+        'missing_items_for_email': missing_documents + [f['email_bullet'] for f in data_quality_flags],
+    }
+
+
+def _compute_debt_sizing(organization, metrics, asking_price=None):
+    """
+    Sprint "Workflow Upgrades" Feature 5 (Automatic Loan Sizing & Debt
+    Service Check): standard mortgage-constant DSCR-based max loan sizing,
+    using this org's debt_assumptions (Organization.get_debt_assumptions())
+    and the deal's own extracted T12 NOI.
+
+    max_loan_by_ltv / constrained_max_loan / estimated_dscr (the LTV-
+    constrained half of the client's spec) need a persisted, analyst-
+    entered asking_price on the deal record — Sprint "Workflow Upgrades"
+    Feature 1 added PropertyProject.asking_price for exactly this. All
+    three stay None (never guessed) whenever asking_price isn't available
+    yet for this deal — e.g. an analysis run before Feature 1 shipped, or
+    simply a deal nobody has entered a price for.
+
+    Returns None when there's no usable NOI to size a loan against at all
+    (no analysis yet, or NOI missing/zero/negative).
+    """
+    noi = (metrics or {}).get('t12_revenue_expenses', {}).get('net_operating_income')
+    if not isinstance(noi, (int, float)) or isinstance(noi, bool) or noi <= 0:
+        return None
+
+    assumptions = organization.get_debt_assumptions()
+    interest_rate_pct = assumptions['interest_rate']
+    amortization_years = assumptions['amortization_years']
+    min_dscr = assumptions['min_dscr']
+    target_ltv_pct = assumptions['target_ltv']
+
+    monthly_rate = (interest_rate_pct / 100.0) / 12.0
+    n_payments = amortization_years * 12
+    if monthly_rate == 0:
+        # Degenerate but valid input (0% rate) — straight-line principal
+        # only, no interest component to the mortgage constant.
+        annual_debt_service_per_dollar = 1.0 / amortization_years
+    else:
+        monthly_constant = (
+            (monthly_rate * (1 + monthly_rate) ** n_payments)
+            / (((1 + monthly_rate) ** n_payments) - 1)
+        )
+        annual_debt_service_per_dollar = monthly_constant * 12
+
+    max_loan_by_dscr = (noi / min_dscr) / annual_debt_service_per_dollar
+
+    result = {
+        'noi': noi,
+        'min_dscr': min_dscr,
+        'target_ltv': target_ltv_pct,
+        'interest_rate': interest_rate_pct,
+        'amortization_years': amortization_years,
+        'annual_debt_service_per_dollar': round(annual_debt_service_per_dollar, 6),
+        'max_loan_by_dscr': round(max_loan_by_dscr, 2),
+        'max_loan_by_ltv': None,
+        'constrained_max_loan': None,
+        'estimated_dscr': None,
+    }
+
+    has_asking_price = (
+        isinstance(asking_price, (int, float)) and not isinstance(asking_price, bool) and asking_price > 0
+    )
+    if has_asking_price:
+        max_loan_by_ltv = asking_price * (target_ltv_pct / 100.0)
+        constrained_max_loan = min(max_loan_by_dscr, max_loan_by_ltv)
+        estimated_dscr = (
+            round(noi / (constrained_max_loan * annual_debt_service_per_dollar), 2)
+            if constrained_max_loan > 0 else None
+        )
+        result['max_loan_by_ltv'] = round(max_loan_by_ltv, 2)
+        result['constrained_max_loan'] = round(constrained_max_loan, 2)
+        result['estimated_dscr'] = estimated_dscr
+
+    return result
+
+
 def _variance_pct(original_value, current_value):
     """
     Feature 1 (Variance & Change Ledger) extension: percentage change
@@ -2728,6 +3210,10 @@ def _serialize_override_upload(upload):
         'uploaded_by': upload.uploaded_by.email if upload.uploaded_by else None,
         'original_filename': upload.original_filename,
         'is_post_lock_revision': upload.is_post_lock_revision,
+        # Sprint "Workflow Upgrades" Feature 2: blank unless this upload's
+        # deltas crossed the >2.0% GPR/OpEx/NOI threshold at the time it
+        # was submitted — see ExcelOverrideCheckView.post()'s two-step flow.
+        'variance_note': upload.variance_note,
         'deltas': [
             {
                 'field_name': d.field_name,
@@ -2859,6 +3345,38 @@ class ExcelOverrideCheckView(APIView):
                             'variance_pct': _variance_pct(original_raw, current_value),
                         })
 
+        # Sprint "Workflow Upgrades" Feature 2 (Variance Alert Context
+        # Notes): this re-upload requires a leadership-facing 1-sentence
+        # reason BEFORE it commits if any detected delta touches one of the
+        # same three fields/threshold already used by the firm-wide alert
+        # feed below (OVERRIDE_ALERT_TRACKED_FIELDS /
+        # OVERRIDE_ALERT_THRESHOLD_PCT) — intentionally the exact same
+        # fields/threshold, not a separate configuration, so "what triggers
+        # a leadership alert" and "what requires an explanation" never
+        # drift apart. Nothing has been written to the database yet at
+        # this point (deltas is still a plain list), so returning early
+        # here needs no rollback — the frontend is expected to resubmit
+        # the SAME file with variance_note set once the user supplies one.
+        variance_note = (request.data.get('variance_note') or '').strip()
+        note_required = any(
+            d['field_name'] in OVERRIDE_ALERT_TRACKED_FIELDS
+            and d['variance_pct'] is not None
+            and d['variance_pct'] > OVERRIDE_ALERT_THRESHOLD_PCT
+            for d in deltas
+        )
+        if note_required and not variance_note:
+            return Response(
+                {
+                    'detail': (
+                        "Key numbers shifted by more than 2%. Please add a "
+                        "quick 1-sentence reason for leadership before this "
+                        "upload is recorded."
+                    ),
+                    'requires_variance_note': True,
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         with transaction.atomic():
             upload = ExcelOverrideUpload.objects.create(
                 project=project,
@@ -2874,6 +3392,7 @@ class ExcelOverrideCheckView(APIView):
                 # OneToOneField reverse accessor that raises
                 # RelatedObjectDoesNotExist (not returning None) when unset.
                 is_post_lock_revision=hasattr(project, 'baseline_lock'),
+                variance_note=variance_note,
             )
             ExcelOverrideDelta.objects.bulk_create([
                 ExcelOverrideDelta(
@@ -2983,6 +3502,10 @@ class OverrideAlertFeedView(APIView):
                 'original_value': d.original_value,
                 'new_value': d.new_value,
                 'variance_pct': d.variance_pct,
+                # Sprint "Workflow Upgrades" Feature 2: the analyst's
+                # required 1-sentence explanation for this upload, shown
+                # directly under the alert row in the firm-wide feed.
+                'variance_note': d.upload.variance_note,
             }
             for d in deltas
         ]

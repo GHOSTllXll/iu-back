@@ -158,6 +158,19 @@ class PropertyProject(models.Model):
 
     is_deleted = models.BooleanField(default=False)
 
+    # Sprint "Workflow Upgrades" Feature 1 (10-Second Scorecard): the
+    # analyst's own entered/confirmed asking price for this deal — NOT the
+    # AI-extracted deal_valuation.target_purchase_price (whatever figure
+    # the OM itself stated), which is a separate, unconfirmed value that
+    # already lives inside AnalysisReport.metrics. Captured optionally on
+    # the upload screen (or at Excel-download time, the pre-existing
+    # "Target Purchase Price" field) and persisted here so the Deal
+    # Scorecard's cap-rate/price-per-unit math and Feature 5's DSCR/max-
+    # loan sizing both have it automatically on every later view of this
+    # deal, without re-asking. Null until an analyst actually provides one
+    # — never defaulted or backfilled from the AI's own OM-derived guess.
+    asking_price = models.FloatField(null=True, blank=True)
+
     class Meta:
         ordering = ['-updated_at']
         indexes = [
@@ -296,6 +309,23 @@ class AnalysisReport(models.Model):
     # rent_roll_data/t12_monthly_data above.
     injected_values_snapshot = models.JSONField(null=True, blank=True)
 
+    # Sprint "Workflow Upgrades" Feature 1 (10-Second Scorecard & Missing
+    # Doc Check): exactly which of the 3 core documents were actually
+    # submitted for THIS run — {"om": bool, "t12": bool, "rent_roll": bool}.
+    # Deliberately an explicit record of what was SUBMITTED, never inferred
+    # from whether metrics happen to look empty — a document can be
+    # provided and still yield little data (e.g. a T12 the AI couldn't
+    # parse well), and that must never be confused with "wasn't sent at
+    # all" for the Scorecard's missing-document check. Defaults to {}
+    # (Django's required mutable-default pattern for a JSONField) for
+    # every row that predates partial uploads — reader code
+    # (_compute_deal_scorecard in views.py) treats an ABSENT key as "was
+    # provided" (.get(key, True)), which is correct for every legacy row
+    # too: all three were hard-required before this feature existed.
+    documents_provided = models.JSONField(
+        default=dict, blank=True,
+    )
+
     # How long the actual analysis pipeline took (parsing + AI call + Enterprise
     # modules), in seconds. Real, measured data — used to power the "Avg.
     # Processing" dashboard stat honestly instead of a fabricated number.
@@ -356,6 +386,14 @@ class ExcelOverrideUpload(models.Model):
     # (analysis.injected_values_snapshot) is already frozen by that point
     # regardless of this flag.
     is_post_lock_revision = models.BooleanField(default=False)
+    # Sprint "Workflow Upgrades" Feature 2 (Variance Alert Context Notes):
+    # required leadership-facing 1-sentence reason, collected ONLY when this
+    # upload's deltas include a qualifying >OVERRIDE_ALERT_THRESHOLD_PCT
+    # shift on one of OVERRIDE_ALERT_TRACKED_FIELDS (GPR/OpEx/NOI) — see
+    # ExcelOverrideCheckView.post()'s two-step flow in views.py. Blank for
+    # every upload that never crossed that threshold, never backfilled or
+    # required retroactively.
+    variance_note = models.TextField(blank=True, default='')
 
     class Meta:
         ordering = ['-uploaded_at']

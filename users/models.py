@@ -61,6 +61,41 @@ class Organization(models.Model):
     # without needing a new tier or a hardcoded per-org special case.
     quota_override = models.IntegerField(null=True, blank=True)
 
+    # Sprint "Workflow Upgrades" Feature 5 (Automatic Loan Sizing & DSCR
+    # Check): org-wide defaults for debt sizing, editable by Org Admins
+    # only (see DebtAssumptionsView in ai_service/views.py). A single
+    # JSONField rather than four separate typed columns — deliberately the
+    # first generic per-org settings bucket on this model; every existing
+    # column above is a specific typed field, so this is the new pattern
+    # for anything configurable-but-not-yet-numerous enough to earn its
+    # own migration every time a client wants one more knob.
+    # Keys: target_ltv (pct, e.g. 70.0), interest_rate (pct, e.g. 6.50),
+    # amortization_years (int, e.g. 30), min_dscr (e.g. 1.25).
+    # default=dict (not a lambda/callable literal) is Django's required
+    # pattern for a mutable default on a JSONField — each row gets its own
+    # fresh dict, never a shared one.
+    debt_assumptions = models.JSONField(default=dict, blank=True)
+
+    DEFAULT_DEBT_ASSUMPTIONS = {
+        'target_ltv': 70.0,
+        'interest_rate': 6.50,
+        'amortization_years': 30,
+        'min_dscr': 1.25,
+    }
+
+    def get_debt_assumptions(self):
+        """
+        Merges self.debt_assumptions over DEFAULT_DEBT_ASSUMPTIONS rather
+        than returning the raw field — an org that has never touched
+        Workspace Settings has debt_assumptions == {} (the JSONField
+        default), and a partially-filled-in dict (e.g. only min_dscr ever
+        PATCHed) should still fall back to the defaults for every other
+        key, not silently compute with a missing one.
+        """
+        merged = dict(self.DEFAULT_DEBT_ASSUMPTIONS)
+        merged.update(self.debt_assumptions or {})
+        return merged
+
     objects = OrganizationManager()
 
     def __str__(self):
