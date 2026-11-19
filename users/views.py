@@ -256,7 +256,60 @@ class AdminToggleUserStatusView(APIView):
             
         except CustomUser.DoesNotExist:
             return Response({'detail': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
-        
+
+
+class AdminUpdateUserRoleView(APIView):
+    """
+    Platform admin sets a user's ORG-LEVEL role ('admin' = Company Admin,
+    'member' = Team Member) within their own organization.
+
+    This is distinct from two other things that sound similar:
+      - The platform-wide `is_admin` flag, hardcoded to a single account
+        in CustomUser.save() — never settable here, and never touched by
+        this view.
+      - `workspace_role` ('analyst' / 'head', Feature 4) — a separate,
+        per-workspace seat, set via MyOrganizationMemberWorkspaceView /
+        AdminOrganizationUserWorkspaceView instead.
+
+    org `role='admin'` is what makes someone this organization's own
+    admin: able to see every workspace, and to manage Team Members /
+    Workspaces on their Settings page. Added because AdminCreateUserView
+    always defaulted new accounts to 'member' with no way to promote one
+    afterward — see create-account.vue's formData.role.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, email):
+        if not request.user.is_admin:
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        new_role = request.data.get('role')
+        valid_roles = dict(CustomUser.ROLE_CHOICES)
+        if new_role not in valid_roles:
+            return Response(
+                {'detail': f"'role' must be one of: {', '.join(valid_roles)}."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            decoded_email = urllib.parse.unquote(email)
+            user = CustomUser.objects.get(email=decoded_email)
+        except CustomUser.DoesNotExist:
+            return Response({'detail': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        user.role = new_role
+        user.save(update_fields=['role'])
+
+        log_activity(
+            user=request.user,
+            action='TOGGLE_USER',
+            target=user.email,
+            details=f"Role changed to {valid_roles[new_role]}",
+            ip_address=request.META.get('REMOTE_ADDR')
+        )
+
+        return Response({'email': user.email, 'role': user.role})
+
 
 # added views for admin to toggle organization status and delete organization
 class AdminToggleOrganizationStatusView(APIView):
@@ -1474,6 +1527,63 @@ class MyOrganizationMemberWorkspaceView(APIView):
             'workspace_name': member.workspace.name if member.workspace_id else None,
             'workspace_role': member.workspace_role,
         })
+
+
+class MyOrganizationMemberRoleView(APIView):
+    """
+    Org-admin self-serve: promote/demote ONE of their own teammates between
+    'admin' (Company Admin) and 'member'. Mirrors AdminUpdateUserRoleView
+    (the platform-admin equivalent in /admin) but scoped to the calling
+    admin's own organization, same as every other My* view in this file.
+
+    Deliberately refuses to let an org admin change their OWN role —
+    without that guard, an org with exactly one admin could demote itself
+    into having zero, permanently locking every teammate out of Workspaces
+    and Team Members with no self-serve way back in (only the platform
+    admin could then fix it via /admin). Promoting a second admin first,
+    or asking the platform admin, are the only ways around that.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, email):
+        if request.user.organization_id is None:
+            return Response({'detail': 'This account has no organization.'}, status=status.HTTP_400_BAD_REQUEST)
+        if request.user.role != 'admin':
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        decoded_email = urllib.parse.unquote(email)
+
+        if decoded_email.lower() == request.user.email.lower():
+            return Response(
+                {'detail': "You can't change your own role. Ask another admin, or contact support."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        new_role = request.data.get('role')
+        valid_roles = dict(CustomUser.ROLE_CHOICES)
+        if new_role not in valid_roles:
+            return Response(
+                {'detail': f"'role' must be one of: {', '.join(valid_roles)}."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            member = CustomUser.objects.get(email=decoded_email, organization_id=request.user.organization_id)
+        except CustomUser.DoesNotExist:
+            return Response({'detail': 'Team member not found in your organization.'}, status=status.HTTP_404_NOT_FOUND)
+
+        member.role = new_role
+        member.save(update_fields=['role'])
+
+        log_activity(
+            user=request.user,
+            action='TOGGLE_USER',
+            target=member.email,
+            details=f"Role changed to {valid_roles[new_role]}",
+            ip_address=request.META.get('REMOTE_ADDR')
+        )
+
+        return Response({'email': member.email, 'role': member.role})
 
 
 class AdminOrganizationWorkspacesView(APIView):

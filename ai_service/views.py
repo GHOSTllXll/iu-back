@@ -4344,22 +4344,27 @@ class ExcelOverrideCheckView(APIView):
 # diff/variance-alert/vault pipeline (_apply_excel_override above)
 # end-to-end, via a MINIMAL synthetic workbook (_build_grid_edit_workbook)
 # built purely to carry the grid's edited values through that existing
-# named-range-diff machinery. Excluded for organizations on a
-# ClientExcelTemplate in v1 — same precedent as auto-vault-on-lock (see
-# DealVaultFile's own docstring) — since this grid is bound to OUR
-# standard field catalog, not whatever layout a client's own template
-# happens to use.
-
-def _org_uses_custom_excel_template(organization_id) -> bool:
-    from .models import ClientExcelTemplate
-    return ClientExcelTemplate.objects.filter(organization=organization_id, is_active=True).exists()
-
-
-GRID_EDITOR_CUSTOM_TEMPLATE_DETAIL = (
-    "The Live Grid Editor isn't available for organizations using a "
-    "custom Excel template — use \"Re-upload Edited Underwriting File\" "
-    "with your own template's export instead."
-)
+# named-range-diff machinery.
+#
+# v2 (Live Grid Editor for Custom Excel Templates): this grid is bound to
+# OUR field catalog either way, so a ClientExcelTemplate org edits through
+# EXACTLY the same snapshot/diff/variance/vault pipeline as a standard
+# org below — nothing in _build_grid_edit_workbook or _apply_excel_override
+# cares which path produced the snapshot it's diffing against, since both
+# already resolve values through the IU_* catalog, just via different
+# physical cells. The only custom-template-specific behavior lives in
+# GridFieldValuesView.get() below: it additionally resolves each known
+# IU_* name against the ORG'S OWN uploaded template (read-only — see
+# _resolve_custom_template_field_locations) so the grid can show which
+# tab/cell each field actually maps to, same information an admin can
+# already see on the Excel Template settings panel. "Save" writes no
+# differently for a custom-template org than for a standard one — it was
+# never touching any real workbook in the first place (see
+# _build_grid_edit_workbook's own docstring), so there was nothing
+# custom-template-specific to adapt there at all. The deal's ACTUAL custom
+# .xlsx is still only ever generated fresh at Download/Lock time from
+# analysis.metrics/rent_roll_data (see generate_excel_from_template's
+# caller above) — this grid never loads, mutates, or re-saves that file.
 
 
 def _build_grid_edit_workbook(scalars: dict, rows: list):
@@ -4419,6 +4424,57 @@ def _build_grid_edit_workbook(scalars: dict, rows: list):
     return buf.getvalue()
 
 
+def _resolve_custom_template_field_locations(custom_template):
+    """
+    Live Grid Editor for Custom Excel Templates: opens THIS org's own
+    uploaded template (read-only — never re-saved, same discipline as
+    validate_template() in custom_template_generator.py) and resolves
+    every known IU_* named range to a human-readable "Tab!Cell" location,
+    so the grid can show an analyst exactly which tab/cell each field maps
+    to in their own workbook, same as an admin can already see (in raw
+    field-name form) on the Excel Template settings panel.
+
+    Deliberately re-resolves from the live file on every call rather than
+    trusting ClientExcelTemplate.detected_named_ranges — that column is
+    only ever a flat list of field NAMES (captured at upload time for the
+    admin's benefit), never the (sheet, row, col) a display needs, and
+    re-opening a workbook purely to read its defined names is cheap (the
+    same thing validate_template() already does on every upload).
+
+    Best-effort: if the stored file can't be opened for any reason (a
+    corrupt upload, a storage hiccup), returns None rather than failing
+    the whole grid-values request — the grid still works with plain field
+    labels, it just loses the Tab/Cell column for this one request.
+    """
+    from openpyxl.utils import get_column_letter
+
+    try:
+        workbook = openpyxl.load_workbook(custom_template.file, data_only=False, read_only=True)
+    except Exception:
+        logger.exception(
+            "Live Grid Editor: couldn't open the custom template for org %s "
+            "to resolve field locations — grid will still work without the "
+            "Tab/Cell column.",
+            custom_template.organization_id,
+        )
+        return None
+
+    try:
+        resolved, _skipped = extract_defined_names(workbook)
+    finally:
+        workbook.close()
+
+    field_locations = {
+        name: {'sheet': sheet_name, 'cell': f"{get_column_letter(col)}{row}"}
+        for name, (sheet_name, row, col) in resolved.items()
+        if name in SCALAR_FIELD_CATALOG or name in ROW_FIELD_CATALOG
+    }
+    return {
+        'original_filename': custom_template.original_filename,
+        'field_locations': field_locations,
+    }
+
+
 class GridFieldValuesView(APIView):
     """
     GET: the current editable values for the Live Grid Editor — exactly
@@ -4429,22 +4485,28 @@ class GridFieldValuesView(APIView):
     FIELD_CATALOG from metrics here, by design — see that field's own
     docstring for why it's only ever captured at actual generation time.
 
-    Same "no snapshot yet" / "no custom-template orgs" gates as the Save
-    action below, so a disabled grid and a rejected save are never
-    surprises of each other.
+    Same "no snapshot yet" gate as the Save action below, so a disabled
+    grid and a rejected save are never surprises of each other.
+
+    For an organization on an active ClientExcelTemplate, the response
+    also includes a `custom_template` object ({original_filename,
+    field_locations}) resolving each known field to where it actually
+    lives in THIS org's own workbook — see
+    _resolve_custom_template_field_locations above. `custom_template` is
+    null for a standard-template org, and best-effort null (logged, not
+    raised) if this org's template file couldn't be opened — either way
+    the grid itself still renders from `scalars`/`rows` as normal.
     URL: GET /api/ai/pipeline/projects/<int:project_id>/grid-values/
     """
     permission_classes = [IsAuthenticated]
 
     def get(self, request, project_id):
         from .permissions import visible_projects_for
+        from .models import ClientExcelTemplate
 
         project = visible_projects_for(request.user).select_related('organization').filter(pk=project_id).first()
         if project is None:
             return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
-
-        if _org_uses_custom_excel_template(project.organization_id):
-            return Response({'detail': GRID_EDITOR_CUSTOM_TEMPLATE_DETAIL}, status=status.HTTP_400_BAD_REQUEST)
 
         analysis = project.analyses.order_by('-created_at').first()
         if analysis is None:
@@ -4454,10 +4516,18 @@ class GridFieldValuesView(APIView):
         if not snapshot:
             return Response({'detail': OVERRIDE_SNAPSHOT_UNAVAILABLE_DETAIL}, status=status.HTTP_400_BAD_REQUEST)
 
+        custom_template_info = None
+        custom_template = ClientExcelTemplate.objects.filter(
+            organization=project.organization_id, is_active=True
+        ).first()
+        if custom_template is not None:
+            custom_template_info = _resolve_custom_template_field_locations(custom_template)
+
         return Response({
             'scalars': snapshot.get('scalars') or {},
             'rows': snapshot.get('rows') or [],
             'is_post_lock_revision': hasattr(project, 'baseline_lock'),
+            'custom_template': custom_template_info,
         })
 
 
@@ -4558,6 +4628,13 @@ class GridEditSaveView(APIView):
     anything else in the posted body is silently ignored, the same
     defensive posture every other endpoint in this codebase takes toward
     client-supplied field names.
+
+    Works identically for an organization on an active ClientExcelTemplate
+    — this view never touches any real workbook, custom or standard (see
+    _build_grid_edit_workbook's own docstring), so there's nothing
+    custom-template-specific to branch on here. The org's own template
+    file is only ever read (never written) by GridFieldValuesView above,
+    purely to show where each field lives.
     URL: POST /api/ai/pipeline/projects/<int:project_id>/grid-save/
     """
     permission_classes = [IsAuthenticated]
@@ -4568,9 +4645,6 @@ class GridEditSaveView(APIView):
         project = visible_projects_for(request.user).select_related('organization').filter(pk=project_id).first()
         if project is None:
             return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
-
-        if _org_uses_custom_excel_template(project.organization_id):
-            return Response({'detail': GRID_EDITOR_CUSTOM_TEMPLATE_DETAIL}, status=status.HTTP_400_BAD_REQUEST)
 
         analysis = project.analyses.order_by('-created_at').first()
         if analysis is None:

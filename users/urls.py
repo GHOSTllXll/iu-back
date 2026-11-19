@@ -3,6 +3,7 @@ from django.urls import path, include
 from .views import (LoginView, LogoutView, CurrentUserView, AdminCreateUserView, AdminOrganizationsView,
                     AdminOrganizationUsersView, AdminToggleUserStatusView, AdminToggleOrganizationStatusView, AdminDeleteOrganizationView,
                     AdminDeleteUserView, AdminActiveUsersCountView, AdminActivityLogView, AdminUpdateOrganizationPlanView,
+                    AdminUpdateUserRoleView,
                     PasswordResetRequestView, PasswordResetConfirmView,
                     AdminCreateMessageView, AdminMessageListView, AdminDeactivateMessageView, ActiveMessagesView,
                     AdminCreateTrialAccountView,
@@ -10,7 +11,7 @@ from .views import (LoginView, LogoutView, CurrentUserView, AdminCreateUserView,
                     AdminUploadExcelTemplateView, AdminGetExcelTemplateView, AdminDeleteExcelTemplateView,
                     MyOrganizationExcelTemplateView,
                     MyOrganizationWorkspacesView, MyOrganizationWorkspaceDetailView,
-                    MyOrganizationMembersView, MyOrganizationMemberWorkspaceView,
+                    MyOrganizationMembersView, MyOrganizationMemberWorkspaceView, MyOrganizationMemberRoleView,
                     AdminOrganizationWorkspacesView, AdminOrganizationWorkspaceDetailView,
                     AdminOrganizationUserWorkspaceView, WorkspaceUsageView,
                     MyOrganizationDebtAssumptionsView)
@@ -31,6 +32,7 @@ urlpatterns = [
 
     path('admin/organizations/<int:org_id>/users/', AdminOrganizationUsersView.as_view(), name='admin_org_users'),
     path('admin/users/<str:email>/toggle-status/', AdminToggleUserStatusView.as_view(), name='admin_toggle_user'),
+    path('admin/users/<str:email>/role/', AdminUpdateUserRoleView.as_view(), name='admin_update_user_role'),
 
     path('admin/organizations/<int:org_id>/toggle-status/', AdminToggleOrganizationStatusView.as_view(), name='admin_toggle_org_status'),
     path('admin/organizations/<int:org_id>/delete/', AdminDeleteOrganizationView.as_view(), name='admin_delete_org'),
@@ -74,6 +76,7 @@ urlpatterns = [
     path('organization/workspaces/<int:workspace_id>/', MyOrganizationWorkspaceDetailView.as_view(), name='my_workspace_detail'),
     path('organization/members/', MyOrganizationMembersView.as_view(), name='my_org_members'),
     path('organization/members/<str:email>/workspace/', MyOrganizationMemberWorkspaceView.as_view(), name='my_org_member_workspace'),
+    path('organization/members/<str:email>/role/', MyOrganizationMemberRoleView.as_view(), name='my_org_member_role'),
 
     # Feature 4: workspace-scoped usage metrics for the Head Seat (or org
     # admin) — see WorkspaceUsageView's docstring for the full gating rule.
