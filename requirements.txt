@@ -49,3 +49,10 @@ django-redis==7.0.0
 redis==8.1.0
 PyMySQL==1.2.0
 celery==5.4.0
+
+# Pipeline Modules Phase 2 (VP Sign-Off Gate & Leadership Digest): the IC/
+# Leadership Digest PDF export. Chosen over WeasyPrint per the client's own
+# explicit decision — this server's cPanel hosting has no system-level
+# Cairo/Pango libraries that WeasyPrint requires, while reportlab is pure
+# Python with no native dependencies.
+reportlab==4.2.5

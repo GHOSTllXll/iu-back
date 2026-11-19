@@ -134,6 +134,103 @@ def run_cre_underwriting_task(self, om_path, om_name, t12_path, t12_name,
         _cleanup_temp_files(om_path, t12_path, rent_roll_path)
 
 
+@shared_task(bind=True, name='ai_service.run_inbound_email_underwriting_task')
+def run_inbound_email_underwriting_task(self, om_path, om_name, t12_path, t12_name,
+                                          rent_roll_path, rent_roll_name, tier, uploaded_by_id,
+                                          project_id, explicit_asking_price=None):
+    """
+    Pipeline Modules Phase 7 (Multi-Tenant Email-to-Deal Intake): thin
+    wrapper around run_cre_underwriting_task above, for deals that
+    arrived via the inbound email webhook (InboundEmailWebhookView in
+    views.py) and therefore need TWO things no manual upload ever needs.
+    Calls run_cre_underwriting_task DIRECTLY — a normal synchronous
+    Python call, not .delay() — rather than duplicating its temp-file-
+    handling/cleanup logic; this is the standard Celery pattern for
+    invoking one task from inside another without a second broker
+    round-trip (the @shared_task wrapper's bind=True still works exactly
+    the same way on a direct call as it does on a normal .delay()'d one).
+
+      1. asking_price pre-fill — there's no analyst at an upload screen to
+         type a Target Purchase Price in by hand. If the inbound email's
+         subject/body carried an explicit Target:/Price: $X tag
+         (explicit_asking_price — resolved by the webhook view BEFORE
+         enqueueing, by parsing the raw email), that value is forwarded
+         exactly like a normal upload's asking_price and nothing below
+         runs. Otherwise, once extraction succeeds, this falls back to
+         the AI-extracted metrics['deal_valuation']['target_purchase_price']
+         — the ONE place in this codebase that ever does that:
+         process_underwriting_files/record_analysis_report deliberately
+         NEVER do this for a manual upload (see
+         PropertyProject.asking_price's own docstring in models.py) since
+         a human is always available there to enter one instead. Never
+         overwrites an asking_price that's already non-null on the
+         project, so a later re-analysis of the same email-originated
+         deal can't clobber a value an analyst has since edited by hand
+         in the drawer.
+      2. property_name upgrade — the webhook view creates this
+         PropertyProject up front using the email's SUBJECT LINE as a
+         placeholder title (so the deal shows up in the pipeline
+         immediately, before extraction even starts), then passes its id
+         in as project_id here. record_analysis_report's existing-project
+         branch never touches property_name (see its own docstring) — by
+         design, for the ordinary "re-upload & re-analyze" case, where
+         overwriting a deal's established name on every re-run would be
+         wrong. This is the one deliberate exception: once extraction
+         succeeds, the placeholder subject is replaced with the AI's own
+         extracted property name, exactly once, here.
+
+    On an extraction FAILURE (result['error'] is True), neither of the
+    above runs — the placeholder subject-line title and any Target:/
+    Price: tag asking_price (already applied via the forwarded
+    explicit_asking_price argument, if given) simply stand as-is; there's
+    nothing further to resolve without real metrics.
+    """
+    result = run_cre_underwriting_task(
+        om_path, om_name, t12_path, t12_name, rent_roll_path, rent_roll_name,
+        tier, uploaded_by_id, project_id=project_id, asking_price=explicit_asking_price,
+    )
+
+    if result.get('error'):
+        logger.warning(
+            "Inbound email intake: extraction failed for project %s — "
+            "leaving its placeholder title/asking_price exactly as the "
+            "webhook view set them.", project_id,
+        )
+        return result
+
+    try:
+        from .models import PropertyProject
+
+        project = PropertyProject.objects.filter(pk=project_id).first()
+        if project is not None:
+            update_fields = []
+            metrics = result.get('metrics') or {}
+
+            extracted_name = (metrics.get('property_metadata') or {}).get('property_name') or ''
+            if extracted_name:
+                project.property_name = extracted_name
+                update_fields.append('property_name')
+
+            if explicit_asking_price is None and project.asking_price is None:
+                om_price = (metrics.get('deal_valuation') or {}).get('target_purchase_price')
+                if om_price:
+                    project.asking_price = om_price
+                    update_fields.append('asking_price')
+
+            if update_fields:
+                project.save(update_fields=update_fields)
+    except Exception:
+        # Best-effort polish on top of an ALREADY-successful extraction —
+        # never let a failure here make a successful run look failed.
+        logger.exception(
+            "Inbound email intake: post-processing (title/asking_price "
+            "pre-fill) failed for project %s — extraction itself still "
+            "succeeded and its metrics are unaffected.", project_id,
+        )
+
+    return result
+
+
 @shared_task(bind=True, name='ai_service.run_ppm_underwriting_task')
 def run_ppm_underwriting_task(self, ppm_path, ppm_name, manual_pages, tier, uploaded_by_id):
     """Background counterpart to the institutional PPM pipeline."""
@@ -155,3 +252,33 @@ def run_ppm_underwriting_task(self, ppm_path, ppm_name, manual_pages, tier, uplo
         return {'error': False, 'metrics': metrics, 'tier': tier}
     finally:
         _cleanup_temp_files(ppm_path)
+
+
+@shared_task(bind=True, name='ai_service.run_email_thread_backfill_task', max_retries=0)
+def run_email_thread_backfill_task(self, thread_link_id):
+    """
+    V2 Module 1 (Phase V2-3): the ONE-TIME full-history pull a thread
+    gets right after an analyst tags it to a deal (ProjectEmailThreadsView.
+    post() in views.py enqueues this instead of blocking the request on
+    however many Gmail/Graph round trips a long thread's backfill takes).
+    Unlike every other task in this file, this one is NOT an AI-bound
+    pipeline — it's here, rather than a plain synchronous call, purely
+    to keep the HTTP response fast; the actual backfill logic (and all
+    of its own error handling — a failed backfill is recorded on
+    LinkedEmailThread.backfill_status/backfill_error, never raised back
+    to Celery to retry) lives entirely in email_sync.backfill_linked_thread.
+    The 5-minute poll (sync_email_threads management command) is a
+    completely separate, cron-driven entry point into the SAME
+    underlying sync_linked_thread() — this task exists only for the
+    one-time backfill's latency, not as part of the recurring sync.
+    """
+    from .models import LinkedEmailThread
+    from . import email_sync
+
+    try:
+        thread_link = LinkedEmailThread.objects.select_related('connection', 'connection__user').get(pk=thread_link_id)
+    except LinkedEmailThread.DoesNotExist:
+        logger.warning("run_email_thread_backfill_task: LinkedEmailThread %s no longer exists.", thread_link_id)
+        return
+
+    email_sync.backfill_linked_thread(thread_link)

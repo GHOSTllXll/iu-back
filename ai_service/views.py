@@ -6,20 +6,24 @@ import hashlib
 import os
 import time
 import uuid
+import base64
+import zipfile
 import tempfile
 import datetime
 import openpyxl
 import pandas as pd
 from datetime import timedelta
+from email.utils import parseaddr
 from django.http import FileResponse
+from django.conf import settings as django_settings
 from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 
 from celery.result import AsyncResult
-from .tasks import run_cre_underwriting_task, run_ppm_underwriting_task
+from .tasks import run_cre_underwriting_task, run_ppm_underwriting_task, run_inbound_email_underwriting_task
 
 from .llm_router import ai_client, AIRateLimitExhausted
 from .parsers import (
@@ -30,14 +34,20 @@ from .parsers import (
     validate_uploaded_file,
     FileValidationError,
 )
-from .excel_generator import generate_underwriting_excel, ExcelGenerationError, CURRENCY_FORMATS, DEFAULT_CURRENCY_CODE
+from .excel_generator import generate_underwriting_excel, ExcelGenerationError, CURRENCY_FORMATS, DEFAULT_CURRENCY_CODE, safe_get
+from .waterfall_calculator import compute_waterfall, WaterfallInputError
 from .custom_template_generator import (
     generate_excel_from_template,
     TemplateValidationError as CustomTemplateValidationError,
     TemplateCapacityError,
     compute_injected_values_snapshot,
     extract_defined_names,
+    SCALAR_FIELD_CATALOG,
+    ROW_FIELD_CATALOG,
+    apply_scalar_edits_to_metrics,
+    apply_row_edits_to_rent_roll_data,
 )
+from openpyxl.workbook.defined_name import DefinedName
 from .excel_ppm_generator import build_ppm_master_grid, PPMExcelGenerationError
 from .rent_roll_utils import (
     detect_charge_ledger_columns,
@@ -59,6 +69,9 @@ from .document_classifier import (
     DocumentClassificationError,
     CLASSIFIABLE_EXTENSIONS,
     DOCUMENT_TYPE_UNCLASSIFIED,
+    DOCUMENT_TYPE_RENT_ROLL,
+    DOCUMENT_TYPE_TRAILING_12,
+    DOCUMENT_TYPE_OFFERING_MEMORANDUM,
 )
 
 
@@ -2482,7 +2495,7 @@ class ProcessedDocumentDeleteView(APIView):
 # ---------------------------------------------------------------------------
 
 def _serialize_project_summary(project, user=None):
-    from .permissions import can_lock_project
+    from .permissions import can_lock_project, can_manage_project
 
     latest = project.analyses.order_by('-created_at').first()
     # Feature 2 (Immutable Snapshots): OneToOneField reverse accessor —
@@ -2493,8 +2506,8 @@ def _serialize_project_summary(project, user=None):
     return {
         'id': project.id,
         'property_name': project.property_name or 'Untitled',
-        'deal_status': project.deal_status,
-        'deal_status_display': project.get_deal_status_display(),
+        'pipeline_stage': project.pipeline_stage,
+        'pipeline_stage_display': project.get_pipeline_stage_display(),
         'organization': project.organization.name,
         'workspace': project.workspace.name if project.workspace_id else None,
         'uploaded_by': (
@@ -2505,6 +2518,15 @@ def _serialize_project_summary(project, user=None):
         'analysis_count': project.analyses.count(),
         'can_download': bool(latest and latest.rent_roll_data),
         'updated_at': project.updated_at.isoformat(),
+        # Pipeline Modules Phase 1: who's actively working this deal, and
+        # the team's own target date for closing/offer — see
+        # PropertyProject.assigned_analyst/target_closing_or_offer_date's
+        # docstrings in models.py. Both null until someone sets them.
+        'assigned_analyst': project.assigned_analyst.email if project.assigned_analyst_id else None,
+        'target_closing_or_offer_date': (
+            project.target_closing_or_offer_date.isoformat()
+            if project.target_closing_or_offer_date else None
+        ),
         # Sprint "Workflow Upgrades" Feature 1: the analyst's own entered/
         # confirmed price for this deal — see PropertyProject.asking_price's
         # own docstring in models.py for how this differs from the AI-
@@ -2518,15 +2540,29 @@ def _serialize_project_summary(project, user=None):
         'locked_at': lock.locked_at.isoformat() if lock else None,
         'locked_by': lock.locked_by.email if lock and lock.locked_by else None,
         'can_lock': lock is None and user is not None and can_lock_project(user, project),
+        # Pipeline Modules Phase 2 (VP Sign-Off Gate): deliberately NOT
+        # gated on `lock is None` like can_lock above — a VP/Org Admin can
+        # still sign off and advance an already-locked 'vp_review' deal
+        # (see VPSignOffView's docstring), so the frontend needs this
+        # permission flag available independent of lock state.
+        'can_sign_off': user is not None and can_lock_project(user, project),
+        # Pipeline Modules Phase 6: gates the drawer's assigned_analyst/
+        # target_closing_or_offer_date edit controls and the "Generate
+        # Lender Packet" action — same can_manage_project check the PATCH
+        # endpoint and the lender-link endpoints enforce server-side, just
+        # exposed here so the frontend can show/hide the controls instead
+        # of letting a user try an edit that's just going to 403.
+        'can_manage': user is not None and can_manage_project(user, project),
     }
 
 
 class PropertyProjectListView(APIView):
     """
     The Deal Pipeline dashboard's table: property, uploader, date
-    processed, status, and whether a historical Download is available.
-    Optional ?deal_status=reviewing|approved|archived filter for the
-    dashboard's status tabs/filter dropdown.
+    processed, stage, and whether a historical Download is available.
+    Optional ?pipeline_stage=new_incoming|underwriting|vp_review|
+    offer_submitted|dead_passed filter for the dashboard's stage
+    tabs/filter dropdown.
     URL: GET /api/ai/pipeline/projects/
     """
     permission_classes = [IsAuthenticated]
@@ -2535,14 +2571,130 @@ class PropertyProjectListView(APIView):
         from .permissions import visible_projects_for
 
         projects = visible_projects_for(request.user).select_related(
-            'organization', 'workspace', 'created_by', 'baseline_lock', 'baseline_lock__locked_by'
+            'organization', 'workspace', 'created_by', 'assigned_analyst',
+            'baseline_lock', 'baseline_lock__locked_by'
         )
 
-        deal_status_filter = request.query_params.get('deal_status')
-        if deal_status_filter:
-            projects = projects.filter(deal_status=deal_status_filter)
+        pipeline_stage_filter = request.query_params.get('pipeline_stage')
+        if pipeline_stage_filter:
+            projects = projects.filter(pipeline_stage=pipeline_stage_filter)
 
         return Response([_serialize_project_summary(p, user=request.user) for p in projects])
+
+
+def _get_deal_activity_feed(project):
+    """
+    Pipeline Modules Phase 4 (Unified Activity Feed): ONE chronological
+    feed for the pipeline drawer, synthesized server-side from THREE
+    already-existing sources rather than a new table of its own —
+    consistent with this module's "don't duplicate audit infrastructure"
+    discipline (see TeamNote/DealActivityLog/ExcelOverrideUpload's own
+    docstrings for earlier examples of the same principle). Per the
+    client's explicit decision, Team Notes are no longer shown in their
+    own separate drawer section — they're interleaved here as "comment"
+    events alongside stage changes and checklist resolutions, newest
+    first, matching every other list in this module.
+
+      - DealActivityLog: every pipeline_stage transition (Phase 1),
+        including the from_stage=None "deal created" row.
+      - TeamNote: every comment, each carrying its resolved @mentions
+        (Phase 4) — see _parse_mentions above.
+      - DealChecklistItem: only RESOLUTION events, keyed off resolved_at
+        — NOT creation events. An item being auto-seeded as missing
+        isn't itself something that happened ON the deal worth a feed
+        entry (every deal would otherwise get noisy "checklist item
+        created" spam the moment it's analyzed); a human actually
+        resolving one is a real, feed-worthy event.
+      - SyncedEmailMessage (V2 Module 1, Phase V2-3): every message the
+        5-minute poll (or the one-time backfill right after a thread is
+        tagged) has pulled from any thread EVER linked to this deal —
+        deliberately including messages synced through a thread that's
+        since been soft-unlinked (LinkedEmailThread.is_active=False
+        only stops FUTURE polling; it was never meant to erase history
+        that's already in the feed — see that model's own docstring).
+
+    Each entry carries a 'type' discriminator the frontend switches on
+    to render it, and an 'at' ISO timestamp (already sorted on before
+    being stringified, so the feed array itself is the final order).
+    """
+    from .models import PropertyProject
+
+    stage_labels = dict(PropertyProject.PIPELINE_STAGE_CHOICES)
+    events = []
+
+    for log in project.activity_log.select_related('user'):
+        events.append({
+            'type': 'stage_change',
+            'at': log.created_at,
+            'id': f'stage-{log.id}',
+            'user': log.user.email if log.user else None,
+            'from_stage': log.from_stage,
+            'from_stage_display': stage_labels.get(log.from_stage) if log.from_stage else None,
+            'to_stage': log.to_stage,
+            'to_stage_display': stage_labels.get(log.to_stage, log.to_stage),
+        })
+
+    for note in project.notes.select_related('author').prefetch_related('mentioned_users'):
+        events.append({
+            'type': 'comment',
+            'at': note.created_at,
+            'id': f'note-{note.id}',
+            'user': note.author.email if note.author else None,
+            'body': note.body,
+            'mentioned_users': [u.email for u in note.mentioned_users.all()],
+        })
+
+    for item in project.checklist_items.filter(
+        is_resolved=True, resolved_at__isnull=False
+    ).select_related('resolved_by'):
+        events.append({
+            'type': 'checklist_resolved',
+            'at': item.resolved_at,
+            'id': f'checklist-{item.id}',
+            'user': item.resolved_by.email if item.resolved_by else None,
+            'label': item.label,
+        })
+
+    # Pipeline Modules Phase 6 (Lender Packet & View Tracking): ONE feed
+    # entry per LenderShareLink that's been opened at least once —
+    # LenderShareLink.view_count/last_viewed_at is a running counter, not
+    # a per-visit log, so this is "viewed N times, most recently at..."
+    # rather than N separate events. Deliberately NOT sourced from
+    # DealActivityLog (that model is stage-transitions-only — see its own
+    # docstring); the view count/timestamp live on LenderShareLink itself.
+    for link in project.lender_share_links.filter(view_count__gt=0, last_viewed_at__isnull=False):
+        events.append({
+            'type': 'lender_link_viewed',
+            'at': link.last_viewed_at,
+            'id': f'lender-link-{link.id}',
+            'user': None,
+            'recipient_label': link.recipient_label or 'Lender',
+            'view_count': link.view_count,
+        })
+
+    from .models import SyncedEmailMessage
+
+    for msg in SyncedEmailMessage.objects.filter(thread_link__project=project).select_related('thread_link', 'thread_link__connection'):
+        thread_link = msg.thread_link
+        events.append({
+            'type': 'email',
+            'at': msg.sent_at,
+            'id': f'email-{msg.id}',
+            'user': None,
+            'direction': msg.direction,
+            'sender_email': msg.sender_email,
+            'sender_name': msg.sender_name,
+            'thread_label': thread_link.label or thread_link.subject or '(no subject)',
+            'thread_link_id': thread_link.id,
+            'provider': thread_link.connection.provider,
+            'body_text': msg.body_text,
+            'attachment_summary': msg.attachment_summary,
+        })
+
+    events.sort(key=lambda e: e['at'], reverse=True)
+    for e in events:
+        e['at'] = e['at'].isoformat()
+    return events
 
 
 class PropertyProjectDetailView(APIView):
@@ -2550,7 +2702,10 @@ class PropertyProjectDetailView(APIView):
     A single deal's full detail for the pipeline side-drawer — latest
     metrics, every past analysis run (each one individually downloadable
     when it has persisted rent_roll_data), and its Team Notes. PATCH
-    updates deal_status only — notes have their own endpoint below.
+    updates any of pipeline_stage / assigned_analyst /
+    target_closing_or_offer_date, independently — notes have their own
+    endpoint below. See the patch() method's own comments for exactly
+    what each does.
     URL: GET/PATCH /api/ai/pipeline/projects/<int:project_id>/
     """
     permission_classes = [IsAuthenticated]
@@ -2571,7 +2726,6 @@ class PropertyProjectDetailView(APIView):
 
         analyses = list(project.analyses.select_related('uploaded_by').order_by('-created_at'))
         latest = analyses[0] if analyses else None
-        notes = project.notes.select_related('author').order_by('-created_at')
         # Feature 2 (Immutable Snapshots) reverse accessor — see
         # _serialize_project_summary's own comment on why getattr(default)
         # is required here instead of a plain attribute access.
@@ -2618,20 +2772,29 @@ class PropertyProjectDetailView(APIView):
                 }
                 for a in analyses
             ],
-            'notes': [
-                {
-                    'id': n.id,
-                    'body': n.body,
-                    'author': n.author.email if n.author else None,
-                    'created_at': n.created_at.isoformat(),
-                }
-                for n in notes
+            # Pipeline Modules Phase 4 (Unified Activity Feed): supersedes
+            # the old standalone 'notes' list in this payload — Team
+            # Notes are now interleaved here as "comment" events
+            # alongside stage changes and checklist resolutions. See
+            # _get_deal_activity_feed()'s own docstring. Posting a note
+            # still goes through TeamNoteListCreateView's own endpoint
+            # unchanged; only this read-side shape changed.
+            'activity_feed': _get_deal_activity_feed(project),
+            # Pipeline Modules Phase 4 (Persistent Missing-Doc Checklist):
+            # inlined here (not just its own /checklist/ endpoint) so the
+            # drawer has it the instant it opens, same reasoning as
+            # 'analyses' above. Resolving/adding an item still goes
+            # through DealChecklistListCreateView/
+            # DealChecklistItemResolveView's own endpoints.
+            'checklist_items': [
+                _serialize_checklist_item(i)
+                for i in project.checklist_items.select_related('created_by', 'resolved_by')
             ],
         })
 
     def patch(self, request, project_id):
         from .permissions import can_manage_project
-        from .models import PropertyProject
+        from .models import PropertyProject, DealActivityLog
 
         project, error = self._get_visible_project_or_404(request, project_id)
         if error:
@@ -2639,18 +2802,281 @@ class PropertyProjectDetailView(APIView):
         if not can_manage_project(request.user, project):
             return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
 
-        new_status = request.data.get('deal_status')
-        valid_statuses = dict(PropertyProject.STATUS_CHOICES)
-        if new_status not in valid_statuses:
+        update_fields = []
+
+        # Pipeline Modules Phase 1: a stage change is the one field here
+        # that also writes a DealActivityLog row — see that model's
+        # docstring. Key is optional on this PATCH; omit it entirely to
+        # update only assigned_analyst/target_closing_or_offer_date below
+        # without touching the deal's stage.
+        if 'pipeline_stage' in request.data:
+            new_stage = request.data.get('pipeline_stage')
+            valid_stages = dict(PropertyProject.PIPELINE_STAGE_CHOICES)
+            if new_stage not in valid_stages:
+                return Response(
+                    {'detail': f"'pipeline_stage' must be one of: {', '.join(valid_stages)}."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if new_stage != project.pipeline_stage:
+                # Pipeline Modules Phase 2 (VP Sign-Off Gate): moving a deal
+                # INTO 'offer_submitted' requires its baseline to already be
+                # locked — see VPSignOffView's own docstring for why
+                # "locked" doubles as "a VP has signed off" (the client's
+                # explicit combined-action decision). This only blocks this
+                # generic dropdown path; VPSignOffView itself performs the
+                # lock (if needed) and the stage change together in one
+                # action. Once a deal IS locked, pipeline_stage goes back to
+                # being as freely editable as every other stage — see
+                # ExcelBaselineLock's own docstring ("pipeline_stage ...
+                # left fully editable").
+                if new_stage == 'offer_submitted' and getattr(project, 'baseline_lock', None) is None:
+                    return Response(
+                        {'detail': (
+                            "This deal needs VP Sign-Off before it can move to "
+                            "'Offer Submitted' — use the Sign Off action once "
+                            "it's in VP Review."
+                        )},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                DealActivityLog.objects.create(
+                    project=project,
+                    user=request.user,
+                    from_stage=project.pipeline_stage,
+                    to_stage=new_stage,
+                )
+                project.pipeline_stage = new_stage
+                update_fields.append('pipeline_stage')
+
+        # Pipeline Modules Phase 1: who's actively working this deal day
+        # to day. An empty string clears the assignment; otherwise the
+        # email must belong to THIS project's own organization — never
+        # trust client input to already be scoped right, same rule
+        # applied everywhere else in this module.
+        if 'assigned_analyst' in request.data:
+            raw_email = (request.data.get('assigned_analyst') or '').strip()
+            if not raw_email:
+                project.assigned_analyst = None
+            else:
+                from users.models import CustomUser
+                analyst = CustomUser.objects.filter(
+                    email=raw_email, organization_id=project.organization_id
+                ).first()
+                if analyst is None:
+                    return Response(
+                        {'detail': "'assigned_analyst' must be a member of this deal's organization."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                project.assigned_analyst = analyst
+            update_fields.append('assigned_analyst')
+
+        # Pipeline Modules Phase 1: the team's own target date — a
+        # planning input, never validated against anything else on the
+        # deal (e.g. not required to be in the future; teams backdate
+        # these sometimes when entering history).
+        if 'target_closing_or_offer_date' in request.data:
+            raw_date = request.data.get('target_closing_or_offer_date')
+            if not raw_date:
+                project.target_closing_or_offer_date = None
+            else:
+                from datetime import date as _date
+                try:
+                    project.target_closing_or_offer_date = _date.fromisoformat(raw_date)
+                except (TypeError, ValueError):
+                    return Response(
+                        {'detail': "'target_closing_or_offer_date' must be an ISO date (YYYY-MM-DD)."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            update_fields.append('target_closing_or_offer_date')
+
+        if not update_fields:
             return Response(
-                {'detail': f"'deal_status' must be one of: {', '.join(valid_statuses)}."},
+                {'detail': (
+                    'Provide at least one of: pipeline_stage, assigned_analyst, '
+                    'target_closing_or_offer_date.'
+                )},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        project.deal_status = new_status
-        project.save(update_fields=['deal_status', 'updated_at'])
+        project.save(update_fields=update_fields + ['updated_at'])
 
         return Response(_serialize_project_summary(project, user=request.user))
+
+
+class DealAssignableAnalystsView(APIView):
+    """
+    Pipeline Modules Phase 6 add-on: the roster the deal drawer's
+    assigned_analyst picker selects from — the same org-membership data
+    MyOrganizationMembersView already serves (users/views.py), but gated
+    to can_manage_project(user, THIS project) instead of role=='admin',
+    so a plain analyst managing their own deal isn't 403'd just because
+    they aren't an Org Admin (can_manage_project already allows exactly
+    this case via its own-created-deal fallback — see permissions.py).
+
+    Deliberately NOT a general-purpose member directory: scoped to one
+    project's organization, and requires the caller already be allowed
+    to manage THAT project — MyOrganizationMembersView's admin-only
+    "manage my team's roster" scope is left completely untouched.
+    URL: GET /api/ai/pipeline/projects/<int:project_id>/assignable-analysts/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, project_id):
+        from .permissions import visible_projects_for, can_manage_project
+        from users.models import CustomUser
+
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if not can_manage_project(request.user, project):
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        members = CustomUser.objects.filter(
+            organization_id=project.organization_id, is_active=True
+        ).order_by('first_name', 'last_name')
+
+        return Response([
+            {
+                'email': m.email,
+                'first_name': m.first_name,
+                'last_name': m.last_name,
+            }
+            for m in members
+        ])
+
+
+def _vault_locked_baseline_excel(project, lock, user):
+    """
+    Pipeline Modules Phase 5 (Excel Versioning & Supporting Document
+    Vault): auto-captures a DealVaultFile the instant a baseline is
+    locked — see DealVaultFile's own docstring in models.py (file_type=
+    'locked_baseline_excel') for exactly what this does and its
+    documented limitation (regenerated from this org's CURRENT debt
+    assumptions, since purchase price/LTV/rate are never persisted on an
+    analysis — see AnalysisReport.rent_roll_data's own docstring — so
+    this vaulted copy isn't guaranteed byte-identical to any one
+    historical download).
+
+    The ONE caller (_create_baseline_lock below) wraps this entire call
+    in try/except — a failure here must NEVER block the lock itself,
+    which is the actual point of the action the user asked for. This
+    function itself raises normally on failure; it's the caller's job to
+    swallow it.
+
+    Deliberately skips organizations using a ClientExcelTemplate (custom
+    Excel template) in this v1 — see DealVaultFile's own docstring for
+    why (avoids custom_template_generator.py's more complex branching).
+    """
+    from .models import ClientExcelTemplate, DealVaultFile
+    from django.core.files.base import ContentFile
+
+    if ClientExcelTemplate.objects.filter(organization=project.organization_id, is_active=True).exists():
+        logger.info(
+            "Skipping auto-vault of locked baseline Excel for project %s — "
+            "org %s uses a custom Excel template (v1 scope excludes "
+            "custom-template orgs from auto-vault-on-lock).",
+            project.id, project.organization_id,
+        )
+        return
+
+    analysis = lock.analysis
+    rent_roll_df = pd.DataFrame((analysis.rent_roll_data or {}).get('rows', []))
+    assumptions = project.organization.get_debt_assumptions()
+    debt_assumptions = {
+        'ltv_pct': assumptions['target_ltv'],
+        'interest_rate_pct': assumptions['interest_rate'],
+        'amortization_years': assumptions['amortization_years'],
+        # project.asking_price is the best available stand-in — debt
+        # inputs are re-prompted at each download, never persisted (see
+        # above). generate_underwriting_excel tolerates a missing
+        # purchase_price (debt_assumptions.get('purchase_price'), no
+        # default — see excel_generator.py) by simply leaving that one
+        # cell blank, so None here is safe, not a crash.
+        'purchase_price': project.asking_price,
+    }
+
+    excel_bytes = generate_underwriting_excel(
+        analysis.metrics, rent_roll_df, debt_assumptions=debt_assumptions, currency_code=DEFAULT_CURRENCY_CODE,
+    )
+
+    DealVaultFile.objects.create(
+        project=project,
+        file=ContentFile(excel_bytes, name=f"locked_baseline_{project.id}.xlsx"),
+        file_type='locked_baseline_excel',
+        original_filename=f"{(project.property_name or 'Deal').replace(' ', '_')}_Locked_Baseline.xlsx",
+        version_label=f"Locked {lock.locked_at:%Y-%m-%d}",
+        uploaded_by=user,
+    )
+
+
+def _create_baseline_lock(project, user):
+    """
+    Pipeline Modules Phase 2: the actual lock-creation logic shared by
+    ApproveLockBaselineView (the standalone "Approve & Lock Baseline"
+    action) and VPSignOffView (which locks, if not already locked, as
+    HALF of its combined sign-off action — see that view's docstring).
+    Factored out so there is exactly one place that computes the
+    snapshot hash and creates the row, rather than two copies that could
+    silently drift apart.
+
+    Callers are responsible for confirming can_lock_project(user, project)
+    and that project.baseline_lock doesn't already exist — this helper
+    only handles the one remaining precondition (a downloaded snapshot to
+    freeze) and the creation itself. Returns (lock, error_response) —
+    exactly one of the two is ever non-None.
+    """
+    from .models import ExcelBaselineLock
+
+    analysis = project.latest_analysis
+    if analysis is None or not analysis.injected_values_snapshot:
+        return None, Response(
+            {'detail': (
+                "This deal has no downloaded Excel yet to lock as a baseline — "
+                "download it at least once, then lock it."
+            )},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # Per the client's explicit instruction: hash ONLY the JSON
+    # snapshot (never the .xlsx bytes, never the full metrics blob —
+    # see ExcelBaselineLock's own docstring). sort_keys=True so the
+    # hash is stable regardless of dict insertion/JSONField round-trip
+    # ordering — the same logical snapshot must always hash identically.
+    snapshot_json = json.dumps(analysis.injected_values_snapshot, sort_keys=True)
+    snapshot_sha256 = hashlib.sha256(snapshot_json.encode('utf-8')).hexdigest()
+
+    lock = ExcelBaselineLock.objects.create(
+        project=project,
+        analysis=analysis,
+        locked_by=user,
+        snapshot_sha256=snapshot_sha256,
+    )
+
+    # Pipeline Modules Phase 5: best-effort, never blocks the lock itself
+    # — see _vault_locked_baseline_excel's own docstring.
+    try:
+        _vault_locked_baseline_excel(project, lock, user)
+    except Exception:
+        logger.exception(
+            "Failed to auto-vault locked baseline Excel for project %s — "
+            "the lock itself still succeeded.", project.id,
+        )
+
+    # V2 Module 3: freeze whatever Scenario Builder results exist at
+    # lock time onto the lock itself — same best-effort, never-blocks
+    # posture as vaulting above. Left as None (not recomputed) if the
+    # analyst never ran "Calculate" before locking — never fabricated.
+    try:
+        saved_scenario = analysis.waterfall_scenario
+        if saved_scenario and saved_scenario.get('results'):
+            lock.waterfall_summary = saved_scenario['results']
+            lock.save(update_fields=['waterfall_summary'])
+    except Exception:
+        logger.exception(
+            "Failed to freeze waterfall scenario summary for project %s — "
+            "the lock itself still succeeded.", project.id,
+        )
+
+    return lock, None
 
 
 class ApproveLockBaselineView(APIView):
@@ -2658,7 +3084,7 @@ class ApproveLockBaselineView(APIView):
     Feature 2 (Immutable Snapshots): "Approve & Lock Baseline" — freezes
     this deal's CURRENT analysis snapshot as its permanent underwriting
     baseline. See ExcelBaselineLock's own docstring for exactly what
-    locking does, and deliberately does NOT do (deal_status and Team
+    locking does, and deliberately does NOT do (pipeline_stage and Team
     Notes stay fully editable either way).
 
     Gated to can_lock_project() — role='admin' (Org Admin) or
@@ -2669,7 +3095,8 @@ class ApproveLockBaselineView(APIView):
 
     Requires the project's latest analysis to already have a captured
     injected_values_snapshot — i.e. its Excel has been downloaded at
-    least once — there's nothing to freeze otherwise. Locking an
+    least once — there's nothing to freeze otherwise (see
+    _create_baseline_lock, shared with VPSignOffView below). Locking an
     already-locked project 400s rather than silently no-op'ing or
     re-locking to a newer analysis — this is a one-way action with no
     "re-lock" story in v1 (see the model's own docstring on why).
@@ -2680,7 +3107,6 @@ class ApproveLockBaselineView(APIView):
     def post(self, request, project_id):
         from django.db import transaction
         from .permissions import visible_projects_for, can_lock_project
-        from .models import ExcelBaselineLock
 
         project = visible_projects_for(request.user).select_related('workspace').filter(pk=project_id).first()
         if project is None:
@@ -2702,39 +3128,339 @@ class ApproveLockBaselineView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        analysis = project.latest_analysis
-        if analysis is None or not analysis.injected_values_snapshot:
-            return Response(
-                {'detail': (
-                    "This deal has no downloaded Excel yet to lock as a baseline — "
-                    "download it at least once, then lock it."
-                )},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        # Per the client's explicit instruction: hash ONLY the JSON
-        # snapshot (never the .xlsx bytes, never the full metrics blob —
-        # see ExcelBaselineLock's own docstring). sort_keys=True so the
-        # hash is stable regardless of dict insertion/JSONField round-trip
-        # ordering — the same logical snapshot must always hash identically.
-        snapshot_json = json.dumps(analysis.injected_values_snapshot, sort_keys=True)
-        snapshot_sha256 = hashlib.sha256(snapshot_json.encode('utf-8')).hexdigest()
-
         with transaction.atomic():
-            lock = ExcelBaselineLock.objects.create(
-                project=project,
-                analysis=analysis,
-                locked_by=request.user,
-                snapshot_sha256=snapshot_sha256,
-            )
+            lock, error = _create_baseline_lock(project, request.user)
+            if error:
+                return error
 
         return Response({
             'id': lock.id,
             'locked_at': lock.locked_at.isoformat(),
             'locked_by': request.user.email,
-            'analysis_id': analysis.id,
+            'analysis_id': lock.analysis_id,
             'snapshot_sha256': lock.snapshot_sha256,
         }, status=status.HTTP_201_CREATED)
+
+
+class VPSignOffView(APIView):
+    """
+    Pipeline Modules Phase 2 (VP Sign-Off Gate & Leadership Digest):
+    "Sign Off & Advance to Offer Submitted" — the one combined action
+    that both satisfies the VP Sign-Off Gate (see
+    PropertyProjectDetailView.patch's own gate check on the
+    'offer_submitted' transition) and freezes the deal's financial
+    baseline, per the client's explicit decision that these are a single
+    action rather than two separate steps: by the time an offer is going
+    out the door, the numbers backing it should already be frozen.
+
+    Deliberately reuses can_lock_project (NOT can_manage_project) — the
+    same Org Admin / Workspace Head-only gate as the existing "Approve &
+    Lock Baseline" action, since this view performs that exact same
+    freeze (via the shared _create_baseline_lock() helper above) as part
+    of signing off. A plain analyst gets a 403 even on a deal they
+    created and are assigned to.
+
+    Requires the deal to currently be in the 'vp_review' stage — signing
+    off a deal that hasn't reached VP Review yet (or has already moved
+    past it) is rejected with a 400 rather than silently fast-forwarding
+    it through stages it was never actually reviewed at.
+
+    If the deal's baseline is ALREADY locked (e.g. an earlier, unrelated
+    lock from before this deal ever reached VP Review), this does NOT
+    error or attempt to re-lock — it treats that existing lock as
+    already satisfying the freeze half of sign-off and proceeds straight
+    to advancing the stage. Either way, the whole operation (lock-if-
+    needed + stage change + DealActivityLog row) is one atomic
+    transaction, so a deal can never end up "signed off" with only half
+    of this applied.
+    URL: POST /api/ai/pipeline/projects/<int:project_id>/vp-sign-off/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, project_id):
+        from django.db import transaction
+        from .permissions import visible_projects_for, can_lock_project
+        from .models import DealActivityLog
+
+        project = visible_projects_for(request.user).select_related('workspace').filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if not can_lock_project(request.user, project):
+            return Response(
+                {'detail': "Only an Org Admin or this deal's Workspace Head can sign off on a deal."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        if project.pipeline_stage != 'vp_review':
+            return Response(
+                {'detail': (
+                    f"This deal is in '{project.get_pipeline_stage_display()}', not "
+                    "'VP Review' — move it to VP Review before it can be signed off."
+                )},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        existing_lock = getattr(project, 'baseline_lock', None)
+
+        with transaction.atomic():
+            if existing_lock is None:
+                lock, error = _create_baseline_lock(project, request.user)
+                if error:
+                    return error
+
+            DealActivityLog.objects.create(
+                project=project,
+                user=request.user,
+                from_stage=project.pipeline_stage,
+                to_stage='offer_submitted',
+            )
+            project.pipeline_stage = 'offer_submitted'
+            project.save(update_fields=['pipeline_stage', 'updated_at'])
+
+        # Belt-and-suspenders: refresh_from_db() clears any cached relations
+        # on this instance (including the baseline_lock reverse one-to-one),
+        # so _serialize_project_summary below is guaranteed a fresh read
+        # rather than depending on exactly how/whether a prior getattr()
+        # cached its result.
+        project.refresh_from_db()
+        return Response(_serialize_project_summary(project, user=request.user))
+
+
+class ICSummaryPDFView(APIView):
+    """
+    Pipeline Modules Phase 2 follow-up: "Download IC Summary" in the deal
+    drawer — a per-deal, one-page reportlab PDF (see ic_summary_pdf.py)
+    handing a VP/analyst something easy to pass to an Investment
+    Committee right after signing off on a deal.
+
+    Built exclusively from the LOCKED analysis (ExcelBaselineLock.analysis)
+    — never the project's current/latest one — same "frozen, not a moving
+    target" principle as Draft Broker Email's use of locked_metrics and
+    ApproveLockBaselineView itself. Requires the deal's baseline to
+    already be locked; there's nothing frozen to summarize otherwise, so
+    this 400s with a message pointing at Approve & Lock Baseline / VP
+    Sign-Off rather than silently falling back to an unlocked snapshot.
+
+    Deliberately just visible_projects_for() — the same visibility as the
+    rest of the deal drawer — rather than can_lock_project. This is a
+    read/export action on a deal you can already see, not a workflow
+    action like VPSignOffView above, so it doesn't need the stricter gate.
+    URL: GET /api/ai/pipeline/projects/<int:project_id>/ic-summary/pdf/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, project_id):
+        from .permissions import visible_projects_for
+        from .ic_summary_pdf import render_ic_summary_pdf
+
+        project = visible_projects_for(request.user).select_related(
+            'organization', 'workspace', 'assigned_analyst',
+            'baseline_lock', 'baseline_lock__locked_by', 'baseline_lock__analysis',
+        ).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        lock = getattr(project, 'baseline_lock', None)
+        if lock is None:
+            return Response(
+                {'detail': (
+                    "This deal's baseline must be locked before an IC Summary can "
+                    "be generated — use Approve & Lock Baseline, or Sign Off if "
+                    "it's in VP Review."
+                )},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        analysis = lock.analysis
+        rent_roll_df = (
+            pd.DataFrame((analysis.rent_roll_data or {}).get('rows', []))
+            if analysis.rent_roll_data else None
+        )
+        deal_scorecard = _compute_deal_scorecard(
+            analysis.metrics, rent_roll_df, analysis.documents_provided, project.asking_price
+        )
+        debt_sizing = _compute_debt_sizing(
+            project.organization, analysis.metrics, asking_price=project.asking_price
+        )
+
+        pdf_bytes = render_ic_summary_pdf(
+            project, lock, analysis.metrics, deal_scorecard, debt_sizing, lock.waterfall_summary,
+        )
+
+        safe_name = (project.property_name or 'Deal').replace('/', '-').replace('\\', '-')
+        filename = f"IC_Summary_{safe_name}.pdf"
+        return FileResponse(
+            io.BytesIO(pdf_bytes),
+            as_attachment=True,
+            filename=filename,
+            content_type='application/pdf',
+        )
+
+
+class PresentDealDataView(APIView):
+    """
+    V2 Module 4c (Boardroom IC Presentation Mode): the JSON data behind
+    the deal drawer's "Present Deal" button — a full-screen, multi-slide
+    view the frontend renders (Property Overview, Seller vs.
+    Underwritten, Forensic Audit Flags, Debt & Waterfall Summary, Local
+    Comps). Property Overview/Debt Sizing/Waterfall are computed
+    IDENTICALLY to ICSummaryPDFView just above (same
+    _compute_deal_scorecard/_compute_debt_sizing calls, same
+    lock.waterfall_summary) — this just returns that data as JSON
+    instead of rendering it into a PDF.
+
+    Same "frozen, not a moving target" requirement as ICSummaryPDFView:
+    requires the deal's baseline to already be locked, and reads
+    EXCLUSIVELY from ExcelBaselineLock.analysis, never the project's
+    current/latest one — a boardroom presentation shows the numbers
+    the VP actually signed off on, not whatever's been edited since.
+
+    Seller vs. Underwritten Table slide: reuses
+    _compute_seller_vs_underwritten(project, analysis) VERBATIM — the
+    exact same "Sprint Workflow Upgrades Feature 2" table
+    PropertyProjectDetailView.get() already shows in the deal drawer
+    (baseline-extracted value vs. latest re-uploaded/edited value, for
+    GPR/Vacancy-Concessions/EGI/OpEx/NOI) — called against the LOCKED
+    analysis specifically (not the project's current/latest one), so
+    this slide reflects the baseline that was actually signed off on
+    plus whatever was re-uploaded against THAT locked analysis, never a
+    newer re-analysis.
+
+    Forensic Audit Flags slide: reads metrics['reconciliation']['flags']
+    (Module 1 — see reconciliation.py) directly — a DIFFERENT, separate
+    concept from the table above (internal OM/T12/Rent Roll document
+    consistency, not baseline-vs-edit drift). An empty list is a real,
+    meaningful result (every check was within the 2% tolerance, or
+    reconciliation never ran for this deal — e.g. no rent roll was
+    submitted) and the frontend should say so explicitly rather than
+    treating the slide as broken.
+
+    Local Comps slide: reads whatever V2 Module 2 cached
+    PropertyMarketDataSnapshot already exists for this deal — this
+    view NEVER triggers a fresh RentCast fetch (see MarketCompsView
+    above); opening a presentation must never silently spend the
+    account's capped monthly RentCast quota. A deal whose Market & Tax
+    Comps were never checked simply gets market_comps: null, and the
+    frontend shows a prompt to check it from the main panel instead.
+
+    Deliberately just visible_projects_for() — same reasoning as
+    ICSummaryPDFView: a read/export action on a deal you can already
+    see, not a workflow action like VPSignOffView/ApproveLockBaselineView.
+    URL: GET /api/ai/pipeline/projects/<int:project_id>/present-deal/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, project_id):
+        from .permissions import visible_projects_for
+        from .market_comps import build_market_comps_payload
+
+        project = visible_projects_for(request.user).select_related(
+            'organization', 'workspace', 'assigned_analyst',
+            'baseline_lock', 'baseline_lock__locked_by', 'baseline_lock__analysis',
+            'market_data_snapshot',
+        ).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        lock = getattr(project, 'baseline_lock', None)
+        if lock is None:
+            return Response(
+                {'detail': (
+                    "This deal's baseline must be locked before Boardroom Presentation "
+                    "Mode is available — use Approve & Lock Baseline, or Sign Off if "
+                    "it's in VP Review."
+                )},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        analysis = lock.analysis
+        metrics = analysis.metrics or {}
+        rent_roll_df = (
+            pd.DataFrame((analysis.rent_roll_data or {}).get('rows', []))
+            if analysis.rent_roll_data else None
+        )
+        deal_scorecard = _compute_deal_scorecard(
+            metrics, rent_roll_df, analysis.documents_provided, project.asking_price
+        )
+        debt_sizing = _compute_debt_sizing(
+            project.organization, metrics, asking_price=project.asking_price
+        )
+        property_metadata = metrics.get('property_metadata') or {}
+        reconciliation = metrics.get('reconciliation') or {}
+
+        market_comps_payload = None
+        snapshot = getattr(project, 'market_data_snapshot', None)
+        if snapshot is not None:
+            market_comps_payload = build_market_comps_payload(snapshot, metrics, project.asking_price)
+
+        return Response({
+            'property_overview': {
+                'property_name': project.property_name or 'Untitled',
+                'address': property_metadata.get('address'),
+                'asset_class': property_metadata.get('asset_class'),
+                'total_unit_count': property_metadata.get('total_unit_count'),
+                'workspace_name': project.workspace.name if project.workspace_id else None,
+                'assigned_analyst': project.assigned_analyst.email if project.assigned_analyst_id else None,
+                'pipeline_stage': project.pipeline_stage,
+                'asking_price': project.asking_price,
+                'target_closing_or_offer_date': (
+                    project.target_closing_or_offer_date.isoformat()
+                    if project.target_closing_or_offer_date else None
+                ),
+                'noi': deal_scorecard.get('noi'),
+                'in_place_cap_rate': deal_scorecard.get('in_place_cap_rate'),
+                'opex_ratio': deal_scorecard.get('opex_ratio'),
+                'price_per_unit_or_sf': deal_scorecard.get('price_per_unit_or_sf'),
+                'price_per_unit_or_sf_basis': deal_scorecard.get('price_per_unit_or_sf_basis'),
+            },
+            'seller_vs_underwritten': _compute_seller_vs_underwritten(project, analysis),
+            'forensic_audit_flags': {
+                'flags': reconciliation.get('flags') or [],
+                'note': reconciliation.get('note'),
+            },
+            'debt_sizing': debt_sizing,
+            'waterfall_summary': lock.waterfall_summary,
+            'market_comps': market_comps_payload,
+            'locked_at': lock.locked_at.isoformat(),
+            'locked_by': lock.locked_by.email if lock.locked_by else None,
+        })
+
+
+# Pipeline Modules Phase 4 (@Mentions, in-app only): matches "@" followed
+# immediately by a full email address inside a Team Note's body text —
+# e.g. "cc @alex@acme.com on this". Typing the full email is the entire
+# mechanism for v1: this codebase has no org-member-directory/autocomplete
+# endpoint to build a nicer @-picker against yet (confirmed by inspection —
+# a real one is a reasonable later addition, not built here to keep this
+# phase scoped), and no email notification infrastructure exists either —
+# a mention only ever surfaces as an in-app highlight/"mentions you" filter
+# on the unified Activity Feed below, never a sent email.
+_MENTION_RE = re.compile(r'@([A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]+)')
+
+
+def _parse_mentions(body, organization_id):
+    """
+    Resolves every @-mentioned email in `body` against a member of
+    `organization_id` — the exact same org-scoped
+    CustomUser.objects.filter(email=..., organization_id=...) pattern
+    already used for PropertyProject.assigned_analyst in
+    PropertyProjectDetailView.patch(), so "who counts as a valid
+    mention" never drifts from "who counts as a valid assignee".
+    Case-insensitive (email addresses aren't case-sensitive in practice
+    here — CustomUser.email is normalized lowercase at creation). A
+    mention of an email with no matching org member (a typo, or someone
+    outside this org) simply resolves to nobody — silently dropped, not
+    an error, since a comment's body is otherwise free-form text.
+    Returns a CustomUser queryset (possibly empty), never a list, so the
+    caller can hand it straight to a ManyToManyField's .set().
+    """
+    from users.models import CustomUser
+
+    emails = {m.group(1).lower() for m in _MENTION_RE.finditer(body)}
+    if not emails:
+        return CustomUser.objects.none()
+    return CustomUser.objects.filter(email__in=emails, organization_id=organization_id)
 
 
 class TeamNoteListCreateView(APIView):
@@ -2743,6 +3469,13 @@ class TeamNoteListCreateView(APIView):
     own docstring for why; v1 scope, same reasoning as IssueReport). GET/POST
     both require the same visibility as the project itself — anyone who can
     see a deal can read and add to its notes.
+
+    Pipeline Modules Phase 4: a note's body can now carry @mentions (see
+    _parse_mentions above) and is interleaved into the pipeline drawer's
+    unified Activity Feed as a "comment" event (see
+    _get_deal_activity_feed) rather than shown in a separate section —
+    this endpoint itself is unchanged either way; it's still the one
+    place a Team Note is read or written.
     URL: GET/POST /api/ai/pipeline/projects/<int:project_id>/notes/
     """
     permission_classes = [IsAuthenticated]
@@ -2759,13 +3492,14 @@ class TeamNoteListCreateView(APIView):
         if error:
             return error
 
-        notes = project.notes.select_related('author').order_by('-created_at')
+        notes = project.notes.select_related('author').prefetch_related('mentioned_users').order_by('-created_at')
         return Response([
             {
                 'id': n.id,
                 'body': n.body,
                 'author': n.author.email if n.author else None,
                 'created_at': n.created_at.isoformat(),
+                'mentioned_users': [u.email for u in n.mentioned_users.all()],
             }
             for n in notes
         ])
@@ -2783,12 +3517,128 @@ class TeamNoteListCreateView(APIView):
 
         note = TeamNote.objects.create(project=project, author=request.user, body=body)
 
+        # Pipeline Modules Phase 4 (@Mentions): resolved once, at creation
+        # — see TeamNote.mentioned_users' own docstring in models.py for
+        # why there's no "re-parse on edit" path.
+        mentioned = list(_parse_mentions(body, project.organization_id))
+        if mentioned:
+            note.mentioned_users.set(mentioned)
+
         return Response({
             'id': note.id,
             'body': note.body,
             'author': note.author.email if note.author else None,
             'created_at': note.created_at.isoformat(),
+            'mentioned_users': [u.email for u in mentioned],
         }, status=status.HTTP_201_CREATED)
+
+
+def _serialize_checklist_item(item):
+    return {
+        'id': item.id,
+        'doc_key': item.doc_key,
+        'label': item.label,
+        'is_resolved': item.is_resolved,
+        'created_by': item.created_by.email if item.created_by else None,
+        'resolved_by': item.resolved_by.email if item.resolved_by else None,
+        'created_at': item.created_at.isoformat(),
+        'resolved_at': item.resolved_at.isoformat() if item.resolved_at else None,
+    }
+
+
+class DealChecklistListCreateView(APIView):
+    """
+    Pipeline Modules Phase 4 (Persistent Missing-Doc Checklist): GET lists
+    every checklist item on a deal — the 3 core documents, auto-seeded
+    whenever an analysis run reports one missing (see
+    _seed_missing_doc_checklist_items() in document_history.py), plus
+    whatever the team has added by hand. POST adds a CUSTOM item only —
+    there is no client-settable doc_key here; the 3 doc-backed items only
+    ever come from the auto-seed path, never from this endpoint.
+
+    Same visibility gate as Team Notes (GET/POST both require only that
+    the caller can see the deal, not can_manage_project) — a checklist
+    item is a collaborative, low-stakes artifact like a note, not a
+    pipeline-stage change.
+    URL: GET/POST /api/ai/pipeline/projects/<int:project_id>/checklist/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def _get_visible_project_or_404(self, request, project_id):
+        from .permissions import visible_projects_for
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return None, Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return project, None
+
+    def get(self, request, project_id):
+        project, error = self._get_visible_project_or_404(request, project_id)
+        if error:
+            return error
+
+        items = project.checklist_items.select_related('created_by', 'resolved_by')
+        return Response([_serialize_checklist_item(i) for i in items])
+
+    def post(self, request, project_id):
+        from .models import DealChecklistItem
+
+        project, error = self._get_visible_project_or_404(request, project_id)
+        if error:
+            return error
+
+        label = (request.data.get('label') or '').strip()
+        if not label:
+            return Response({'detail': 'A label is required for a custom checklist item.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # doc_key is deliberately never accepted from the client here —
+        # see this view's own docstring. Every item created through this
+        # endpoint is a custom, hand-added one.
+        item = DealChecklistItem.objects.create(
+            project=project, label=label, created_by=request.user,
+        )
+
+        return Response(_serialize_checklist_item(item), status=status.HTTP_201_CREATED)
+
+
+class DealChecklistItemResolveView(APIView):
+    """
+    Pipeline Modules Phase 4: toggle (or explicitly set) one checklist
+    item's resolved state. Body: {"is_resolved": true|false} — explicit,
+    not a bare toggle-with-no-body, so a double-click/retry can't
+    accidentally flip it twice. Setting resolved_by/resolved_at only on
+    the transition INTO resolved — clearing both back to null when
+    un-resolving, rather than leaving a stale "resolved by/at" pair on an
+    item that's currently showing as outstanding again.
+    URL: PATCH /api/ai/pipeline/projects/<int:project_id>/checklist/<int:item_id>/resolve/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, project_id, item_id):
+        from .permissions import visible_projects_for
+        from .models import DealChecklistItem
+
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        item = DealChecklistItem.objects.filter(pk=item_id, project=project).first()
+        if item is None:
+            return Response({'detail': 'Checklist item not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if 'is_resolved' not in request.data:
+            return Response({'detail': "'is_resolved' (true/false) is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        is_resolved = bool(request.data.get('is_resolved'))
+        item.is_resolved = is_resolved
+        if is_resolved:
+            item.resolved_by = request.user
+            item.resolved_at = timezone.now()
+        else:
+            item.resolved_by = None
+            item.resolved_at = None
+        item.save(update_fields=['is_resolved', 'resolved_by', 'resolved_at'])
+
+        return Response(_serialize_checklist_item(item))
 
 
 class PropertyProjectDownloadView(APIView):
@@ -3227,6 +4077,177 @@ def _serialize_override_upload(upload):
     }
 
 
+# Shared between ExcelOverrideCheckView (a real re-uploaded file) and
+# Pipeline Modules Phase 8's Live Grid Editor (GridFieldValuesView /
+# GridEditSaveView below) — both roads lead to the same "nothing to diff
+# against yet" condition, so they use the exact same wording rather than
+# two messages that could drift apart.
+OVERRIDE_SNAPSHOT_UNAVAILABLE_DETAIL = (
+    "Override tracking isn't available yet for this deal — download the "
+    "Excel from this project at least once (the Live Grid Editor needs "
+    "that same snapshot), then editing will work."
+)
+
+
+def _apply_excel_override(*, project, analysis, snapshot, workbook, file_bytes,
+                           original_filename, user, variance_note, vault_file_type,
+                           vault_label):
+    """
+    The core diff-and-persist logic shared by ExcelOverrideCheckView's
+    "Re-upload Edited Underwriting File" (a real re-uploaded .xlsx/.xlsm)
+    and Pipeline Modules Phase 8's Live Grid Editor "Save" action (a
+    minimal workbook synthesized in-memory purely to carry the grid's
+    edited values through this SAME named-range-diff machinery — see
+    _build_grid_edit_workbook below). Neither caller's own identity
+    matters here: both already resolved `workbook` down to "a workbook
+    whose defined names we can read," and this function doesn't care
+    which path produced it.
+
+    Returns a DRF Response either way — a 400 for "no tracked fields
+    found" or "a >2% field changed without a variance_note yet", or a 201
+    with the newly-created ExcelOverrideUpload serialized. Never raises
+    for an ordinary validation outcome; the caller is only responsible for
+    getting as far as a parsed `workbook` and a non-empty `snapshot`.
+    """
+    from django.db import transaction
+    from .models import ExcelOverrideUpload, ExcelOverrideDelta
+
+    resolved_names, _skipped = extract_defined_names(workbook)
+    if not resolved_names:
+        return Response(
+            {'detail': (
+                "No tracked fields were found — this doesn't look like a "
+                "workbook generated by this platform."
+            )},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    deltas = []
+
+    # Scalars — one value each, direct compare.
+    for name, original_value in (snapshot.get('scalars') or {}).items():
+        if name not in resolved_names:
+            continue  # named range no longer present — nothing to compare
+        sheet_name, row, col = resolved_names[name]
+        current_value = workbook[sheet_name].cell(row=row, column=col).value
+        original_str = _normalize_value_for_compare(original_value)
+        current_str = _normalize_value_for_compare(current_value)
+        if original_str != current_str:
+            deltas.append({
+                'field_name': name, 'row_index': None,
+                'original_value': original_str, 'new_value': current_str,
+                'variance_pct': _variance_pct(original_value, current_value),
+            })
+
+    # Rows — same anchor cell as a scalar, one row further down per
+    # tenant position (the same "first data cell, write downward"
+    # convention used everywhere these are written).
+    snapshot_rows = snapshot.get('rows') or []
+    if snapshot_rows:
+        row_field_names = [n for n in snapshot_rows[0].keys() if n in resolved_names]
+        for i, original_row in enumerate(snapshot_rows):
+            for name in row_field_names:
+                sheet_name, anchor_row, col = resolved_names[name]
+                current_value = workbook[sheet_name].cell(row=anchor_row + i, column=col).value
+                original_raw = original_row.get(name)
+                original_str = _normalize_value_for_compare(original_raw)
+                current_str = _normalize_value_for_compare(current_value)
+                if original_str != current_str:
+                    deltas.append({
+                        'field_name': name, 'row_index': i,
+                        'original_value': original_str, 'new_value': current_str,
+                        'variance_pct': _variance_pct(original_raw, current_value),
+                    })
+
+    # Sprint "Workflow Upgrades" Feature 2 (Variance Alert Context Notes):
+    # requires a leadership-facing 1-sentence reason BEFORE this commits if
+    # any detected delta touches one of the same three fields/threshold
+    # already used by the firm-wide alert feed below
+    # (OVERRIDE_ALERT_TRACKED_FIELDS / OVERRIDE_ALERT_THRESHOLD_PCT) —
+    # intentionally the exact same fields/threshold, not a separate
+    # configuration, so "what triggers a leadership alert" and "what
+    # requires an explanation" never drift apart. Nothing has been written
+    # to the database yet at this point (deltas is still a plain list), so
+    # returning early here needs no rollback — the caller is expected to
+    # resubmit with variance_note set once the user supplies one.
+    note_required = any(
+        d['field_name'] in OVERRIDE_ALERT_TRACKED_FIELDS
+        and d['variance_pct'] is not None
+        and d['variance_pct'] > OVERRIDE_ALERT_THRESHOLD_PCT
+        for d in deltas
+    )
+    if note_required and not variance_note:
+        return Response(
+            {
+                'detail': (
+                    "Key numbers shifted by more than 2%. Please add a "
+                    "quick 1-sentence reason for leadership before this "
+                    "is recorded."
+                ),
+                'requires_variance_note': True,
+            },
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    with transaction.atomic():
+        upload = ExcelOverrideUpload.objects.create(
+            project=project,
+            analysis=analysis,
+            uploaded_by=user,
+            original_filename=original_filename,
+            # Feature 2 (Immutable Snapshots) extension: labels this
+            # upload as a post-lock "child version branch" when the deal
+            # already has a baseline lock at the moment of this
+            # re-upload/save — see ExcelOverrideUpload.is_post_lock_revision
+            # and ExcelBaselineLock's own docstring. Checked via hasattr
+            # rather than a query — baseline_lock is a OneToOneField
+            # reverse accessor that raises RelatedObjectDoesNotExist (not
+            # returning None) when unset.
+            is_post_lock_revision=hasattr(project, 'baseline_lock'),
+            variance_note=variance_note,
+        )
+        ExcelOverrideDelta.objects.bulk_create([
+            ExcelOverrideDelta(
+                upload=upload,
+                field_name=d['field_name'],
+                row_index=d['row_index'],
+                original_value=d['original_value'],
+                new_value=d['new_value'],
+                variance_pct=d['variance_pct'],
+            )
+            for d in deltas
+        ])
+
+        # Pipeline Modules Phase 5 (Excel Versioning): vault the exact
+        # bytes this came from — byte-identical, no regeneration needed,
+        # unlike the locked-baseline-on-lock path (see
+        # _vault_locked_baseline_excel's own docstring for why THAT path
+        # can't do the same). try/except INSIDE this atomic block, not
+        # around it — a vaulting failure must never roll back (or block)
+        # the override record this action exists to create; it's only
+        # ever best-effort.
+        try:
+            from .models import DealVaultFile
+            from django.core.files.base import ContentFile
+
+            DealVaultFile.objects.create(
+                project=project,
+                file=ContentFile(file_bytes, name=original_filename or 'override.xlsx'),
+                file_type=vault_file_type,
+                original_filename=original_filename,
+                version_label=f"{vault_label} — {upload.uploaded_at:%Y-%m-%d %H:%M}",
+                uploaded_by=user,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to vault %s for project %s (override upload %s) — "
+                "the override record itself still succeeded.",
+                vault_file_type, project.id, upload.id,
+            )
+
+    return Response({'upload': _serialize_override_upload(upload)}, status=status.HTTP_201_CREATED)
+
+
 class ExcelOverrideCheckView(APIView):
     """
     Parses the re-uploaded file's named ranges with the EXACT SAME
@@ -3239,7 +4260,11 @@ class ExcelOverrideCheckView(APIView):
     wrote the last time an Excel was actually generated for this deal.
     Every detected change is persisted as one ExcelOverrideUpload (the
     event) with one ExcelOverrideDelta per CHANGED field only — see that
-    model's own docstring for why an unchanged field produces no row.
+    model's own docstring for why an unchanged field produces no row. The
+    actual diff/persist/vault logic lives in the shared _apply_excel_
+    override above — Pipeline Modules Phase 8's Live Grid Editor
+    (GridEditSaveView below) uses that exact same function with a
+    synthesized workbook instead of a real re-upload.
 
     Row fields are matched by POSITION ONLY, against exactly as many
     tenant rows as existed when the snapshot was captured — confirmed
@@ -3252,15 +4277,13 @@ class ExcelOverrideCheckView(APIView):
 
     Requires only the same visibility as the project itself (like Team
     Notes below) — not can_manage_project — since re-uploading for a check
-    is an audit action on the deal, not a change to deal_status itself.
+    is an audit action on the deal, not a change to pipeline_stage itself.
     URL: POST /api/ai/pipeline/projects/<int:project_id>/override-check/
     """
     permission_classes = [IsAuthenticated]
 
     def post(self, request, project_id):
-        from django.db import transaction
         from .permissions import visible_projects_for
-        from .models import ExcelOverrideUpload, ExcelOverrideDelta
 
         project = visible_projects_for(request.user).filter(pk=project_id).first()
         if project is None:
@@ -3272,14 +4295,7 @@ class ExcelOverrideCheckView(APIView):
 
         snapshot = analysis.injected_values_snapshot
         if not snapshot:
-            return Response(
-                {'detail': (
-                    "Override tracking isn't available yet for this deal — "
-                    "download the Excel from this project at least once, "
-                    "then re-uploading an edited copy will work."
-                )},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({'detail': OVERRIDE_SNAPSHOT_UNAVAILABLE_DETAIL}, status=status.HTTP_400_BAD_REQUEST)
 
         uploaded_file = request.FILES.get('file')
         if not uploaded_file:
@@ -3290,123 +4306,310 @@ class ExcelOverrideCheckView(APIView):
         except FileValidationError as e:
             return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Captured once, up front — Pipeline Modules Phase 5 vaults these
+        # EXACT bytes (byte-identical, no regeneration needed) once this
+        # upload is actually recorded below. uploaded_file.read() can only
+        # be called once against the underlying stream, so every later
+        # use in this method reads from this variable, never the file
+        # object again.
+        uploaded_file_bytes = uploaded_file.read()
         try:
-            workbook = openpyxl.load_workbook(io.BytesIO(uploaded_file.read()), data_only=False)
+            workbook = openpyxl.load_workbook(io.BytesIO(uploaded_file_bytes), data_only=False)
         except Exception as e:
             return Response(
                 {'detail': f"Couldn't open this file as an Excel workbook: {e}"},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        resolved_names, _skipped = extract_defined_names(workbook)
-        if not resolved_names:
-            return Response(
-                {'detail': (
-                    "No tracked fields were found in this file — this "
-                    "doesn't look like a workbook generated by this platform."
-                )},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
-        deltas = []
-
-        # Scalars — one value each, direct compare.
-        for name, original_value in (snapshot.get('scalars') or {}).items():
-            if name not in resolved_names:
-                continue  # named range no longer present — nothing to compare
-            sheet_name, row, col = resolved_names[name]
-            current_value = workbook[sheet_name].cell(row=row, column=col).value
-            original_str = _normalize_value_for_compare(original_value)
-            current_str = _normalize_value_for_compare(current_value)
-            if original_str != current_str:
-                deltas.append({
-                    'field_name': name, 'row_index': None,
-                    'original_value': original_str, 'new_value': current_str,
-                    'variance_pct': _variance_pct(original_value, current_value),
-                })
-
-        # Rows — same anchor cell as a scalar, one row further down per
-        # tenant position (the same "first data cell, write downward"
-        # convention used everywhere these are written).
-        snapshot_rows = snapshot.get('rows') or []
-        if snapshot_rows:
-            row_field_names = [n for n in snapshot_rows[0].keys() if n in resolved_names]
-            for i, original_row in enumerate(snapshot_rows):
-                for name in row_field_names:
-                    sheet_name, anchor_row, col = resolved_names[name]
-                    current_value = workbook[sheet_name].cell(row=anchor_row + i, column=col).value
-                    original_raw = original_row.get(name)
-                    original_str = _normalize_value_for_compare(original_raw)
-                    current_str = _normalize_value_for_compare(current_value)
-                    if original_str != current_str:
-                        deltas.append({
-                            'field_name': name, 'row_index': i,
-                            'original_value': original_str, 'new_value': current_str,
-                            'variance_pct': _variance_pct(original_raw, current_value),
-                        })
-
-        # Sprint "Workflow Upgrades" Feature 2 (Variance Alert Context
-        # Notes): this re-upload requires a leadership-facing 1-sentence
-        # reason BEFORE it commits if any detected delta touches one of the
-        # same three fields/threshold already used by the firm-wide alert
-        # feed below (OVERRIDE_ALERT_TRACKED_FIELDS /
-        # OVERRIDE_ALERT_THRESHOLD_PCT) — intentionally the exact same
-        # fields/threshold, not a separate configuration, so "what triggers
-        # a leadership alert" and "what requires an explanation" never
-        # drift apart. Nothing has been written to the database yet at
-        # this point (deltas is still a plain list), so returning early
-        # here needs no rollback — the frontend is expected to resubmit
-        # the SAME file with variance_note set once the user supplies one.
         variance_note = (request.data.get('variance_note') or '').strip()
-        note_required = any(
-            d['field_name'] in OVERRIDE_ALERT_TRACKED_FIELDS
-            and d['variance_pct'] is not None
-            and d['variance_pct'] > OVERRIDE_ALERT_THRESHOLD_PCT
-            for d in deltas
+
+        return _apply_excel_override(
+            project=project, analysis=analysis, snapshot=snapshot, workbook=workbook,
+            file_bytes=uploaded_file_bytes,
+            original_filename=getattr(uploaded_file, 'name', '') or '',
+            user=request.user, variance_note=variance_note,
+            vault_file_type='re_upload', vault_label='Re-upload',
         )
-        if note_required and not variance_note:
+
+
+# ---------------------------------------------------------------------------
+# Pipeline Modules Phase 8: Live In-Browser Spreadsheet Editor
+# ---------------------------------------------------------------------------
+# Explicit client decision from design review: a CONSTRAINED grid bound
+# only to the already-tracked IU_* fields (SCALAR_FIELD_CATALOG /
+# ROW_FIELD_CATALOG — the exact same catalog "Re-upload Edited
+# Underwriting File" and the custom-template path already use), not a
+# full formula-driven workbook clone. "Save" never introduces a new
+# live-edit data model of its own — it reuses ExcelOverrideCheckView's
+# diff/variance-alert/vault pipeline (_apply_excel_override above)
+# end-to-end, via a MINIMAL synthetic workbook (_build_grid_edit_workbook)
+# built purely to carry the grid's edited values through that existing
+# named-range-diff machinery. Excluded for organizations on a
+# ClientExcelTemplate in v1 — same precedent as auto-vault-on-lock (see
+# DealVaultFile's own docstring) — since this grid is bound to OUR
+# standard field catalog, not whatever layout a client's own template
+# happens to use.
+
+def _org_uses_custom_excel_template(organization_id) -> bool:
+    from .models import ClientExcelTemplate
+    return ClientExcelTemplate.objects.filter(organization=organization_id, is_active=True).exists()
+
+
+GRID_EDITOR_CUSTOM_TEMPLATE_DETAIL = (
+    "The Live Grid Editor isn't available for organizations using a "
+    "custom Excel template — use \"Re-upload Edited Underwriting File\" "
+    "with your own template's export instead."
+)
+
+
+def _build_grid_edit_workbook(scalars: dict, rows: list):
+    """
+    Builds a small, purely-mechanical in-memory workbook whose ONLY job is
+    to carry the Live Grid Editor's submitted values through
+    extract_defined_names() + _apply_excel_override() exactly the way a
+    real re-uploaded "Source Values (IU)" sheet/Argus tab would (see
+    excel_generator.py's own Named Ranges section for that convention).
+    Deliberately ugly/undecorated — this is never shown to a human as a
+    deliverable, only vaulted for audit (file_type='live_grid_edit', a
+    distinct label from a real re-upload) and immediately diffed.
+
+    Silently drops any key that isn't a known IU_* name (defensive against
+    stale/tampered client input — see GridEditSaveView.post()) and any row
+    dict that is not actually a dict. Scalars get one row each (col B);
+    row fields share one block below them, one column per field, written
+    downward one row per tenant — anchored on a fresh defined name per
+    field, same "first data cell, write downward" convention used
+    everywhere else in this codebase.
+    """
+    from openpyxl import Workbook
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Grid Edit'
+
+    r = 1
+    for name, value in (scalars or {}).items():
+        if name not in SCALAR_FIELD_CATALOG:
+            continue
+        ws.cell(row=r, column=1, value=name)
+        ws.cell(row=r, column=2, value=value if value not in (None, '') else None)
+        wb.defined_names[name] = DefinedName(name, attr_text=f"'{ws.title}'!$B${r}")
+        r += 1
+
+    clean_rows = [row for row in (rows or []) if isinstance(row, dict)]
+    row_field_names = sorted({
+        k for row in clean_rows for k in row if k in ROW_FIELD_CATALOG
+    })
+    if row_field_names:
+        anchor_row = r + 1  # one blank separator row between scalars and the row table
+        for col_offset, name in enumerate(row_field_names):
+            col = 2 + col_offset  # leave column A free, same as the scalar block above
+            ws.cell(row=anchor_row - 1, column=col, value=name)  # cosmetic header only
+            wb.defined_names[name] = DefinedName(
+                name, attr_text=f"'{ws.title}'!${get_column_letter(col)}${anchor_row}"
+            )
+        for i, row_data in enumerate(clean_rows):
+            for col_offset, name in enumerate(row_field_names):
+                value = row_data.get(name)
+                ws.cell(row=anchor_row + i, column=2 + col_offset, value=value if value not in (None, '') else None)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+class GridFieldValuesView(APIView):
+    """
+    GET: the current editable values for the Live Grid Editor — exactly
+    analysis.injected_values_snapshot (the same {scalars, rows} shape
+    "Re-upload Edited Underwriting File" diffs against), so the grid's
+    starting values and the backend's diff baseline can never silently
+    drift apart from each other. No separate re-resolution of SCALAR_
+    FIELD_CATALOG from metrics here, by design — see that field's own
+    docstring for why it's only ever captured at actual generation time.
+
+    Same "no snapshot yet" / "no custom-template orgs" gates as the Save
+    action below, so a disabled grid and a rejected save are never
+    surprises of each other.
+    URL: GET /api/ai/pipeline/projects/<int:project_id>/grid-values/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, project_id):
+        from .permissions import visible_projects_for
+
+        project = visible_projects_for(request.user).select_related('organization').filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if _org_uses_custom_excel_template(project.organization_id):
+            return Response({'detail': GRID_EDITOR_CUSTOM_TEMPLATE_DETAIL}, status=status.HTTP_400_BAD_REQUEST)
+
+        analysis = project.analyses.order_by('-created_at').first()
+        if analysis is None:
+            return Response({'detail': 'This deal has no analysis yet.'}, status=status.HTTP_404_NOT_FOUND)
+
+        snapshot = analysis.injected_values_snapshot
+        if not snapshot:
+            return Response({'detail': OVERRIDE_SNAPSHOT_UNAVAILABLE_DETAIL}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({
+            'scalars': snapshot.get('scalars') or {},
+            'rows': snapshot.get('rows') or [],
+            'is_post_lock_revision': hasattr(project, 'baseline_lock'),
+        })
+
+
+def _sync_grid_edits_to_working_state(analysis, scalars, rows):
+    """
+    Follow-up fix to Pipeline Modules Phase 8: makes a Live Grid Editor
+    "Save" actually update the deal's WORKING state — analysis.metrics
+    and analysis.rent_roll_data, the exact two fields
+    PropertyProjectDownloadView and _vault_locked_baseline_excel both
+    regenerate an Excel from — not just the ExcelOverrideUpload/Delta
+    audit trail _apply_excel_override already writes. Before this,
+    "Download .xlsx" and "Approve & Lock Baseline" would silently keep
+    reflecting the ORIGINAL extraction forever, no matter how many grid
+    edits were saved — only the audit log and the vaulted synthetic
+    workbook ever saw them.
+
+    Also recomputes analysis.injected_values_snapshot from the new
+    metrics/rent_roll_data, so reopening the grid shows what was just
+    saved rather than appearing to silently revert it, and so the NEXT
+    save's diff/variance-alert check is against this save's values, not
+    the original extraction forever. Deliberately does NOT touch
+    ExcelOverrideCheckView's re-upload path at all — a plain re-upload's
+    "working state" semantics are intentionally left exactly as they
+    were; this sync only ever runs from GridEditSaveView below.
+
+    One explicit, permanent limitation: IU_DebtLTVPct/
+    IU_DebtInterestRatePct/IU_DebtAmortizationYears have no persisted
+    home to write into (see SCALAR_FIELD_WRITE_PATHS's own comment in
+    custom_template_generator.py — debt assumptions are re-prompted at
+    every download/lock, never stored on an analysis). Whatever the
+    analyst saved for those 3 fields is kept in the snapshot (so the
+    grid itself keeps showing it) and in the audit trail, but can never
+    flow through to Download/Lock. Likewise IU_Row_AnnualRent/
+    IU_Row_MLAProfile are always recomputed at generation time (never
+    read from a real rent-roll column), so an edit to either is tracked
+    in the audit trail but never changes what a regeneration produces.
+
+    Best-effort, like DealVaultFile's own vaulting step inside
+    _apply_excel_override: by the time this runs, the override/audit
+    record it's called after has ALREADY been committed successfully, so
+    a failure here is logged and swallowed rather than surfaced as a
+    failed save — worst case, Download/Lock keeps showing the pre-edit
+    numbers until the next successful save, never silently corrupted
+    data.
+    """
+    try:
+        metrics = analysis.metrics or {}
+        metrics, _written = apply_scalar_edits_to_metrics(metrics, scalars)
+
+        rent_roll_data = apply_row_edits_to_rent_roll_data(analysis.rent_roll_data, rows)
+        rent_roll_df = pd.DataFrame((rent_roll_data or {}).get('rows') or [])
+
+        new_snapshot = compute_injected_values_snapshot(metrics, None, rent_roll_df)
+
+        old_scalars = (analysis.injected_values_snapshot or {}).get('scalars') or {}
+        for debt_field in ('IU_DebtLTVPct', 'IU_DebtInterestRatePct', 'IU_DebtAmortizationYears'):
+            if debt_field in (scalars or {}):
+                new_snapshot['scalars'][debt_field] = scalars[debt_field]
+            elif debt_field in old_scalars:
+                new_snapshot['scalars'][debt_field] = old_scalars[debt_field]
+
+        analysis.metrics = metrics
+        analysis.rent_roll_data = rent_roll_data
+        analysis.injected_values_snapshot = new_snapshot
+        analysis.save(update_fields=['metrics', 'rent_roll_data', 'injected_values_snapshot'])
+    except Exception:
+        logger.exception(
+            "Live Grid Editor: saved override/audit record for analysis "
+            "%s, but failed to sync edits into metrics/rent_roll_data — "
+            "Download/Lock will keep showing pre-edit values until the "
+            "next successful save.",
+            analysis.id,
+        )
+
+
+class GridEditSaveView(APIView):
+    """
+    POST: "Save" on the Live Grid Editor. Body: {"scalars": {IU_name:
+    value, ...}, "rows": [{IU_Row_name: value, ...}, ...], "variance_note":
+    "..." (optional, required only if a tracked field crossed the >2%
+    alert threshold — see _apply_excel_override)}.
+
+    Builds a minimal synthetic workbook from the posted values
+    (_build_grid_edit_workbook) and hands it to the EXACT SAME
+    _apply_excel_override() "Re-upload Edited Underwriting File" itself
+    calls — this endpoint exists only to translate "JSON from a grid"
+    into "a workbook extract_defined_names() can read," not to duplicate
+    any of the diff/variance-alert/vault logic itself. See this module's
+    Phase 8 section comment above for the full design.
+
+    On a successful save (201), ALSO calls _sync_grid_edits_to_working_state
+    so Download/Lock pick up the edits too — see that function's own
+    docstring for exactly what does and doesn't flow through, and why
+    it's deliberately never invoked from ExcelOverrideCheckView's
+    re-upload path.
+
+    Only known IU_* names are ever written into that synthetic workbook —
+    anything else in the posted body is silently ignored, the same
+    defensive posture every other endpoint in this codebase takes toward
+    client-supplied field names.
+    URL: POST /api/ai/pipeline/projects/<int:project_id>/grid-save/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, project_id):
+        from .permissions import visible_projects_for
+
+        project = visible_projects_for(request.user).select_related('organization').filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if _org_uses_custom_excel_template(project.organization_id):
+            return Response({'detail': GRID_EDITOR_CUSTOM_TEMPLATE_DETAIL}, status=status.HTTP_400_BAD_REQUEST)
+
+        analysis = project.analyses.order_by('-created_at').first()
+        if analysis is None:
+            return Response({'detail': 'This deal has no analysis yet.'}, status=status.HTTP_404_NOT_FOUND)
+
+        snapshot = analysis.injected_values_snapshot
+        if not snapshot:
+            return Response({'detail': OVERRIDE_SNAPSHOT_UNAVAILABLE_DETAIL}, status=status.HTTP_400_BAD_REQUEST)
+
+        scalars = request.data.get('scalars')
+        rows = request.data.get('rows')
+        if not isinstance(scalars, dict) or not isinstance(rows, list):
             return Response(
-                {
-                    'detail': (
-                        "Key numbers shifted by more than 2%. Please add a "
-                        "quick 1-sentence reason for leadership before this "
-                        "upload is recorded."
-                    ),
-                    'requires_variance_note': True,
-                },
+                {'detail': '"scalars" (object) and "rows" (array) are both required.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        with transaction.atomic():
-            upload = ExcelOverrideUpload.objects.create(
-                project=project,
-                analysis=analysis,
-                uploaded_by=request.user,
-                original_filename=getattr(uploaded_file, 'name', '') or '',
-                # Feature 2 (Immutable Snapshots) extension: labels this
-                # upload as a post-lock "child version branch" when the
-                # deal already has a baseline lock at the moment of this
-                # re-upload — see ExcelOverrideUpload.is_post_lock_revision
-                # and ExcelBaselineLock's own docstring. Checked via
-                # hasattr rather than a query — baseline_lock is a
-                # OneToOneField reverse accessor that raises
-                # RelatedObjectDoesNotExist (not returning None) when unset.
-                is_post_lock_revision=hasattr(project, 'baseline_lock'),
-                variance_note=variance_note,
-            )
-            ExcelOverrideDelta.objects.bulk_create([
-                ExcelOverrideDelta(
-                    upload=upload,
-                    field_name=d['field_name'],
-                    row_index=d['row_index'],
-                    original_value=d['original_value'],
-                    new_value=d['new_value'],
-                    variance_pct=d['variance_pct'],
-                )
-                for d in deltas
-            ])
+        variance_note = (request.data.get('variance_note') or '').strip()
 
-        return Response({'upload': _serialize_override_upload(upload)}, status=status.HTTP_201_CREATED)
+        file_bytes = _build_grid_edit_workbook(scalars, rows)
+        workbook = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=False)
+
+        response = _apply_excel_override(
+            project=project, analysis=analysis, snapshot=snapshot, workbook=workbook,
+            file_bytes=file_bytes,
+            # Not a real filename — there is no uploaded file on this path
+            # (see this view's own docstring) — but original_filename is
+            # exactly what the Override Summary / Vault UIs display, so a
+            # readable label here is more honest than a fabricated-looking
+            # "grid-edit-42.xlsx".
+            original_filename="Live Grid Editor",
+            user=request.user, variance_note=variance_note,
+            vault_file_type='live_grid_edit', vault_label='Live Grid Edit',
+        )
+        if response.status_code == status.HTTP_201_CREATED:
+            # The "Download .xlsx"/"Approve & Lock Baseline" sync fix —
+            # see _sync_grid_edits_to_working_state's own docstring.
+            _sync_grid_edits_to_working_state(analysis, scalars, rows)
+        return response
 
 
 class ExcelOverrideHistoryView(APIView):
@@ -3432,6 +4635,588 @@ class ExcelOverrideHistoryView(APIView):
         return Response({'uploads': [_serialize_override_upload(u) for u in uploads]})
 
 
+# ---------------------------------------------------------------------------
+# V2 Module 3 (Live Debt & Equity Waterfall Scenario Builder) — Phase V2-1.
+# Pure Python, $0/month infrastructure, no AI API calls: see
+# waterfall_calculator.py's own module docstring for the full algorithm
+# and its documented modeling conventions. Backend Python is the
+# AUTHORITATIVE calculation (an explicit build-order decision — the
+# number an analyst sees here is the exact same code path that feeds the
+# locked baseline snapshot and the IC Summary PDF, never a second JS
+# implementation that could silently drift from it).
+# ---------------------------------------------------------------------------
+
+DEFAULT_PROMOTE_TIERS = [
+    {'hurdle_irr_pct': 8.0, 'gp_promote_pct': 0.0},
+    {'hurdle_irr_pct': None, 'gp_promote_pct': 20.0},
+]
+
+
+def _resolve_going_in_noi(analysis):
+    """Same T12 NOI metrics already resolve to everywhere else in this
+    codebase (SCALAR_FIELD_CATALOG['IU_NetOperatingIncome']) — the
+    waterfall's going-in NOI is never a separate, independently-typed
+    input; it's always this deal's own underwritten NOI."""
+    return safe_get(analysis.metrics or {}, 't12_revenue_expenses', 'net_operating_income')
+
+
+class WaterfallScenarioView(APIView):
+    """
+    GET: the deal's saved Scenario Builder state — {"inputs": {...},
+    "results": {...}, "computed_at": ...} from
+    AnalysisReport.waterfall_scenario, or a seeded-but-uncalculated
+    default (DEFAULT_PROMOTE_TIERS, a blank debt structure, results:
+    null) if the analyst has never run "Calculate" on this deal before.
+    Also returns going_in_noi so the UI can show WHY a scenario can't be
+    built yet (no positive NOI) without a wasted round-trip to Calculate.
+    URL: GET /api/ai/pipeline/projects/<int:project_id>/waterfall-scenario/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, project_id):
+        from .permissions import visible_projects_for
+
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        analysis = project.latest_analysis
+        if analysis is None:
+            return Response({'detail': 'This deal has no analysis yet.'}, status=status.HTTP_404_NOT_FOUND)
+
+        going_in_noi = _resolve_going_in_noi(analysis)
+        saved = analysis.waterfall_scenario or {}
+
+        return Response({
+            'inputs': saved.get('inputs') or {
+                'debt_structure': 'fixed_rate_permanent',
+                'purchase_price': project.asking_price,
+                'promote_tiers': DEFAULT_PROMOTE_TIERS,
+            },
+            'results': saved.get('results'),
+            'computed_at': saved.get('computed_at'),
+            'going_in_noi': going_in_noi,
+            'is_post_lock_revision': hasattr(project, 'baseline_lock'),
+        })
+
+
+class WaterfallScenarioCalculateView(APIView):
+    """
+    POST: "Calculate" on the Scenario Builder. Body is the raw `inputs`
+    dict compute_waterfall() expects (debt_structure, purchase_price,
+    hold_period_years, exit_cap_rate_pct, acquisition_ltv_pct,
+    equity_split_pct, promote_tiers, plus the structure-specific fields —
+    see waterfall_calculator.REQUIRED_FIELDS_*). Runs the authoritative
+    Python calculation, persists {"inputs", "results", "computed_at"} to
+    AnalysisReport.waterfall_scenario (overwriting any prior scenario —
+    there is deliberately only ever ONE "current" scenario per deal for
+    v1, not a saved list of named scenarios), and returns the results.
+
+    A WaterfallInputError (missing/invalid field, or no positive NOI to
+    build from) is a clean 400 with the exact reason — never a silently
+    guessed default for a financial assumption.
+    URL: POST /api/ai/pipeline/projects/<int:project_id>/waterfall-calculate/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, project_id):
+        from .permissions import visible_projects_for
+
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        analysis = project.latest_analysis
+        if analysis is None:
+            return Response({'detail': 'This deal has no analysis yet.'}, status=status.HTTP_404_NOT_FOUND)
+
+        inputs = request.data if isinstance(request.data, dict) else None
+        if not inputs:
+            return Response({'detail': 'Scenario inputs are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # purchase_price falls back to the deal's own asking price if the
+        # analyst hasn't overridden it in the scenario itself — same
+        # "AI-extracted/asking price is the default, always editable"
+        # convention Module A's Target:/Price: tag override established.
+        inputs = dict(inputs)
+        if inputs.get('purchase_price') in (None, ''):
+            inputs['purchase_price'] = project.asking_price
+
+        going_in_noi = _resolve_going_in_noi(analysis)
+
+        try:
+            results = compute_waterfall(inputs, going_in_noi)
+        except WaterfallInputError as e:
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        computed_at = timezone.now().isoformat()
+        analysis.waterfall_scenario = {'inputs': inputs, 'results': results, 'computed_at': computed_at}
+        analysis.save(update_fields=['waterfall_scenario'])
+
+        return Response({'inputs': inputs, 'results': results, 'computed_at': computed_at})
+
+
+# ---------------------------------------------------------------------------
+# Pipeline Modules Phase 5 (Excel Versioning & Supporting Document Vault).
+# See DealVaultFile's own docstring in models.py for exactly which 3 moments
+# auto-capture a version (lock, re-upload) vs. the one manual upload path
+# below — there is no "save version now" button anywhere in the UI.
+# ---------------------------------------------------------------------------
+
+ALLOWED_VAULT_SUPPORTING_DOC_EXTENSIONS = {
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.xlsm', '.csv', '.png', '.jpg', '.jpeg',
+}
+
+
+def _serialize_vault_file(f):
+    return {
+        'id': f.id,
+        'file_type': f.file_type,
+        'file_type_display': f.get_file_type_display(),
+        'original_filename': f.original_filename,
+        'version_label': f.version_label,
+        'uploaded_by': f.uploaded_by.email if f.uploaded_by else None,
+        'uploaded_at': f.uploaded_at.isoformat(),
+    }
+
+
+class DealVaultListView(APIView):
+    """
+    Every versioned file kept against a deal — auto-vaulted Locked
+    Baseline/Re-upload Excel snapshots plus any manually-added supporting
+    documents — newest first. Read-only; see DealVaultFileUploadView
+    below for adding a supporting document and DealVaultFileDownloadView
+    for reading one back. Same visibility gate as every other read-only
+    pipeline list (Team Notes, checklist) — anyone who can see the deal
+    can see its vault.
+    URL: GET /api/ai/pipeline/projects/<int:project_id>/vault/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, project_id):
+        from .permissions import visible_projects_for
+
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        files = project.vault_files.select_related('uploaded_by')
+        return Response([_serialize_vault_file(f) for f in files])
+
+
+class DealVaultFileUploadView(APIView):
+    """
+    The ONE manual path into the vault: attaching an arbitrary supporting
+    document (an appraisal, an insurance quote, a signed LOI) to a deal —
+    see DealVaultFile's own docstring ('supporting_document') for why
+    this is a deliberate, named exception to this platform's usual zero-
+    retention policy. Same visibility gate as Team Notes/checklist — not
+    can_manage_project — a supporting document is a collaborative
+    artifact like a note, not a pipeline-stage change.
+    URL: POST /api/ai/pipeline/projects/<int:project_id>/vault/upload/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, project_id):
+        from .permissions import visible_projects_for
+        from .models import DealVaultFile
+
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        uploaded_file = request.FILES.get('file')
+        try:
+            validate_uploaded_file(
+                uploaded_file, ALLOWED_VAULT_SUPPORTING_DOC_EXTENSIONS, label="Supporting Document"
+            )
+        except FileValidationError as e:
+            return Response({'detail': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        version_label = (request.data.get('version_label') or '').strip()
+
+        vault_file = DealVaultFile.objects.create(
+            project=project,
+            file=uploaded_file,
+            file_type='supporting_document',
+            original_filename=uploaded_file.name,
+            version_label=version_label,
+            uploaded_by=request.user,
+        )
+
+        return Response(_serialize_vault_file(vault_file), status=status.HTTP_201_CREATED)
+
+
+class DealVaultFileDownloadView(APIView):
+    """
+    Reads one vault file back — the only way any vault file is ever
+    reachable, per PrivateFileSystemStorage's own docstring (no public
+    URL exists). Visibility-checked against the file's OWN project
+    first, then re-confirmed the file actually belongs to the
+    project_id in the URL — a vault file id alone is never trusted to
+    imply the right deal.
+    URL: GET /api/ai/pipeline/projects/<int:project_id>/vault/<int:file_id>/download/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, project_id, file_id):
+        import mimetypes
+        from .permissions import visible_projects_for
+        from .models import DealVaultFile
+
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        vault_file = DealVaultFile.objects.filter(pk=file_id, project=project).first()
+        if vault_file is None:
+            return Response({'detail': 'File not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        filename = vault_file.original_filename or vault_file.file.name.rsplit('/', 1)[-1]
+        content_type, _ = mimetypes.guess_type(filename)
+
+        return FileResponse(
+            vault_file.file.open('rb'),
+            as_attachment=True,
+            filename=filename,
+            content_type=content_type or 'application/octet-stream',
+        )
+
+
+def _serialize_lender_share_link(link):
+    return {
+        'id': link.id,
+        'access_token': link.access_token,
+        'recipient_label': link.recipient_label,
+        'is_active': link.is_active,
+        'view_count': link.view_count,
+        'last_viewed_at': link.last_viewed_at.isoformat() if link.last_viewed_at else None,
+        'expires_at': link.expires_at.isoformat() if link.expires_at else None,
+        'created_at': link.created_at.isoformat(),
+        'is_expired': link.is_expired,
+        'is_usable': link.is_usable,
+    }
+
+
+class LenderShareLinkListCreateView(APIView):
+    """
+    Pipeline Modules Phase 6: "Generate Lender Packet" — every tokenized
+    public share link ever generated for a deal (GET), and generating a
+    new one (POST). Gated to can_manage_project — the same bar as editing
+    assigned_analyst/pipeline_stage — since a generated link is a
+    standing, EXTERNALLY reachable grant on this deal's locked data, not
+    a purely collaborative artifact like a Team Note or vault upload
+    (those only require visible_projects_for).
+
+    POST requires the deal to already be locked — see LenderShareLink's
+    own docstring ("nothing to show before lock").
+
+    expires_in_days (optional int in the POST body): omitted defaults to
+    30 days (the client's explicit default); 0/null/'' means no expiry;
+    a positive integer sets expires_at that many days from now.
+    URL: GET/POST /api/ai/pipeline/projects/<int:project_id>/lender-links/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def _get_project(self, request, project_id):
+        from .permissions import visible_projects_for
+        return visible_projects_for(request.user).select_related(
+            'workspace', 'baseline_lock'
+        ).filter(pk=project_id).first()
+
+    def get(self, request, project_id):
+        project = self._get_project(request, project_id)
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        links = project.lender_share_links.all()
+        return Response([_serialize_lender_share_link(l) for l in links])
+
+    def post(self, request, project_id):
+        from .permissions import can_manage_project
+        from .models import LenderShareLink
+
+        project = self._get_project(request, project_id)
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if not can_manage_project(request.user, project):
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        if getattr(project, 'baseline_lock', None) is None:
+            return Response(
+                {'detail': (
+                    "This deal's baseline must be locked before a Lender Packet can "
+                    "be generated — use Approve & Lock Baseline, or Sign Off if it's "
+                    "in VP Review."
+                )},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        recipient_label = (request.data.get('recipient_label') or '').strip()
+
+        if 'expires_in_days' in request.data:
+            raw_days = request.data.get('expires_in_days')
+            expires_at = None
+            if raw_days:
+                try:
+                    days = int(raw_days)
+                except (TypeError, ValueError):
+                    return Response(
+                        {'detail': "'expires_in_days' must be an integer."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                if days > 0:
+                    expires_at = timezone.now() + timedelta(days=days)
+            # falsy (0 / null / '') -> no expiry, expires_at stays None.
+        else:
+            # Omitted entirely -> the client's explicit default.
+            expires_at = timezone.now() + timedelta(days=30)
+
+        link = LenderShareLink.objects.create(
+            project=project,
+            workspace=project.workspace,
+            recipient_label=recipient_label,
+            expires_at=expires_at,
+            created_by=request.user,
+        )
+        return Response(_serialize_lender_share_link(link), status=status.HTTP_201_CREATED)
+
+
+class LenderShareLinkRevokeView(APIView):
+    """
+    Toggles is_active on one of this deal's LenderShareLink rows — the
+    manual revoke/reactivate switch (see LenderShareLink's own docstring
+    for how this interacts with expires_at). Same can_manage_project gate
+    as generating the link. The link id is re-confirmed against THIS
+    project_id, same double-check pattern as DealVaultFileDownloadView —
+    a link id alone is never trusted to imply the right deal.
+    URL: PATCH /api/ai/pipeline/projects/<int:project_id>/lender-links/<int:link_id>/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, project_id, link_id):
+        from .permissions import visible_projects_for, can_manage_project
+        from .models import LenderShareLink
+
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if not can_manage_project(request.user, project):
+            return Response({'detail': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+
+        link = LenderShareLink.objects.filter(pk=link_id, project=project).first()
+        if link is None:
+            return Response({'detail': 'Lender link not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if 'is_active' not in request.data:
+            return Response({'detail': "Provide 'is_active' (true/false)."}, status=status.HTTP_400_BAD_REQUEST)
+
+        link.is_active = bool(request.data.get('is_active'))
+        link.save(update_fields=['is_active'])
+        return Response(_serialize_lender_share_link(link))
+
+
+def _get_usable_lender_link_or_none(access_token):
+    """
+    Shared lookup for every public lender-portal view below. Deliberately
+    collapses "no such token" / "revoked" / "expired" into the same None
+    result — an unauthenticated caller is never told WHICH reason a token
+    doesn't work (same minimal-disclosure principle as a login form never
+    confirming whether an email exists), and every caller below turns
+    None into a 404, NEVER a 401 — see LenderSharePortalView's own
+    docstring for exactly why that distinction matters for this one
+    group of endpoints.
+    """
+    from .models import LenderShareLink
+
+    link = LenderShareLink.objects.select_related(
+        'project', 'project__organization',
+        'project__baseline_lock', 'project__baseline_lock__analysis',
+    ).filter(access_token=access_token).first()
+    if link is None or not link.is_usable:
+        return None
+    return link
+
+
+class LenderSharePortalView(APIView):
+    """
+    Pipeline Modules Phase 6: the public, UNAUTHENTICATED read-only lender
+    portal — the frontend's /share/deal/:token page calls this to render
+    everything a lender sees. permission_classes=[AllowAny] (the same
+    no-gate pattern as users.views.LogoutView, for the same reason: this
+    request may have no valid session at all, by design — an external
+    lender was never asked to create an account on this platform).
+
+    IMPORTANT — this view (and every other public lender-portal view
+    below) must NEVER return HTTP 401, under any failure path. Why: the
+    frontend's global $fetch override (frontend/app/plugins/
+    auth_interceptor.client.ts) force-logs-out and redirects to /login on
+    ANY 401 response anywhere in the app. An external lender has no
+    account and no /login to go to — a 401 here would silently strand
+    them on a broken redirect instead of a plain "this link doesn't
+    work" message. Every failure path below returns 404 instead.
+    (Belt-and-suspenders note: CookieJWTAuthentication.authenticate()
+    already returns None rather than raising for a missing OR invalid
+    access_token cookie — see users/authentication.py — so an ordinary
+    unauthenticated request was never going to 401 at the auth layer in
+    the first place. authentication_classes=[] below is an extra,
+    explicit guarantee on top of that, specifically for this one group of
+    public-facing views where getting it wrong has a real user-facing
+    consequence.)
+
+    Bundles exactly what the spec calls for: the 1-Page Deal Scorecard &
+    Executive Summary (the same _compute_deal_scorecard() computation
+    ICSummaryPDFView uses, built off the LOCKED analysis only — never a
+    moving "latest" one), whether a Locked Underwritten Excel Model is
+    available (see LenderShareExcelDownloadView — absent for
+    ClientExcelTemplate orgs, which skip auto-vault-on-lock in v1), and
+    any vault 'supporting_document' files — deliberately EXCLUDING
+    're_upload' vault entries (post-lock internal cell-override audit
+    history, not meant for an external audience) and never exposing raw
+    OM/T12/Rent Roll inputs, which this platform's zero-retention policy
+    never persists anywhere to begin with.
+
+    Increments view_count/last_viewed_at on every successful load — this
+    feature's entire "view tracking" mechanism; see LenderShareLink's own
+    docstring and _get_deal_activity_feed's 'lender_link_viewed' event for
+    how this surfaces back to the team.
+    URL: GET /api/ai/share/deal/<str:access_token>/
+    """
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request, access_token):
+        link = _get_usable_lender_link_or_none(access_token)
+        if link is None:
+            return Response({'detail': 'This link is no longer available.'}, status=status.HTTP_404_NOT_FOUND)
+
+        project = link.project
+        lock = getattr(project, 'baseline_lock', None)
+        if lock is None:
+            # Shouldn't happen in practice — generating a link requires a
+            # lock, and nothing in this codebase ever unlocks a deal — but
+            # this view must never crash the public portal if it somehow
+            # does (e.g. data fixed up by hand).
+            return Response({'detail': 'This link is no longer available.'}, status=status.HTTP_404_NOT_FOUND)
+
+        analysis = lock.analysis
+        rent_roll_df = (
+            pd.DataFrame((analysis.rent_roll_data or {}).get('rows', []))
+            if analysis.rent_roll_data else None
+        )
+        deal_scorecard = _compute_deal_scorecard(
+            analysis.metrics, rent_roll_df, analysis.documents_provided, project.asking_price
+        )
+
+        has_locked_excel = project.vault_files.filter(file_type='locked_baseline_excel').exists()
+        supporting_docs = project.vault_files.filter(file_type='supporting_document')
+
+        link.view_count += 1
+        link.last_viewed_at = timezone.now()
+        link.save(update_fields=['view_count', 'last_viewed_at'])
+
+        return Response({
+            'recipient_label': link.recipient_label,
+            'property_name': project.property_name or 'Untitled',
+            'locked_at': lock.locked_at.isoformat(),
+            'deal_scorecard': deal_scorecard,
+            'has_locked_excel': has_locked_excel,
+            'supporting_documents': [
+                {
+                    'id': f.id,
+                    'original_filename': f.original_filename,
+                    'version_label': f.version_label,
+                    'uploaded_at': f.uploaded_at.isoformat(),
+                }
+                for f in supporting_docs
+            ],
+        })
+
+
+class LenderShareExcelDownloadView(APIView):
+    """
+    Serves the Locked Underwritten Excel Model's bytes for one usable
+    LenderShareLink — see LenderSharePortalView's docstring for the
+    401-avoidance discipline every view in this group follows. Reads the
+    'locked_baseline_excel' DealVaultFile vaulted at lock time (see
+    _vault_locked_baseline_excel above), exactly like
+    DealVaultFileDownloadView does for an authenticated team member, just
+    gated by the share token instead of visible_projects_for.
+    404s (never 401) for a bad/expired/inactive token OR an org with no
+    vaulted locked-baseline Excel (e.g. a ClientExcelTemplate org — see
+    DealVaultFile's own docstring on why those are skipped in v1).
+    URL: GET /api/ai/share/deal/<str:access_token>/excel/
+    """
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request, access_token):
+        import mimetypes
+        from .models import DealVaultFile
+
+        link = _get_usable_lender_link_or_none(access_token)
+        if link is None:
+            return Response({'detail': 'This link is no longer available.'}, status=status.HTTP_404_NOT_FOUND)
+
+        vault_file = DealVaultFile.objects.filter(
+            project=link.project, file_type='locked_baseline_excel'
+        ).order_by('-uploaded_at').first()
+        if vault_file is None:
+            return Response(
+                {'detail': 'No locked Excel model is available for this deal.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        filename = vault_file.original_filename or vault_file.file.name.rsplit('/', 1)[-1]
+        content_type, _ = mimetypes.guess_type(filename)
+
+        return FileResponse(
+            vault_file.file.open('rb'),
+            as_attachment=True,
+            filename=filename,
+            content_type=content_type or 'application/octet-stream',
+        )
+
+
+class LenderShareVaultFileDownloadView(APIView):
+    """
+    Serves one 'supporting_document' vault file for a usable
+    LenderShareLink — same 404-never-401 discipline as the other public
+    lender-portal views above. Restricted to file_type=
+    'supporting_document': a lender can never reach a 're_upload'
+    internal-audit vault entry through this endpoint even by guessing its
+    id, since that type is already excluded from LenderSharePortalView's
+    own listing.
+    URL: GET /api/ai/share/deal/<str:access_token>/vault/<int:file_id>/
+    """
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def get(self, request, access_token, file_id):
+        import mimetypes
+        from .models import DealVaultFile
+
+        link = _get_usable_lender_link_or_none(access_token)
+        if link is None:
+            return Response({'detail': 'This link is no longer available.'}, status=status.HTTP_404_NOT_FOUND)
+
+        vault_file = DealVaultFile.objects.filter(
+            pk=file_id, project=link.project, file_type='supporting_document'
+        ).first()
+        if vault_file is None:
+            return Response({'detail': 'File not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        filename = vault_file.original_filename or vault_file.file.name.rsplit('/', 1)[-1]
+        content_type, _ = mimetypes.guess_type(filename)
+
+        return FileResponse(
+            vault_file.file.open('rb'),
+            as_attachment=True,
+            filename=filename,
+            content_type=content_type or 'application/octet-stream',
+        )
+
+
 # Feature 1 (Variance & Change Ledger) extension: per the client's explicit
 # decision, the firm-wide PROACTIVE alert feed below is deliberately
 # narrower than the full 18-scalar/13-row Cell Override Audit Log (every
@@ -3444,6 +5229,54 @@ OVERRIDE_ALERT_TRACKED_FIELDS = {
     'IU_NetOperatingIncome': 'Net Operating Income',
 }
 OVERRIDE_ALERT_THRESHOLD_PCT = 2.0
+
+
+def _get_override_alerts(user, limit=200):
+    """
+    The actual query + serialization behind OverrideAlertFeedView, factored
+    out so the Pipeline Modules Phase 2 Leadership Digest (below) can pull
+    the same firm-wide variance feed into its own payload — capped smaller,
+    as a preview — without duplicating this logic or risking it drifting
+    out of sync with the dedicated full-feed endpoint.
+    """
+    from .permissions import visible_projects_for
+    from .models import ExcelOverrideDelta
+
+    projects = visible_projects_for(user)
+
+    deltas = (
+        ExcelOverrideDelta.objects
+        .filter(
+            field_name__in=OVERRIDE_ALERT_TRACKED_FIELDS,
+            variance_pct__isnull=False,
+            variance_pct__gt=OVERRIDE_ALERT_THRESHOLD_PCT,
+            upload__project__in=projects,
+        )
+        .select_related('upload', 'upload__uploaded_by', 'upload__project', 'upload__project__workspace')
+        .order_by('-upload__uploaded_at')[:limit]
+    )
+
+    return [
+        {
+            'delta_id': d.id,
+            'upload_id': d.upload_id,
+            'uploaded_at': d.upload.uploaded_at.isoformat(),
+            'uploaded_by': d.upload.uploaded_by.email if d.upload.uploaded_by else None,
+            'project_id': d.upload.project_id,
+            'property_name': d.upload.project.property_name,
+            'workspace_name': d.upload.project.workspace.name if d.upload.project.workspace_id else None,
+            'field_name': d.field_name,
+            'field_label': OVERRIDE_ALERT_TRACKED_FIELDS[d.field_name],
+            'original_value': d.original_value,
+            'new_value': d.new_value,
+            'variance_pct': d.variance_pct,
+            # Sprint "Workflow Upgrades" Feature 2: the analyst's
+            # required 1-sentence explanation for this upload, shown
+            # directly under the alert row in the firm-wide feed.
+            'variance_note': d.upload.variance_note,
+        }
+        for d in deltas
+    ]
 
 
 class OverrideAlertFeedView(APIView):
@@ -3466,48 +5299,1363 @@ class OverrideAlertFeedView(APIView):
     Capped at the 200 most recent qualifying changes — a dashboard feed,
     not a full export (ExcelOverrideHistoryView above already gives the
     complete, uncapped per-deal history for anyone who opens a deal).
+    The actual query now lives in _get_override_alerts() above, shared
+    with the Leadership Digest (Pipeline Modules Phase 2).
     URL: GET /api/ai/pipeline/override-alerts/
     """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        alerts = _get_override_alerts(request.user, limit=200)
+        return Response({'alerts': alerts, 'threshold_pct': OVERRIDE_ALERT_THRESHOLD_PCT})
+
+
+class TeamScorecardView(APIView):
+    """
+    V2 Module 4b (Analyst Speed & Accuracy Scorecard): per-analyst
+    performance metrics for the Leadership Morning Digest's "Team
+    Performance" tab — see team_scorecard.compute_analyst_scorecards
+    for the 4 metrics (Deals Underwritten, Average Turnaround Time,
+    >2.0% Post-Upload Variance Rate reusing OVERRIDE_ALERT_
+    TRACKED_FIELDS/_THRESHOLD_PCT above verbatim, and Forensic
+    Seller-Trap Flags Triggered).
+
+    Gated to the same leadership tier as every other org-wide/
+    workspace-wide view in this codebase (Org Admin or Workspace Head,
+    or a platform superuser) — a plain analyst, or a member with no
+    workspace, has no "team" to see a scorecard FOR, same reasoning as
+    can_lock_project's own gate. Scoped through visible_projects_for
+    exactly like OverrideAlertFeedView/the Leadership Digest above: an
+    Org Admin's scorecard is firm-wide, a Workspace Head's is their own
+    workspace only. No special case.
+    URL: GET /api/ai/pipeline/team-scorecard/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
         from .permissions import visible_projects_for
-        from .models import ExcelOverrideDelta
+        from .team_scorecard import compute_analyst_scorecards
 
-        projects = visible_projects_for(request.user)
-
-        deltas = (
-            ExcelOverrideDelta.objects
-            .filter(
-                field_name__in=OVERRIDE_ALERT_TRACKED_FIELDS,
-                variance_pct__isnull=False,
-                variance_pct__gt=OVERRIDE_ALERT_THRESHOLD_PCT,
-                upload__project__in=projects,
+        user = request.user
+        is_leader = user.is_admin or user.role == 'admin' or (
+            user.workspace_id is not None and user.workspace_role == 'head'
+        )
+        if not is_leader:
+            return Response(
+                {'detail': 'Only an Org Admin or Workspace Head can view the Team Scorecard.'},
+                status=status.HTTP_403_FORBIDDEN,
             )
-            .select_related('upload', 'upload__uploaded_by', 'upload__project', 'upload__project__workspace')
-            .order_by('-upload__uploaded_at')[:200]
+
+        projects = visible_projects_for(user)
+        rows = compute_analyst_scorecards(projects, OVERRIDE_ALERT_TRACKED_FIELDS, OVERRIDE_ALERT_THRESHOLD_PCT)
+        return Response({'analysts': rows, 'variance_threshold_pct': OVERRIDE_ALERT_THRESHOLD_PCT})
+
+
+# ---------------------------------------------------------------------------
+# Pipeline Modules Phase 2: VP Sign-Off Gate & Leadership Digest. The gate
+# itself and the combined sign-off/lock action live above (see
+# PropertyProjectDetailView.patch's gate check and VPSignOffView). What
+# follows is the second half: a "Leadership Morning Digest" leadership (or,
+# per the "no special case" philosophy above, anyone — it just narrows to
+# their own deals via visible_projects_for like every other pipeline view)
+# can open any time, plus a reportlab-rendered PDF of the same data. Per the
+# client's explicit decision, this phase ships BOTH: the in-app page now,
+# and a PDF download button on it — no automatic scheduled email yet.
+# ---------------------------------------------------------------------------
+
+# A deal with no DealActivityLog entry in this many days (and not already
+# Dead/Passed) shows up in the digest's "stale deals" section. Deliberately
+# a plain module constant, not an org setting — v1 scope, same reasoning as
+# OVERRIDE_ALERT_THRESHOLD_PCT above.
+STALE_DEAL_DAYS = 7
+
+
+def _get_leadership_digest_data(user):
+    """
+    Gathers every section of the Leadership Morning Digest in one place so
+    LeadershipDigestView (JSON) and LeadershipDigestPDFView (PDF) render
+    the exact same underlying data — never two independently-computed
+    copies that could disagree with each other.
+
+    Sections:
+      - stage_counts: how many of this user's visible deals sit in each of
+        the 5 pipeline stages right now.
+      - awaiting_sign_off: visible deals sitting in 'vp_review' whose
+        baseline isn't locked yet — i.e. still waiting on the VP Sign-Off
+        Gate (see VPSignOffView's docstring).
+      - stale_deals: visible deals (any stage except 'dead_passed') with no
+        DealActivityLog entry in at least STALE_DEAL_DAYS days — "nobody's
+        touched this deal in a while."
+      - variance_alerts: a 10-row preview of the same firm-wide variance
+        feed OverrideAlertFeedView exposes in full (see
+        _get_override_alerts() above).
+
+    Every section is scoped through visible_projects_for(user) — the exact
+    same Org -> Workspace -> Analyst/Head hierarchy as every other pipeline
+    view, so a plain analyst's "Leadership Digest" is really just their own
+    morning digest, and an Org Admin's is genuinely firm-wide. No special
+    case, same philosophy as OverrideAlertFeedView.
+    """
+    from django.db.models import Max
+    from collections import Counter
+    from .permissions import visible_projects_for
+    from .models import PropertyProject, DealActivityLog
+
+    now = timezone.now()
+    projects = list(
+        visible_projects_for(user).select_related('workspace', 'assigned_analyst', 'baseline_lock')
+    )
+
+    stage_counts_raw = Counter(p.pipeline_stage for p in projects)
+    stage_counts = {
+        stage: stage_counts_raw.get(stage, 0) for stage, _ in PropertyProject.PIPELINE_STAGE_CHOICES
+    }
+
+    last_activity_by_project = dict(
+        DealActivityLog.objects
+        .filter(project__in=projects)
+        .values('project_id')
+        .annotate(last_at=Max('created_at'))
+        .values_list('project_id', 'last_at')
+    )
+
+    awaiting_sign_off = []
+    stale_deals = []
+
+    for p in projects:
+        # Every project gets a "created" DealActivityLog row going
+        # forward (see document_history.record_analysis_report), but a
+        # deal created before Pipeline Modules Phase 1 shipped may have
+        # none at all yet — fall back to created_at for those.
+        last_activity = last_activity_by_project.get(p.id) or p.created_at
+        days_since_activity = (now - last_activity).days
+
+        lock = getattr(p, 'baseline_lock', None)
+        if p.pipeline_stage == 'vp_review' and lock is None:
+            awaiting_sign_off.append({
+                'id': p.id,
+                'property_name': p.property_name or 'Untitled',
+                'workspace': p.workspace.name if p.workspace_id else None,
+                'assigned_analyst': p.assigned_analyst.email if p.assigned_analyst_id else None,
+                'days_in_vp_review': days_since_activity,
+                'target_closing_or_offer_date': (
+                    p.target_closing_or_offer_date.isoformat() if p.target_closing_or_offer_date else None
+                ),
+            })
+
+        if p.pipeline_stage != 'dead_passed' and days_since_activity >= STALE_DEAL_DAYS:
+            stale_deals.append({
+                'id': p.id,
+                'property_name': p.property_name or 'Untitled',
+                'workspace': p.workspace.name if p.workspace_id else None,
+                'pipeline_stage': p.pipeline_stage,
+                'pipeline_stage_display': p.get_pipeline_stage_display(),
+                'days_since_activity': days_since_activity,
+            })
+
+    awaiting_sign_off.sort(key=lambda d: d['days_in_vp_review'], reverse=True)
+    stale_deals.sort(key=lambda d: d['days_since_activity'], reverse=True)
+
+    return {
+        'generated_at': now.isoformat(),
+        'stage_counts': stage_counts,
+        'awaiting_sign_off': awaiting_sign_off,
+        # Capped — a dashboard/PDF digest, not a full export (same
+        # "preview, not export" reasoning as _get_override_alerts' own
+        # 200-row cap, just tighter since this renders in full on the page).
+        'stale_deals': stale_deals[:50],
+        'variance_alerts': _get_override_alerts(user, limit=10),
+        'stale_deal_threshold_days': STALE_DEAL_DAYS,
+    }
+
+
+class LeadershipDigestView(APIView):
+    """
+    Pipeline Modules Phase 2: the Leadership Morning Digest's in-app page —
+    see _get_leadership_digest_data()'s own docstring for exactly what it
+    returns and how visibility is scoped.
+    URL: GET /api/ai/pipeline/leadership-digest/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(_get_leadership_digest_data(request.user))
+
+
+class LeadershipDigestPDFView(APIView):
+    """
+    Pipeline Modules Phase 2: "Download as PDF" on the Leadership Digest
+    page — renders the EXACT same data _get_leadership_digest_data()
+    returns to the JSON endpoint above, via reportlab (see that library's
+    own choice reasoning in requirements.txt: this server's cPanel hosting
+    has no Cairo/Pango for WeasyPrint). Never re-queries independently, so
+    the PDF can never show different numbers than the page it was
+    downloaded from.
+    URL: GET /api/ai/pipeline/leadership-digest/pdf/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .leadership_digest_pdf import render_leadership_digest_pdf
+
+        digest_data = _get_leadership_digest_data(request.user)
+        pdf_bytes = render_leadership_digest_pdf(digest_data, generated_for_email=request.user.email)
+
+        filename = f"Leadership_Digest_{timezone.now():%Y-%m-%d}.pdf"
+        return FileResponse(
+            io.BytesIO(pdf_bytes),
+            as_attachment=True,
+            filename=filename,
+            content_type='application/pdf',
         )
 
-        alerts = [
-            {
-                'delta_id': d.id,
-                'upload_id': d.upload_id,
-                'uploaded_at': d.upload.uploaded_at.isoformat(),
-                'uploaded_by': d.upload.uploaded_by.email if d.upload.uploaded_by else None,
-                'project_id': d.upload.project_id,
-                'property_name': d.upload.project.property_name,
-                'workspace_name': d.upload.project.workspace.name if d.upload.project.workspace_id else None,
-                'field_name': d.field_name,
-                'field_label': OVERRIDE_ALERT_TRACKED_FIELDS[d.field_name],
-                'original_value': d.original_value,
-                'new_value': d.new_value,
-                'variance_pct': d.variance_pct,
-                # Sprint "Workflow Upgrades" Feature 2: the analyst's
-                # required 1-sentence explanation for this upload, shown
-                # directly under the alert row in the firm-wide feed.
-                'variance_note': d.upload.variance_note,
-            }
-            for d in deltas
-        ]
 
-        return Response({'alerts': alerts, 'threshold_pct': OVERRIDE_ALERT_THRESHOLD_PCT})
+# ---------------------------------------------------------------------------
+# Pipeline Modules Phase 7: Email-to-Deal Intake (Postmark Inbound)
+# ---------------------------------------------------------------------------
+# An analyst (or a broker, directly) sends/forwards an email with the OM/T12/
+# Rent Roll attached to a workspace's own deals-<slug>@... address (see
+# TeamWorkspace.inbound_email_address in users/models.py). Postmark's Inbound
+# product receives it and POSTs the parsed message to
+# InboundEmailWebhookView below, which turns it into a brand-new
+# PropertyProject and enqueues the same background extraction pipeline a
+# manual dashboard upload uses. See that view's own docstring for the full
+# design (authentication, idempotency, rejection taxonomy).
+
+# Postmark's own inbound limits are 10 attachments / 10MB total per message;
+# these are defensive backstops that mirror those numbers rather than new
+# arbitrary limits of our own.
+MAX_INBOUND_ATTACHMENTS = 10
+MAX_INBOUND_ATTACHMENT_BYTES = 25 * 1024 * 1024
+
+# Matches an optional "Target: $X" / "Price: $X" tag anywhere in the
+# subject or body - e.g. "Target: $5.2M", "Price: 4,500,000", "target:$950k".
+# Case-insensitive; the K/M suffix is a convenience this codebase's own
+# analysts asked for informally, not something the original spec wording
+# required, but it costs nothing extra to support.
+_ASKING_PRICE_TAG_RE = re.compile(
+    r'(?:target|price)\s*:\s*\$?\s*([\d,]+(?:\.\d+)?)\s*([km])?\b', re.IGNORECASE
+)
+
+
+def _parse_asking_price_tag(text):
+    """
+    Returns the first Target:/Price: tag value found in `text` as a float,
+    or None if no tag is present (or it fails to parse) - None leaves
+    asking_price entirely to run_inbound_email_underwriting_task's own
+    AI-extracted-OM-price fallback (see that task's docstring in tasks.py).
+    """
+    if not text:
+        return None
+    match = _ASKING_PRICE_TAG_RE.search(text)
+    if not match:
+        return None
+    try:
+        value = float(match.group(1).replace(',', ''))
+    except (TypeError, ValueError):
+        return None
+    suffix = (match.group(2) or '').lower()
+    if suffix == 'k':
+        value *= 1_000
+    elif suffix == 'm':
+        value *= 1_000_000
+    return value if value > 0 else None
+
+
+def _check_postmark_basic_auth(request) -> bool:
+    """
+    The ONLY authenticity check this webhook has - Postmark Inbound doesn't
+    sign each payload cryptographically; its own recommended verification
+    is HTTP Basic Auth baked into the webhook URL registered with Postmark
+    itself (see POSTMARK_INBOUND_WEBHOOK_USERNAME/PASSWORD's own docstrings
+    in settings.py). Both unset (the dev-friendly default) SKIPS this check
+    entirely - returns True unconditionally - which is only safe before
+    this URL is ever registered live with Postmark.
+    """
+    expected_user = django_settings.POSTMARK_INBOUND_WEBHOOK_USERNAME
+    expected_pass = django_settings.POSTMARK_INBOUND_WEBHOOK_PASSWORD
+    if not expected_user and not expected_pass:
+        return True
+
+    auth_header = request.META.get('HTTP_AUTHORIZATION', '')
+    if not auth_header.startswith('Basic '):
+        return False
+    try:
+        decoded = base64.b64decode(auth_header[len('Basic '):]).decode('utf-8')
+        sent_user, _, sent_pass = decoded.partition(':')
+    except Exception:
+        return False
+    return sent_user == expected_user and sent_pass == expected_pass
+
+
+def _iter_postmark_attachment_files(attachments):
+    """
+    Decodes Postmark's base64 Attachments list into (filename, raw_bytes)
+    pairs. Expands any .zip attachment's contents inline as additional
+    candidates (one level deep only) since brokers routinely zip an
+    OM+T12+Rent Roll bundle together rather than attaching 3 separate
+    files. Caps total candidates at MAX_INBOUND_ATTACHMENTS as a defensive
+    bound against a hostile/oversized zip; anything past the cap (or any
+    single file over MAX_INBOUND_ATTACHMENT_BYTES) is silently dropped
+    rather than erroring the whole email out over it.
+    """
+    candidates = []
+    for att in (attachments or []):
+        if len(candidates) >= MAX_INBOUND_ATTACHMENTS:
+            break
+        name = att.get('Name') or 'attachment'
+        content_b64 = att.get('Content')
+        if not content_b64:
+            continue
+        try:
+            raw = base64.b64decode(content_b64)
+        except Exception:
+            continue
+        if not raw or len(raw) > MAX_INBOUND_ATTACHMENT_BYTES:
+            continue
+
+        if name.lower().endswith('.zip'):
+            try:
+                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                    for zip_name in zf.namelist():
+                        if len(candidates) >= MAX_INBOUND_ATTACHMENTS:
+                            break
+                        if zip_name.endswith('/'):
+                            continue
+                        try:
+                            zip_bytes = zf.read(zip_name)
+                        except Exception:
+                            continue
+                        if not zip_bytes or len(zip_bytes) > MAX_INBOUND_ATTACHMENT_BYTES:
+                            continue
+                        candidates.append((os.path.basename(zip_name), zip_bytes))
+            except zipfile.BadZipFile:
+                # Not actually a valid zip despite the extension - fall
+                # through and try it as a regular file instead.
+                candidates.append((name, raw))
+        else:
+            candidates.append((name, raw))
+    return candidates
+
+
+def _classify_inbound_attachments(attachments):
+    """
+    Runs every decoded attachment candidate through the same
+    classify_document() keyword scan ClassifyDocumentView uses, routing
+    each into the om/t12/rent_roll slot it scores highest for - FIRST
+    MATCH WINS per slot (there's no analyst standing by at inbox time to
+    pick between two Rent Rolls the way the dashboard's drop zone lets one
+    do interactively). Returns (om, t12, rent_roll) as (ContentFile or
+    None) x3. UNCLASSIFIED and unreadable attachments are silently
+    skipped - this is a best-effort automatic sort, not a hard validation
+    gate (the "no usable attachments at all" check happens one level up,
+    in the view itself).
+    """
+    from django.core.files.base import ContentFile
+
+    slots = {'om': None, 't12': None, 'rent_roll': None}
+    type_to_slot = {
+        DOCUMENT_TYPE_OFFERING_MEMORANDUM: 'om',
+        DOCUMENT_TYPE_TRAILING_12: 't12',
+        DOCUMENT_TYPE_RENT_ROLL: 'rent_roll',
+    }
+
+    for filename, raw_bytes in _iter_postmark_attachment_files(attachments):
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in CLASSIFIABLE_EXTENSIONS:
+            continue
+
+        wrapped = ContentFile(raw_bytes, name=filename)
+        try:
+            result = classify_document(wrapped)
+        except DocumentClassificationError:
+            continue
+
+        slot = type_to_slot.get(result.get('document_type'))
+        if slot and slots[slot] is None:
+            wrapped.seek(0)
+            slots[slot] = wrapped
+
+    return slots['om'], slots['t12'], slots['rent_roll']
+
+
+def _resolve_inbound_workspace(to_full):
+    """
+    Resolves the recipient address (Postmark's ToFull[0] - the actual
+    envelope recipient this inbound stream is configured against, not
+    whatever else may be cc'd) against TeamWorkspace.inbound_email_slug.
+    Every address this feature hands out has the literal local-part
+    'deals-<slug>' (see TeamWorkspace.inbound_email_address in
+    users/models.py) - anything that doesn't start with that exact prefix
+    can't be one of ours. Returns the TeamWorkspace, or None.
+    """
+    from users.models import TeamWorkspace
+
+    if not to_full:
+        return None
+    recipient = (to_full[0].get('Email') or '').strip().lower()
+    local_part = recipient.split('@', 1)[0]
+    if not local_part.startswith('deals-'):
+        return None
+    slug = local_part[len('deals-'):]
+    if not slug:
+        return None
+    return TeamWorkspace.objects.filter(inbound_email_slug=slug).first()
+
+
+def _resolve_inbound_sender(from_email, workspace):
+    """
+    Verifies the sender is an ACTIVE CustomUser who is a MEMBER OF THIS
+    EXACT WORKSPACE (CustomUser.workspace_id == workspace.id) - a
+    deliberate, literal reading of the spec, not merely "same
+    organization". Worth flagging as a real consequence: an org admin who
+    oversees several workspaces but isn't personally a member of THIS one
+    can't submit deals through its address unless they're also added as a
+    member - the same membership model CustomUser.workspace already
+    enforces everywhere else in this codebase. Returns the CustomUser, or
+    None.
+    """
+    from django.contrib.auth import get_user_model
+
+    if not from_email or workspace is None:
+        return None
+    User = get_user_model()
+    return User.objects.filter(
+        email__iexact=from_email, workspace_id=workspace.id, is_active=True,
+    ).first()
+
+
+class InboundEmailWebhookView(APIView):
+    """
+    Pipeline Modules Phase 7 (Multi-Tenant Email-to-Deal Intake): the
+    server-to-server endpoint Postmark's Inbound stream POSTs to every
+    time an email arrives at one of this app's deals-<slug>@... addresses
+    (see TeamWorkspace.inbound_email_address in users/models.py). An
+    analyst forwards (or a broker sends directly to) that address with the
+    OM/T12/Rent Roll attached; this view resolves which workspace it
+    belongs to, verifies the sender is actually a member of it, sorts the
+    attachments into the right slots, creates a brand-new PropertyProject
+    immediately (titled from the email's subject line, so it shows up in
+    the pipeline before AI extraction even starts), and enqueues the exact
+    same background extraction pipeline a manual dashboard upload uses
+    (run_inbound_email_underwriting_task - see tasks.py for the two
+    deliberate, scoped differences from a manual upload: the asking_price
+    pre-fill/override and the placeholder-subject-to-AI-extracted-name
+    upgrade).
+
+    AUTHENTICATION: see _check_postmark_basic_auth above - the ONLY path
+    in this view that ever returns 401. Every other rejection below
+    (unknown workspace slug, unauthorized sender, no usable attachments,
+    malformed payload) is a PERMANENT rejection Postmark should stop
+    retrying, so each of those returns 200 instead - exactly what
+    Postmark's own docs recommend for "don't retry this." A row is logged
+    to InboundEmailEvent for every one of these outcomes, accepted or
+    rejected (never for a 401, which never reaches any application logic
+    at all).
+
+    IDEMPOTENCY: Postmark retries a webhook delivery on anything other
+    than a fast 200, so the very first thing this view does (after the
+    Basic Auth gate, and after confirming the payload even has a
+    MessageID) is check whether this exact MessageID has already been
+    recorded in InboundEmailEvent.provider_message_id - a retried
+    delivery of an already-accepted (or already-rejected) email returns
+    200 immediately without doing anything a second time.
+
+    URL: POST /api/webhooks/inbound-email/ (see config/urls.py; deliberately
+    NOT under /api/ai/, since this is never called by this app's own
+    frontend - only by Postmark, server to server).
+    """
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        from .models import InboundEmailEvent, PropertyProject, DealActivityLog, TeamNote
+
+        if not _check_postmark_basic_auth(request):
+            return Response(status=status.HTTP_401_UNAUTHORIZED)
+
+        payload = request.data if isinstance(request.data, dict) else {}
+
+        message_id = (payload.get('MessageID') or '').strip()
+        subject = (payload.get('Subject') or '').strip() or '(no subject)'
+        from_email = parseaddr(payload.get('From') or '')[1].strip().lower()
+        text_body = payload.get('TextBody') or ''
+        html_body = payload.get('HtmlBody') or ''
+        to_full = payload.get('ToFull') or []
+        attachments = payload.get('Attachments') or []
+
+        if not message_id or not from_email:
+            # Malformed beyond anything meaningful to dedupe against - a
+            # missing MessageID means a retry of THIS rejection can't be
+            # recognized as a retry, but that's fine: a payload missing
+            # even these two fields is garbage hitting this URL, not a
+            # real Postmark delivery that will be retried sensibly.
+            InboundEmailEvent.objects.create(
+                provider_message_id=message_id or f'malformed-{uuid.uuid4().hex}',
+                sender_email=from_email,
+                subject=subject,
+                status='rejected_malformed',
+            )
+            return Response(status=status.HTTP_200_OK)
+
+        if InboundEmailEvent.objects.filter(provider_message_id=message_id).exists():
+            return Response(status=status.HTTP_200_OK)
+
+        workspace = _resolve_inbound_workspace(to_full)
+        if workspace is None:
+            InboundEmailEvent.objects.create(
+                provider_message_id=message_id,
+                sender_email=from_email,
+                subject=subject,
+                status='rejected_unknown_slug',
+            )
+            return Response(status=status.HTTP_200_OK)
+
+        sender = _resolve_inbound_sender(from_email, workspace)
+        if sender is None:
+            InboundEmailEvent.objects.create(
+                provider_message_id=message_id,
+                workspace=workspace,
+                sender_email=from_email,
+                subject=subject,
+                status='rejected_unauthorized_sender',
+            )
+            return Response(status=status.HTTP_200_OK)
+
+        organization = sender.organization
+        if organization is None:
+            # Can't happen in practice - a CustomUser with a workspace_id
+            # always has an organization too - but fail gracefully rather
+            # than crash on a None if that invariant is ever violated.
+            InboundEmailEvent.objects.create(
+                provider_message_id=message_id,
+                workspace=workspace,
+                sender_email=from_email,
+                subject=subject,
+                status='rejected_malformed',
+            )
+            return Response(status=status.HTTP_200_OK)
+
+        om_file, t12_file, rent_roll_file = _classify_inbound_attachments(attachments)
+        if not any([om_file, t12_file, rent_roll_file]):
+            InboundEmailEvent.objects.create(
+                provider_message_id=message_id,
+                workspace=workspace,
+                sender_email=from_email,
+                subject=subject,
+                status='rejected_no_usable_attachments',
+            )
+            return Response(status=status.HTTP_200_OK)
+
+        # Target:/Price: tag override - subject first, then the plain-text
+        # body, then (only if neither carried one) a crude tag-stripped
+        # version of the HTML body. None (no tag found anywhere) leaves
+        # asking_price entirely to run_inbound_email_underwriting_task's
+        # own AI-extracted-OM-price fallback - see that task's docstring.
+        explicit_asking_price = (
+            _parse_asking_price_tag(subject)
+            or _parse_asking_price_tag(text_body)
+            or _parse_asking_price_tag(re.sub(r'<[^>]+>', ' ', html_body))
+        )
+
+        tier = organization.subscription_plan or TIER_BASIC
+
+        project = PropertyProject.objects.create(
+            organization=organization,
+            workspace=workspace,
+            property_name=subject,
+            created_by=sender,
+            asking_price=explicit_asking_price,
+        )
+        # Pipeline Modules Phase 1: seed the Activity feed with a "deal
+        # created" row exactly like record_analysis_report does for every
+        # other new-project path (see DealActivityLog's own docstring) -
+        # this view creates the PropertyProject itself, up front, rather
+        # than going through record_analysis_report, so that seeding has
+        # to happen here instead.
+        DealActivityLog.objects.create(
+            project=project, user=sender, from_stage=None, to_stage=project.pipeline_stage,
+        )
+        # "Received via email" provenance surfaces in the Unified Activity
+        # Feed as a normal TeamNote authored by the sender - reusing the
+        # existing 'comment' event infrastructure (_get_deal_activity_feed)
+        # rather than inventing a new event type for this one case.
+        TeamNote.objects.create(
+            project=project,
+            author=sender,
+            body=f'Deal received via email from {from_email} (subject: "{subject}").',
+        )
+
+        om_path, om_name = _save_upload_to_temp(om_file)
+        t12_path, t12_name = _save_upload_to_temp(t12_file)
+        rent_roll_path, rent_roll_name = _save_upload_to_temp(rent_roll_file)
+
+        try:
+            run_inbound_email_underwriting_task.delay(
+                om_path, om_name, t12_path, t12_name, rent_roll_path, rent_roll_name,
+                tier, sender.pk, project.pk, explicit_asking_price,
+            )
+        except Exception:
+            # Enqueueing itself failed (e.g. Redis unreachable) - clean up
+            # the temp files we just wrote, same reasoning as
+            # UnderwritePropertyView's own enqueue failure path above. The
+            # deal itself still exists (with its placeholder title/
+            # attachments unprocessed) - an analyst can retry extraction
+            # manually from inside it - so this is logged but NOT treated
+            # as a rejection of the InboundEmailEvent below.
+            logger.exception(
+                "Inbound email intake: failed to enqueue extraction for "
+                "project %s - deal was created but extraction never ran.",
+                project.pk,
+            )
+            for p in (om_path, t12_path, rent_roll_path):
+                if not p:
+                    continue
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+        InboundEmailEvent.objects.create(
+            provider_message_id=message_id,
+            workspace=workspace,
+            sender_email=from_email,
+            subject=subject,
+            status='accepted',
+            project=project,
+        )
+        return Response(status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# V2 Module 2 (Tax & Rent Comps Panel via RentCast): a "Market & Tax Comps"
+# side panel the frontend renders next to the Live In-Browser Spreadsheet
+# Editor (Pipeline Modules Phase 8) in the deal drawer. See
+# rentcast_client.py for the raw RentCast HTTP layer, market_comps.py for
+# the derived-numbers/variance-flag math, and PropertyMarketDataSnapshot in
+# models.py for the per-deal cache this view reads from and writes to —
+# that model's own docstring explains why caching here is mandatory (the
+# $0-testing RentCast free tier is capped at 50 requests/month).
+# ---------------------------------------------------------------------------
+
+MARKET_COMPS_RENTCAST_UNCONFIGURED_DETAIL = (
+    "Market & Tax Comps isn't turned on for this environment yet (no RentCast "
+    "API key configured)."
+)
+
+
+class MarketCompsView(APIView):
+    """
+    GET: returns this deal's Market & Tax Comps data — tax assessment vs.
+    the seller's stated T12 taxes, nearby active rent comps vs. the OM's
+    claimed market rent, and an AVM value estimate vs. asking price (see
+    market_comps.build_market_comps_payload for the exact shape).
+
+    Fetches AND caches from RentCast on the FIRST call for a deal (no
+    PropertyMarketDataSnapshot exists yet); every later call reads the
+    cached snapshot only — no RentCast call at all — per the client's
+    explicit "cache on the deal record the first time an address is
+    checked" instruction. The variance flags themselves are still
+    recomputed live on every call from the project's CURRENT metrics
+    against that frozen snapshot, so a later Excel re-upload or grid
+    edit is always compared against up-to-date seller-stated figures.
+
+    `?refresh=true` forces a fresh RentCast lookup even when a snapshot
+    already exists, overwriting it in place — gated to Org Admin/
+    Workspace Head (can_lock_project's exact permission check) rather
+    than open to every analyst, since every refresh spends real, capped
+    RentCast quota and an address correction is exactly the kind of
+    deliberate, occasional action a lead should gate, not something a
+    plain analyst should be able to trigger by accident (or repeatedly,
+    by mashing a button).
+
+    URL: GET /api/ai/pipeline/projects/<int:project_id>/market-comps/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, project_id):
+        from .permissions import visible_projects_for, can_lock_project
+        from .models import PropertyMarketDataSnapshot
+        from .market_comps import build_market_comps_payload
+        from . import rentcast_client
+
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        analysis = project.latest_analysis
+        if analysis is None:
+            return Response({'detail': 'This deal has no analysis yet.'}, status=status.HTTP_404_NOT_FOUND)
+
+        metrics = analysis.metrics or {}
+        address = (metrics.get('property_metadata') or {}).get('address') or ''
+
+        refresh_requested = str(request.query_params.get('refresh', '')).lower() in ('1', 'true', 'yes')
+        snapshot = getattr(project, 'market_data_snapshot', None)
+
+        if refresh_requested and not can_lock_project(request.user, project):
+            return Response(
+                {'detail': 'Only an Org Admin or Workspace Head can refresh Market & Tax Comps.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if snapshot is None or refresh_requested:
+            if not address.strip():
+                return Response({
+                    'detail': (
+                        'This deal has no extracted property address yet — Market & Tax '
+                        'Comps needs one to look up.'
+                    ),
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            if not rentcast_client.is_configured():
+                return Response(
+                    {'detail': MARKET_COMPS_RENTCAST_UNCONFIGURED_DETAIL}, status=status.HTTP_400_BAD_REQUEST
+                )
+
+            fetch_error = ''
+            fetched = {'property_record': None, 'avm_value': None, 'rental_comps': []}
+            try:
+                fetched = rentcast_client.fetch_all_market_data(address)
+            except rentcast_client.RentCastError as e:
+                fetch_error = str(e)
+
+            if snapshot is None:
+                snapshot = PropertyMarketDataSnapshot(project=project)
+
+            snapshot.address_checked = address
+            snapshot.fetched_by = request.user
+            snapshot.fetched_at = timezone.now()
+            snapshot.raw_property_record = fetched.get('property_record')
+            snapshot.raw_avm_value = fetched.get('avm_value')
+            snapshot.raw_rental_comps = fetched.get('rental_comps')
+            snapshot.fetch_error = fetch_error
+            snapshot.save()
+
+        payload = build_market_comps_payload(snapshot, metrics, project.asking_price)
+        # Same "server computes the permission, frontend just reads a
+        # boolean" pattern as PropertyProjectDetailView's own 'can_lock'
+        # field — lets the Market & Tax Comps panel show/hide its
+        # Refresh control without re-deriving can_lock_project's rule
+        # client-side.
+        payload['can_refresh'] = can_lock_project(request.user, project)
+        return Response(payload)
+
+
+# ---------------------------------------------------------------------------
+# V2 Module 4a (Buy-Box Auto-Alerts): per-workspace match criteria settings
+# (WorkspaceBuyBoxView — see TeamWorkspace.buy_box_criteria/
+# get_buy_box_criteria in users/models.py and buy_box.py for the actual
+# matching logic, run from document_history._check_buy_box_match_and_notify
+# whenever a brand-new deal is created) plus the generic in-app
+# notification feed the resulting alerts land in (Notification*View — see
+# Notification in models.py for why this table's shape is deliberately
+# generic, not buy-box-specific).
+# ---------------------------------------------------------------------------
+
+class WorkspaceBuyBoxView(APIView):
+    """
+    GET: this workspace's buy-box criteria (merged over defaults — see
+    get_buy_box_criteria). Open to ANY authenticated member of the same
+    organization, mirroring MyOrganizationDebtAssumptionsView's exact
+    "anyone in the org can see the assumptions deals are measured
+    against" reasoning in users/views.py — an analyst should be able to
+    see why a deal they're working did or didn't get flagged as a
+    buy-box match.
+
+    PATCH: gated to this workspace's Org Admin OR Workspace Head only
+    (mirrors can_lock_project's exact role check — a plain analyst, even
+    one who created deals in this workspace, can never edit its buy-box
+    criteria), per the client's explicit "editable by ORG_ADMIN /
+    WORKSPACE_HEAD" scope decision.
+
+    URL: GET/PATCH /api/ai/pipeline/workspaces/<int:workspace_id>/buy-box/
+    """
+    permission_classes = [IsAuthenticated]
+
+    FIELD_SPECS = {
+        'enabled': ('bool', None),
+        'asset_classes': ('str_list', None),
+        'target_cities': ('str_list', None),
+        'target_states': ('str_list', None),
+        'min_units': ('nonneg_float_or_null', None),
+        'max_units': ('nonneg_float_or_null', None),
+        'min_cap_rate_pct': ('nonneg_float_or_null', (0.0, 100.0)),
+        'max_cap_rate_pct': ('nonneg_float_or_null', (0.0, 100.0)),
+        'max_price_per_unit': ('nonneg_float_or_null', None),
+    }
+
+    def _get_workspace_or_error(self, request, workspace_id):
+        from users.models import TeamWorkspace
+
+        workspace = TeamWorkspace.objects.filter(pk=workspace_id).select_related('organization').first()
+        if workspace is None:
+            return None, Response({'detail': 'Workspace not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        user = request.user
+        same_org = user.is_admin or (user.organization_id == workspace.organization_id)
+        if not same_org:
+            return None, Response({'detail': 'Workspace not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        return workspace, None
+
+    def _can_edit(self, user, workspace) -> bool:
+        if user.is_admin:
+            return True
+        if user.organization_id != workspace.organization_id:
+            return False
+        if user.role == 'admin':
+            return True
+        return user.workspace_id == workspace.id and user.workspace_role == 'head'
+
+    def get(self, request, workspace_id):
+        workspace, error = self._get_workspace_or_error(request, workspace_id)
+        if error:
+            return error
+        data = workspace.get_buy_box_criteria()
+        # Same "server computes the permission, frontend just reads a
+        # boolean" pattern as PropertyProjectDetailView's 'can_lock' —
+        # lets Workspace Settings show/hide the edit form per workspace
+        # without re-deriving the Org Admin/Workspace Head rule itself.
+        data['can_edit'] = self._can_edit(request.user, workspace)
+        return Response(data)
+
+    def patch(self, request, workspace_id):
+        workspace, error = self._get_workspace_or_error(request, workspace_id)
+        if error:
+            return error
+
+        if not self._can_edit(request.user, workspace):
+            return Response(
+                {'detail': 'Only an Org Admin or this Workspace\'s Head can edit its buy-box criteria.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        current = workspace.get_buy_box_criteria()
+        updated = dict(current)
+        errors = {}
+
+        for key, (kind, bounds) in self.FIELD_SPECS.items():
+            if key not in request.data:
+                continue
+            raw = request.data.get(key)
+
+            if kind == 'bool':
+                if not isinstance(raw, bool):
+                    errors[key] = 'Must be true or false.'
+                    continue
+                updated[key] = raw
+
+            elif kind == 'str_list':
+                if not isinstance(raw, list) or not all(isinstance(v, str) for v in raw):
+                    errors[key] = 'Must be a list of strings.'
+                    continue
+                updated[key] = [v.strip() for v in raw if v.strip()]
+
+            elif kind == 'nonneg_float_or_null':
+                if raw is None:
+                    updated[key] = None
+                    continue
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    errors[key] = 'Must be a number, or null to clear it.'
+                    continue
+                if value < 0:
+                    errors[key] = 'Must be zero or positive.'
+                    continue
+                if bounds and not (bounds[0] <= value <= bounds[1]):
+                    errors[key] = f'Must be between {bounds[0]:.0f} and {bounds[1]:.0f}.'
+                    continue
+                updated[key] = value
+
+        if errors:
+            return Response({'detail': 'Invalid buy-box criteria.', 'errors': errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        workspace.buy_box_criteria = updated
+        workspace.save(update_fields=['buy_box_criteria'])
+        return Response(workspace.get_buy_box_criteria())
+
+
+class NotificationListView(APIView):
+    """
+    GET: the current user's most recent notifications (buy-box matches
+    today — see Notification's own docstring in models.py for why the
+    shape is generic) plus their unread count, for the dashboard
+    header's notification badge.
+    URL: GET /api/ai/notifications/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .models import Notification
+
+        notifications = (
+            Notification.objects.filter(recipient=request.user)
+            .select_related('project')
+            .order_by('-created_at')[:50]
+        )
+        unread_count = Notification.objects.filter(recipient=request.user, is_read=False).count()
+
+        return Response({
+            'notifications': [
+                {
+                    'id': n.id,
+                    'notification_type': n.notification_type,
+                    'project_id': n.project_id,
+                    'property_name': n.project.property_name if n.project_id else None,
+                    'message': n.message,
+                    'is_read': n.is_read,
+                    'created_at': n.created_at.isoformat(),
+                }
+                for n in notifications
+            ],
+            'unread_count': unread_count,
+        })
+
+
+class NotificationMarkReadView(APIView):
+    """
+    POST: marks one notification read (body: {"id": N}), or every
+    unread notification for this user when no id is given — the header
+    badge's "mark all read" action. Always scoped to
+    recipient=request.user, so there's no way to mark (or probe the
+    existence of) another user's notification by id.
+    URL: POST /api/ai/notifications/mark-read/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from .models import Notification
+
+        notif_id = request.data.get('id')
+        qs = Notification.objects.filter(recipient=request.user, is_read=False)
+        if notif_id is not None:
+            qs = qs.filter(pk=notif_id)
+        updated_count = qs.update(is_read=True)
+        return Response({'updated': updated_count})
+
+
+# ---------------------------------------------------------------------------
+# V2 Module 1 (Two-Way Broker & Lender Email Thread Sync, Phase V2-3)
+# ---------------------------------------------------------------------------
+# Two layers, same split as the models (see models.py's own section-header
+# comment above EmailOAuthConnection):
+#   CONNECTION-level (one CustomUser's own mailbox — never project- or
+#   org-scoped, per the client's own "at the CustomUser level" wording):
+#     EmailConnectionListView, EmailConnectStartView, EmailOAuthCallbackView,
+#     EmailConnectionDisconnectView.
+#   THREAD-level (an explicit, per-deal "tag this thread" action — always
+#   gated through visible_projects_for, the same visibility check every
+#   other pipeline drawer panel uses):
+#     EmailThreadSearchView, ProjectEmailThreadsView, ProjectEmailThreadUnlinkView.
+# _get_deal_activity_feed() above already got its new 'email' event type —
+# see that function's own docstring.
+
+EMAIL_OAUTH_STATE_SALT = 'ai_service.email_oauth_state'
+
+
+def _serialize_email_connection(conn):
+    return {
+        'id': conn.id,
+        'provider': conn.provider,
+        'provider_display': conn.get_provider_display(),
+        'email_address': conn.email_address,
+        'status': conn.status,
+        'last_error': conn.last_error if conn.status == 'error' else '',
+        'connected_at': conn.connected_at.isoformat(),
+    }
+
+
+class EmailConnectionListView(APIView):
+    """
+    GET: the CURRENT user's own connected mailboxes (at most one Gmail
+    + one Microsoft 365 — see EmailOAuthConnection's own docstring) for
+    the Settings page's "Connected Email Accounts" section. Deliberately
+    request.user-scoped only, never org-wide — this is a per-analyst
+    OAuth grant to THEIR OWN mailbox, not a shared workspace resource
+    like an Excel Template.
+    URL: GET /api/ai/email-sync/connections/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from . import email_oauth
+        from .models import EmailOAuthConnection
+
+        connections = EmailOAuthConnection.objects.filter(user=request.user)
+        return Response({
+            'connections': [_serialize_email_connection(c) for c in connections],
+            'google_configured': email_oauth.is_google_configured(),
+            'microsoft_configured': email_oauth.is_microsoft_configured(),
+        })
+
+
+class EmailConnectStartView(APIView):
+    """
+    POST (body: {"provider": "google"|"microsoft"}): returns
+    {"authorization_url": "..."} for the frontend to do a full-page
+    redirect to (not a popup — simplest, no popup-blocker edge cases,
+    standard for a consent screen like this). The `state` param baked
+    into that URL is a signed, TTL'd token (django.core.signing — no new
+    dependency) carrying {user_id, provider}, NOT a Django session or
+    this request's own auth cookie: the callback that follows is a
+    plain top-level browser redirect FROM the provider back to this
+    backend, and signed state is the standard, provider-agnostic way an
+    OAuth client both prevents CSRF on that redirect AND recovers which
+    of its OWN users started the flow — see EmailOAuthCallbackView
+    below, which trusts this signature as its ONLY source of identity.
+    URL: POST /api/ai/email-sync/connect/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from django.core import signing
+        from . import email_oauth
+
+        provider = (request.data.get('provider') or '').strip().lower()
+        if provider not in email_oauth.PROVIDER_CHOICES:
+            return Response({'detail': "provider must be 'google' or 'microsoft'."}, status=status.HTTP_400_BAD_REQUEST)
+        if not email_oauth.is_configured(provider):
+            return Response(
+                {'detail': f"{provider.title()} email sync isn't configured on this server yet."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # request.user.pk, NOT .id - CustomUser's primary key field is
+        # `email` (see users/models.py; USER_ID_FIELD in SIMPLE_JWT is
+        # 'email' for the same reason), so there is no .id attribute at
+        # all. .pk resolves to whatever the actual primary key field is,
+        # which is the only attribute access on a user instance that's
+        # ever safe to assume here.
+        state = signing.dumps({'user_id': request.user.pk, 'provider': provider}, salt=EMAIL_OAUTH_STATE_SALT)
+        if provider == email_oauth.GOOGLE:
+            authorization_url = email_oauth.build_google_authorization_url(state)
+        else:
+            authorization_url = email_oauth.build_microsoft_authorization_url(state)
+
+        return Response({'authorization_url': authorization_url})
+
+
+class EmailOAuthCallbackView(APIView):
+    """
+    GET /api/ai/email-sync/oauth/callback/<provider>/ — exactly the path
+    email_oauth._redirect_uri() builds, and what must be registered as
+    this app's "Authorized redirect URI" with each provider. AllowAny:
+    this is a plain browser redirect FROM Google/Microsoft, not an
+    authenticated call from the frontend's JS — see EmailConnectStartView's
+    own docstring on why the signed `state` param, not request.user, is
+    this view's actual source of identity. Always ends in a 302 back to
+    the frontend's Settings page (never a JSON error — there's no
+    frontend JS request here to receive one), with a query param the
+    Settings page reads once on load to show a toast.
+    URL: GET /api/ai/email-sync/oauth/callback/google/
+    URL: GET /api/ai/email-sync/oauth/callback/microsoft/
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request, provider):
+        from django.core import signing
+        from django.shortcuts import redirect
+        from django.contrib.auth import get_user_model
+        from . import email_oauth
+        from .models import EmailOAuthConnection
+
+        settings_url = f"{django_settings.FRONTEND_BASE_URL.rstrip('/')}/dashboard/settings"
+
+        if provider not in email_oauth.PROVIDER_CHOICES:
+            return redirect(f"{settings_url}?email_sync_error=unknown_provider")
+
+        provider_error = request.GET.get('error')
+        if provider_error:
+            logger.info("Email OAuth (%s): provider returned error=%s", provider, provider_error)
+            return redirect(f"{settings_url}?email_sync_error=provider_denied")
+
+        code = request.GET.get('code')
+        state = request.GET.get('state')
+        if not code or not state:
+            return redirect(f"{settings_url}?email_sync_error=missing_code")
+
+        try:
+            # max_age matches the realistic time a user takes to click
+            # through a consent screen — never the whole session.
+            payload = signing.loads(state, salt=EMAIL_OAUTH_STATE_SALT, max_age=600)
+        except signing.SignatureExpired:
+            return redirect(f"{settings_url}?email_sync_error=expired_state")
+        except signing.BadSignature:
+            return redirect(f"{settings_url}?email_sync_error=bad_state")
+
+        if payload.get('provider') != provider:
+            return redirect(f"{settings_url}?email_sync_error=provider_mismatch")
+
+        CustomUser = get_user_model()
+        user = CustomUser.objects.filter(pk=payload.get('user_id')).first()
+        if user is None:
+            return redirect(f"{settings_url}?email_sync_error=unknown_user")
+
+        try:
+            if provider == email_oauth.GOOGLE:
+                result = email_oauth.exchange_google_code(code)
+            else:
+                result = email_oauth.exchange_microsoft_code(code)
+        except email_oauth.EmailOAuthError as e:
+            logger.warning("Email OAuth (%s) code exchange failed for user %s: %s", provider, user.id, e)
+            return redirect(f"{settings_url}?email_sync_error=exchange_failed")
+
+        # unique_together(user, provider) — reconnecting the SAME
+        # provider replaces the existing row rather than creating a
+        # second one (see EmailOAuthConnection's own docstring).
+        connection, _created = EmailOAuthConnection.objects.update_or_create(
+            user=user, provider=provider,
+            defaults={
+                'email_address': result.get('email_address') or '',
+                'scopes': result.get('scope', ''),
+                'status': 'active',
+                'last_error': '',
+            },
+        )
+        connection.set_access_token(result['access_token'], result['expires_at'])
+        if result.get('refresh_token'):
+            connection.set_refresh_token(result['refresh_token'])
+        elif not connection.encrypted_refresh_token:
+            # Google omits refresh_token on a returning-consent exchange
+            # ONLY if it never issued one before — access_type=offline +
+            # prompt=consent on the authorization request (see
+            # build_google_authorization_url) is specifically what
+            # guarantees this doesn't happen on a fresh connect, but a
+            # connection with no refresh token at all can never be
+            # polled — surface that now rather than let the very first
+            # poll attempt silently discover it.
+            connection.status = 'error'
+            connection.last_error = 'No refresh token was returned. Please reconnect and accept the consent screen.'
+        connection.save()
+
+        return redirect(f"{settings_url}?email_connected={provider}")
+
+
+class EmailConnectionDisconnectView(APIView):
+    """
+    POST /api/ai/email-sync/connections/<provider>/disconnect/ — revokes
+    (best-effort) and clears this user's OWN connection for one
+    provider. Deliberately does NOT delete the EmailOAuthConnection row:
+    LinkedEmailThread.connection is ON_DELETE=CASCADE, so hard-deleting
+    it would wipe every linked thread AND its already-synced Activity
+    Feed history for every deal it ever touched. Instead: tokens are
+    blanked, status becomes 'disconnected', and every thread linked
+    through this connection is soft-unlinked (is_active=False) exactly
+    like a manual per-thread unlink — there's no access token left to
+    poll them with, and their history stays in the Activity Feed either
+    way. Reconnecting the same provider later (EmailOAuthCallbackView)
+    reuses this same row rather than creating a new one.
+    URL: POST /api/ai/email-sync/connections/<provider>/disconnect/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, provider):
+        from . import email_oauth
+        from .models import EmailOAuthConnection
+
+        connection = EmailOAuthConnection.objects.filter(user=request.user, provider=provider).first()
+        if connection is None:
+            return Response({'detail': 'No connection to disconnect.'}, status=status.HTTP_404_NOT_FOUND)
+
+        access_token = ''
+        try:
+            access_token = connection.get_access_token()
+        except Exception:
+            logger.warning("Could not decrypt access token for connection %s during disconnect — revoking skipped, local disconnect proceeds anyway.", connection.id)
+
+        if access_token:
+            try:
+                if connection.provider == email_oauth.GOOGLE:
+                    email_oauth.revoke_google(access_token)
+                else:
+                    email_oauth.revoke_microsoft(access_token)
+            except Exception:
+                logger.exception("Best-effort revoke failed for connection %s — disconnecting locally anyway.", connection.id)
+
+        connection.encrypted_access_token = ''
+        connection.encrypted_refresh_token = ''
+        connection.access_token_expires_at = None
+        connection.status = 'disconnected'
+        connection.last_error = ''
+        connection.save()
+
+        connection.linked_threads.filter(is_active=True).update(is_active=False)
+
+        return Response({'detail': 'Disconnected.'})
+
+
+class EmailThreadSearchView(APIView):
+    """
+    GET /api/ai/email-sync/projects/<project_id>/thread-search/?q=...
+    Searches every ACTIVE connection the CURRENT user owns (never other
+    users' connections — this is "search MY mailbox for a thread to tag
+    onto a deal I can see," never a shared org-wide inbox) and merges
+    results across providers, newest-message-first, so the "Link Email
+    Thread" picker shows one list regardless of how many mailboxes are
+    connected. `project_id` is used ONLY for the visibility check (an
+    analyst must be able to see the deal to search for a thread to tag
+    onto it) — the search itself isn't project-scoped in any other way.
+    A connection whose refresh token has died (ReauthRequired) is
+    skipped from the results, flipped to status='error', and the user
+    is notified — exactly like every other call site in this module —
+    rather than failing the whole search over one broken connection.
+    URL: GET /api/ai/email-sync/projects/<project_id>/thread-search/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, project_id):
+        from .permissions import visible_projects_for
+        from .models import EmailOAuthConnection
+        from . import email_sync
+
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        query = (request.GET.get('q') or '').strip()
+        connections = EmailOAuthConnection.objects.filter(user=request.user, status='active')
+
+        results = []
+        for connection in connections:
+            try:
+                threads = email_sync.search_candidate_threads(connection, query)
+            except email_sync.ReauthRequired as e:
+                email_sync.mark_connection_needs_reauth(connection, str(e))
+                continue
+            except email_sync.EmailSyncError as e:
+                logger.warning("Email thread search failed for connection %s: %s", connection.id, e)
+                continue
+            for t in threads:
+                t['connection_id'] = connection.id
+                t['provider'] = connection.provider
+                results.append(t)
+
+        results.sort(key=lambda t: t.get('last_message_at') or '', reverse=True)
+        return Response({'results': results})
+
+
+def _serialize_linked_thread(thread_link):
+    return {
+        'id': thread_link.id,
+        'provider': thread_link.connection.provider,
+        'provider_display': thread_link.connection.get_provider_display(),
+        'connection_email': thread_link.connection.email_address,
+        'provider_thread_id': thread_link.provider_thread_id,
+        'subject': thread_link.subject,
+        'label': thread_link.label,
+        'linked_by': thread_link.linked_by.email if thread_link.linked_by else None,
+        'linked_at': thread_link.linked_at.isoformat(),
+        'is_active': thread_link.is_active,
+        'last_synced_at': thread_link.last_synced_at.isoformat() if thread_link.last_synced_at else None,
+        'backfill_status': thread_link.backfill_status,
+        'backfill_error': thread_link.backfill_error,
+        'message_count': thread_link.messages.count(),
+    }
+
+
+class ProjectEmailThreadsView(APIView):
+    """
+    GET: every thread ever linked to this deal, active AND soft-
+    unlinked — the "Linked Email Threads" panel shows unlinked ones too
+    (dimmed), since their history is still in the Activity Feed.
+    POST (body: {"connection_id", "provider_thread_id", "subject",
+    "label"}): the ONE explicit "tag this thread to this deal" action —
+    see LinkedEmailThread's own docstring on why this is never auto-
+    matched. connection_id must be one of the CURRENT user's own
+    connections (the thread was found by searching THEIR mailbox — see
+    EmailThreadSearchView above); linking through someone else's
+    connection_id 404s exactly like a project the user can't see.
+    Re-linking a thread that's currently soft-unlinked on this SAME
+    project+connection REACTIVATES that existing row instead of
+    creating a second one (a second row would double-backfill and
+    duplicate every message already in the Activity Feed); linking one
+    that's already active is a 400, not a silent no-op, so the user
+    actually sees why nothing happened.
+    URL: GET/POST /api/ai/email-sync/projects/<project_id>/threads/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, project_id):
+        from .permissions import visible_projects_for
+
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        threads = project.linked_email_threads.select_related('connection', 'linked_by').prefetch_related('messages')
+        return Response([_serialize_linked_thread(t) for t in threads])
+
+    def post(self, request, project_id):
+        from .permissions import visible_projects_for
+        from .models import EmailOAuthConnection, LinkedEmailThread
+        from .tasks import run_email_thread_backfill_task
+
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        connection_id = request.data.get('connection_id')
+        provider_thread_id = (request.data.get('provider_thread_id') or '').strip()
+        subject = (request.data.get('subject') or '').strip()
+        label = (request.data.get('label') or '').strip()
+
+        if not provider_thread_id:
+            return Response({'detail': 'provider_thread_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        connection = EmailOAuthConnection.objects.filter(pk=connection_id, user=request.user).first()
+        if connection is None:
+            return Response({'detail': 'That connection was not found for your account.'}, status=status.HTTP_404_NOT_FOUND)
+
+        existing = LinkedEmailThread.objects.filter(
+            project=project, connection=connection, provider_thread_id=provider_thread_id,
+        ).first()
+
+        if existing is not None and existing.is_active:
+            return Response({'detail': 'This thread is already linked to this deal.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if existing is not None:
+            existing.is_active = True
+            existing.subject = subject or existing.subject
+            existing.label = label or existing.label
+            existing.linked_by = request.user
+            existing.save(update_fields=['is_active', 'subject', 'label', 'linked_by'])
+            thread_link = existing
+        else:
+            thread_link = LinkedEmailThread.objects.create(
+                project=project, connection=connection, provider_thread_id=provider_thread_id,
+                subject=subject, label=label, linked_by=request.user,
+            )
+
+        run_email_thread_backfill_task.delay(thread_link.id)
+
+        return Response(_serialize_linked_thread(thread_link), status=status.HTTP_201_CREATED)
+
+
+class ProjectEmailThreadUnlinkView(APIView):
+    """
+    DELETE: soft-unlinks ONE thread (is_active=False) — see
+    LinkedEmailThread's own docstring on why there's no hard-delete
+    endpoint. Every message already synced through it stays exactly
+    where it is in the Activity Feed; only the 5-minute poll stops
+    touching this thread going forward.
+    URL: DELETE /api/ai/email-sync/projects/<project_id>/threads/<thread_link_id>/
+    """
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, project_id, thread_link_id):
+        from .permissions import visible_projects_for
+        from .models import LinkedEmailThread
+
+        project = visible_projects_for(request.user).filter(pk=project_id).first()
+        if project is None:
+            return Response({'detail': 'Project not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        thread_link = LinkedEmailThread.objects.filter(pk=thread_link_id, project=project).first()
+        if thread_link is None:
+            return Response({'detail': 'Linked thread not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        thread_link.is_active = False
+        thread_link.save(update_fields=['is_active'])
+        return Response({'detail': 'Unlinked.'})

@@ -1272,6 +1272,13 @@ def _serialize_workspace(workspace):
         'member_count': workspace.members.count(),
         'project_count': workspace.property_projects.filter(is_deleted=False).count(),
         'created_at': workspace.created_at.isoformat(),
+        # Pipeline Modules Phase 7 (Multi-Tenant Email-to-Deal Intake): this
+        # workspace's dedicated deals-<slug>@... inbound address — see
+        # TeamWorkspace.inbound_email_address's own docstring in models.py.
+        # Surfaced here since this is the single shared serializer every
+        # workspace list/detail view (self-serve + admin) already funnels
+        # through, so Workspace Settings gets it everywhere for free.
+        'inbound_email_address': workspace.inbound_email_address,
     }
 
 
@@ -1637,9 +1644,9 @@ class WorkspaceUsageView(APIView):
 
         projects = PropertyProject.objects.filter(workspace=workspace, is_deleted=False)
 
-        deals_by_status = {choice_value: 0 for choice_value, _ in PropertyProject.STATUS_CHOICES}
-        for row in projects.values('deal_status').annotate(count=Count('id')):
-            deals_by_status[row['deal_status']] = row['count']
+        deals_by_stage = {choice_value: 0 for choice_value, _ in PropertyProject.PIPELINE_STAGE_CHOICES}
+        for row in projects.values('pipeline_stage').annotate(count=Count('id')):
+            deals_by_stage[row['pipeline_stage']] = row['count']
 
         analyses = AnalysisReport.objects.filter(project__workspace=workspace, is_deleted=False)
 
@@ -1665,7 +1672,7 @@ class WorkspaceUsageView(APIView):
             'workspace_name': workspace.name,
             'member_count': members.count(),
             'deals_total': projects.count(),
-            'deals_by_status': deals_by_status,
+            'deals_by_stage': deals_by_stage,
             'analyses_total': analyses.count(),
             'analyses_last_30_days': analyses.filter(created_at__gte=thirty_days_ago).count(),
             'members': per_member,

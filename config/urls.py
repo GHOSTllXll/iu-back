@@ -17,8 +17,19 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path, include
 
+# Pipeline Modules Phase 7 (Multi-Tenant Email-to-Deal Intake): imported
+# directly from ai_service.views rather than routed through
+# ai_service/urls.py's own urlpatterns (which only ever get included under
+# users.urls' 'ai/' prefix, i.e. /api/ai/...). This endpoint is a
+# server-to-server webhook Postmark posts to - never this app's own
+# frontend - so it deliberately sits at its own /api/webhooks/... path
+# instead of inheriting the /api/ai/ namespace that exists for this
+# project's authenticated browser-facing API.
+from ai_service.views import InboundEmailWebhookView
+
 urlpatterns = [
     path('admin/', admin.site.urls),
     path("api/contact/", include("contact.urls")),
     path("api/", include("users.urls")),
+    path("api/webhooks/inbound-email/", InboundEmailWebhookView.as_view(), name='inbound_email_webhook'),
 ]

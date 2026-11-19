@@ -65,9 +65,9 @@ def visible_projects_for(user):
 def can_manage_project(user, project) -> bool:
     """
     Whether `user` may change this ONE already-fetched project (update its
-    deal_status, add a Team Note, download its Excel). Re-derives the same
-    rule as visible_projects_for rather than re-querying it, since the
-    caller already has the instance in hand from a prior lookup.
+    pipeline_stage, add a Team Note, download its Excel). Re-derives the
+    same rule as visible_projects_for rather than re-querying it, since
+    the caller already has the instance in hand from a prior lookup.
     """
     if not getattr(user, 'is_authenticated', False):
         return False

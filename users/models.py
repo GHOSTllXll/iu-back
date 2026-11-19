@@ -1,7 +1,10 @@
 # users/models.py
+import uuid
+from django.conf import settings as django_settings
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
 from django.db import models
 from django.utils import timezone
+from django.utils.text import slugify
 from datetime import timedelta
 
 class OrganizationManager(models.Manager):
@@ -130,6 +133,64 @@ class TeamWorkspace(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # Pipeline Modules Phase 7 (Multi-Tenant Email-to-Deal Intake): the
+    # local-part half of this workspace's dedicated inbound address (e.g.
+    # 'acme-dispositions-a1b2c3' -> deals-acme-dispositions-a1b2c3@
+    # inboundunderwriting.com — see inbound_email_address below). Must be
+    # GLOBALLY unique, not just unique per-org like `name` above — unlike
+    # every other uniqueness constraint on this model, the inbound email
+    # webhook (InboundEmailWebhookView in ai_service/views.py) has to
+    # resolve a workspace from the recipient address ALONE, with no
+    # organization context yet to scope the lookup by. Auto-generated
+    # once, in save() below, on first creation — never user-editable
+    # (there's no rename endpoint for it; renaming the WORKSPACE's
+    # display `name` deliberately leaves this alone, so an address once
+    # handed out to a lender/broker never silently breaks).
+    inbound_email_slug = models.SlugField(max_length=80, unique=True, null=True, blank=True, editable=False)
+
+    # V2 Module 4a (Buy-Box Auto-Alerts): per-workspace match criteria for
+    # the "new deal matches our buy-box" alert, editable by this
+    # workspace's Org Admin or Workspace Head only (see
+    # WorkspaceBuyBoxView in ai_service/views.py) — exactly the same
+    # JSONField-with-merged-defaults pattern as Organization.
+    # debt_assumptions/get_debt_assumptions() above, applied one level
+    # down the hierarchy since buy-box criteria is naturally a per-
+    # workspace (not firm-wide) concept — different workspaces
+    # (dispositions teams, asset classes) chase different deals. See
+    # DEFAULT_BUY_BOX_CRITERIA/get_buy_box_criteria() below for the keys.
+    buy_box_criteria = models.JSONField(default=dict, blank=True)
+
+    DEFAULT_BUY_BOX_CRITERIA = {
+        'enabled': False,
+        # Matched case-insensitively against property_metadata.asset_class
+        # (e.g. "Class B", "Class C"); an empty list means "any class".
+        'asset_classes': [],
+        'min_units': None,
+        'max_units': None,
+        'min_cap_rate_pct': None,
+        'max_cap_rate_pct': None,
+        'max_price_per_unit': None,
+        # Matched as a case-insensitive substring/suffix against the
+        # deal's full address string (see buy_box._location_matches) —
+        # this app doesn't store a structured city/state at the
+        # property level, only the AI-extracted free-text address.
+        'target_cities': [],
+        'target_states': [],
+    }
+
+    def get_buy_box_criteria(self):
+        """
+        Merges self.buy_box_criteria over DEFAULT_BUY_BOX_CRITERIA —
+        same reasoning as Organization.get_debt_assumptions(): a
+        workspace that's never touched buy-box settings has
+        buy_box_criteria == {} (the JSONField default), and a
+        partially-filled-in dict should still fall back to the defaults
+        (importantly, enabled=False) for every key it hasn't set.
+        """
+        merged = dict(self.DEFAULT_BUY_BOX_CRITERIA)
+        merged.update(self.buy_box_criteria or {})
+        return merged
+
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=['organization', 'name'], name='unique_workspace_name_per_org'),
@@ -138,6 +199,43 @@ class TeamWorkspace(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.organization.name})"
+
+    def _generate_unique_inbound_slug(self) -> str:
+        """
+        Base slug from org id + workspace name (human-recognizable in the
+        resulting email address), suffixed with a short random hex string
+        to guarantee global uniqueness without a second DB round-trip in
+        the common case. The loop below is belt-and-suspenders only — a
+        6-hex-char collision on top of an already-distinguishing base is
+        astronomically unlikely, but this mirrors the rest of this
+        codebase's "never assume, verify" discipline rather than trusting
+        that math.
+        """
+        base = slugify(f"{self.organization_id}-{self.name}")[:40] or 'workspace'
+        for _ in range(5):
+            candidate = f"{base}-{uuid.uuid4().hex[:6]}"
+            if not TeamWorkspace.objects.filter(inbound_email_slug=candidate).exists():
+                return candidate
+        # Fallback if every attempt above somehow collided: a pure UUID4
+        # hex string has no meaningful collision probability at all.
+        return uuid.uuid4().hex
+
+    def save(self, *args, **kwargs):
+        if not self.inbound_email_slug:
+            self.inbound_email_slug = self._generate_unique_inbound_slug()
+        super().save(*args, **kwargs)
+
+    @property
+    def inbound_email_address(self) -> str:
+        """
+        The full address shown in Workspace Settings and matched by
+        InboundEmailWebhookView — e.g.
+        'deals-acme-dispositions-a1b2c3@inboundunderwriting.com'. Built
+        from settings.INBOUND_EMAIL_DOMAIN rather than stored, so changing
+        that setting (e.g. switching domains) instantly updates every
+        workspace's displayed address without a data migration.
+        """
+        return f"deals-{self.inbound_email_slug}@{django_settings.INBOUND_EMAIL_DOMAIN}"
 
 
 class CustomUserManager(BaseUserManager):

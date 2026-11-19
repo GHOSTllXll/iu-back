@@ -263,3 +263,75 @@ AI_MOCK_MODE = os.getenv('AI_MOCK_MODE', 'false')
 
 
 FRONTEND_BASE_URL = os.getenv('FRONTEND_BASE_URL', 'http://localhost:3000')
+
+# Pipeline Modules Phase 7 (Multi-Tenant Email-to-Deal Intake): the domain
+# half of every workspace's auto-generated inbound address (see
+# users.models.TeamWorkspace.inbound_email_address) — e.g.
+# deals-acme-dispositions-a1b2c3@inboundunderwriting.com. Override via env
+# for a staging/dev domain without a code change.
+INBOUND_EMAIL_DOMAIN = os.getenv('INBOUND_EMAIL_DOMAIN', 'inboundunderwriting.com')
+
+# Postmark Inbound doesn't sign each webhook payload — the provider's own
+# recommended way to verify a delivery actually came from Postmark (and
+# not an open POST to a guessed URL) is HTTP Basic Auth baked into the
+# webhook URL you register WITH Postmark itself, e.g.
+# https://<user>:<password>@yourapp.com/api/webhooks/inbound-email/ — see
+# InboundEmailWebhookView in ai_service/views.py. Both unset (the default)
+# SKIPS this check entirely, which is only acceptable before this webhook
+# URL is ever registered anywhere live — set BOTH in production before
+# pointing a real Postmark Inbound stream at this endpoint.
+POSTMARK_INBOUND_WEBHOOK_USERNAME = os.getenv('POSTMARK_INBOUND_WEBHOOK_USERNAME', '')
+POSTMARK_INBOUND_WEBHOOK_PASSWORD = os.getenv('POSTMARK_INBOUND_WEBHOOK_PASSWORD', '')
+
+# V2 Module 2 (Tax & Rent Comps Panel): RentCast is the ONLY paid monthly
+# service added in Version 2.0, deliberately kept on RentCast's free
+# 50-request/month tier during development/testing — see
+# PropertyMarketDataSnapshot in ai_service/models.py for the per-deal
+# cache that keeps this feature inside that cap. Same "disabled if
+# unconfigured" pattern as the Postmark settings above — empty means
+# this feature isn't turned on yet (see rentcast_client.is_configured()),
+# not an error; MarketCompsView surfaces that plainly rather than
+# crashing a deal drawer that happens to open before a key is set.
+RENTCAST_API_KEY = os.getenv('RENTCAST_API_KEY', '')
+
+# V2 Module 1 (Two-Way Broker & Lender Email Thread Sync, Phase V2-3):
+# this app's own public backend URL, used ONLY to build the exact OAuth
+# "redirect_uri" sent to Google/Microsoft on the authorization request
+# and the token exchange that follows it — both providers require that
+# value to match, character-for-character, whatever's registered in
+# their own developer console (see email_oauth.py). Deliberately a
+# SEPARATE setting from FRONTEND_BASE_URL just above: the OAuth
+# provider redirects back to THIS backend's own callback view first
+# (EmailOAuthCallbackView in views.py), which then 302s the browser on
+# to FRONTEND_BASE_URL's Settings page — never straight to the frontend.
+BACKEND_BASE_URL = os.getenv('BACKEND_BASE_URL', 'http://localhost:8000')
+
+# Google Cloud Console OAuth 2.0 Client (Web application) credentials —
+# same "blank means not turned on yet" pattern as RENTCAST_API_KEY
+# above; see email_oauth.is_google_configured(). Authorized redirect
+# URI to register in that Client: BACKEND_BASE_URL +
+# '/api/ai/email-sync/oauth/callback/google/'.
+GOOGLE_OAUTH_CLIENT_ID = os.getenv('GOOGLE_OAUTH_CLIENT_ID', '')
+GOOGLE_OAUTH_CLIENT_SECRET = os.getenv('GOOGLE_OAUTH_CLIENT_SECRET', '')
+
+# Microsoft Entra App Registration credentials (Web platform, "Accounts
+# in any organizational directory and personal Microsoft accounts" so
+# both Microsoft 365 and personal Outlook.com/Hotmail users can connect
+# through the SAME app). Redirect URI to register: BACKEND_BASE_URL +
+# '/api/ai/email-sync/oauth/callback/microsoft/'. MS_OAUTH_TENANT stays
+# 'common' unless this is later locked down to one organization's
+# tenant — see email_oauth.py's own docstring on what each tenant value
+# means.
+MS_OAUTH_CLIENT_ID = os.getenv('MS_OAUTH_CLIENT_ID', '')
+MS_OAUTH_CLIENT_SECRET = os.getenv('MS_OAUTH_CLIENT_SECRET', '')
+MS_OAUTH_TENANT = os.getenv('MS_OAUTH_TENANT', 'common')
+
+# Symmetric key (cryptography.fernet) this app's own OAuth access/
+# refresh tokens are encrypted with at rest — see token_crypto.py.
+# Generate one with:
+#   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Blank means Email Thread Sync can't store a connection yet (same
+# "disabled if unconfigured" pattern as everything else on this page) —
+# deliberately NOT derived from SECRET_KEY, so this can be rotated on
+# its own without touching session/JWT signing.
+EMAIL_OAUTH_TOKEN_ENCRYPTION_KEY = os.getenv('EMAIL_OAUTH_TOKEN_ENCRYPTION_KEY', '')

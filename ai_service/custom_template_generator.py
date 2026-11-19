@@ -394,6 +394,179 @@ def compute_injected_values_snapshot(metrics, debt_assumptions, rent_roll_df):
 
 
 # ==========================================
+# REVERSE MAPPING (Pipeline Modules Phase 8 follow-up: Live Grid Editor
+# "Save" → working-deal-state sync) — the write-back direction of
+# SCALAR_FIELD_CATALOG/ROW_FIELD_CATALOG above. Those two catalogs only
+# ever READ a value out of metrics/a rent roll row; nothing before this
+# needed to write an edited value back into either one, since the Cell
+# Override pipeline (_apply_excel_override in views.py) only ever
+# diffs/audits a change, never persists it into the analysis's own
+# working metrics/rent_roll_data. The Live Grid Editor's "Save" needs
+# both: the audit trail AND an update to what Download/Lock actually
+# regenerate from (see GridEditSaveView's own docstring in views.py).
+# ==========================================
+SCALAR_FIELD_WRITE_PATHS = {
+    'IU_PropertyName': ('property_metadata', 'property_name'),
+    'IU_PropertyAddress': ('property_metadata', 'address'),
+    'IU_AssetClass': ('property_metadata', 'asset_class'),
+    'IU_TotalUnitCount': ('property_metadata', 'total_unit_count'),
+    # IU_TotalBuildingAreaSF is deliberately absent here — it's a 3-way
+    # fallback (industrial/office/retail), not one fixed path; see
+    # _write_total_building_area below.
+    'IU_PhysicalOccupancyPct': ('rent_roll_metrics', 'physical_occupancy_pct'),
+    'IU_EconomicOccupancyPct': ('rent_roll_metrics', 'economic_occupancy_pct'),
+    'IU_TotalVacantUnits': ('rent_roll_metrics', 'total_vacant_units'),
+    'IU_AvgInPlaceRent': ('rent_roll_metrics', 'avg_in_place_monthly_rent'),
+    'IU_AvgMarketRent': ('rent_roll_metrics', 'avg_market_monthly_rent'),
+    'IU_AnnualizedGPR': ('rent_roll_metrics', 'annualized_gpr'),
+    'IU_TotalAnnualConcessions': ('rent_roll_metrics', 'total_annual_concessions'),
+    'IU_NetRentalIncome': ('t12_revenue_expenses', 'net_rental_income'),
+    'IU_TotalOperatingExpenses': ('t12_revenue_expenses', 'total_operating_expenses'),
+    'IU_NetOperatingIncome': ('t12_revenue_expenses', 'net_operating_income'),
+    'IU_TotalOperatingRevenue': ('t12_revenue_expenses', 'total_operating_revenue'),
+    # IU_DebtLTVPct / IU_DebtInterestRatePct / IU_DebtAmortizationYears are
+    # deliberately absent from this dict — they resolve from
+    # debt_assumptions (a request-time input), never from metrics, and
+    # debt_assumptions is never persisted on an analysis at all (see
+    # AnalysisReport.rent_roll_data's own docstring for why: purchase
+    # price/LTV/rate are re-prompted at every download/lock, not stored).
+    # There is no "working state" field these 3 could ever be written
+    # into, so a Live Grid Editor edit to one of them is kept in the
+    # snapshot (so the grid itself shows what was saved) and in the
+    # audit trail, but can never flow through to Download/Lock — see
+    # GridEditSaveView's docstring for this one explicit limitation.
+}
+
+# Same precedence _total_building_area (above) reads in — write into
+# whichever of the three already exists for this deal, never fabricate
+# a property-type section the analysis never had.
+_BUILDING_AREA_WRITE_PATHS = [
+    ('industrial_metrics', 'rentable_square_footage'),
+    ('office_metrics', 'building_total_rsf'),
+    ('retail_metrics', 'center_total_gla'),
+]
+
+
+def _write_total_building_area(metrics, value):
+    for container_key, inner_key in _BUILDING_AREA_WRITE_PATHS:
+        container = metrics.get(container_key)
+        if isinstance(container, dict) and inner_key in container:
+            container[inner_key] = value
+            return True
+    return False
+
+
+def apply_scalar_edits_to_metrics(metrics, edited_scalars):
+    """
+    Writes Live Grid Editor scalar edits back into `metrics` IN PLACE
+    (and also returns it, for `metrics = apply_scalar_edits_to_metrics(...)`
+    convenience) — the reverse of SCALAR_FIELD_CATALOG's read direction.
+    Unknown names and the 3 debt-assumption fields (see
+    SCALAR_FIELD_WRITE_PATHS's own comment) are silently skipped, not
+    errors — same defensive posture as _build_grid_edit_workbook in
+    views.py. Returns (metrics, {names actually written}).
+    """
+    written = set()
+    for name, value in (edited_scalars or {}).items():
+        if name == 'IU_TotalBuildingAreaSF':
+            if _write_total_building_area(metrics, value):
+                written.add(name)
+            continue
+        path = SCALAR_FIELD_WRITE_PATHS.get(name)
+        if path is None:
+            continue
+        container_key, inner_key = path
+        container = metrics.get(container_key)
+        if not isinstance(container, dict):
+            container = {}
+            metrics[container_key] = container
+        container[inner_key] = value
+        written.add(name)
+    return metrics, written
+
+
+# IU_Row_AnnualRent / IU_Row_MLAProfile are deliberately absent here —
+# both are always RECOMPUTED at generation time, never read from a real
+# rent-roll column (annual_rent = base_rent * 12 in _build_row_contexts
+# above; mla_profile is the fixed constant "General_Market") — writing
+# either back into rent_roll_data would just be silently overwritten the
+# next time an Excel is built anyway, so this mapping only lists the
+# fields a real write can actually stick.
+ROW_FIELD_WRITE_LOOKUP_KEYS = {
+    'IU_Row_TenantName': 'tenant_col',
+    'IU_Row_SuiteID': 'suite_col',
+    'IU_Row_SpaceType': 'space_type_col',
+    'IU_Row_SF': 'sf_col',
+    'IU_Row_LeaseStart': 'lease_start_col',
+    'IU_Row_LeaseEnd': 'lease_end_col',
+    'IU_Row_BaseRent': 'rent_col',
+    'IU_Row_Concessions': 'concession_col',
+    'IU_Row_Escalation': 'escalation_col',
+    'IU_Row_RecoveryStructure': 'recovery_col',
+    'IU_Row_BaseYear': 'base_year_col',
+    'IU_Row_OccupancyStatus': 'status_col',
+}
+
+
+def apply_row_edits_to_rent_roll_data(rent_roll_data, edited_rows):
+    """
+    Writes Live Grid Editor row edits back into rent_roll_data['rows'] —
+    the exact {'rows': [...]} shape PropertyProjectDownloadView and
+    _vault_locked_baseline_excel in views.py both read straight off the
+    analysis — by POSITION, matching _apply_excel_override's own
+    position-based row diffing in views.py.
+
+    Column names are rediscovered with the SAME detect_rent_roll_columns/
+    ensure_status_column/detect_argus_fields detection _build_row_contexts
+    above already uses — never guessed or hardcoded — so a write lands in
+    exactly the column a regeneration would itself read back out of.
+
+    A row count change (the analyst added/removed a tenant row in the
+    grid) is handled by rebuilding the list to the new length: a
+    pre-existing row keeps whatever extra, non-mapped columns its
+    original source document had; a newly added row only ever gets the
+    columns this function itself writes. If this particular rent roll's
+    columns can't be confidently detected at all, rent_roll_data is
+    returned UNCHANGED (never guessed) — the caller still saves the
+    scalar edits regardless.
+    """
+    rent_roll_data = rent_roll_data or {}
+    original_rows = rent_roll_data.get('rows') or []
+    clean_edited = [row for row in (edited_rows or []) if isinstance(row, dict)]
+
+    if not clean_edited:
+        return {**rent_roll_data, 'rows': []}
+
+    try:
+        detect_df = pd.DataFrame(original_rows) if original_rows else pd.DataFrame(clean_edited)
+        rent_col, status_col, tenant_col = detect_rent_roll_columns(detect_df)
+        status_col, _ = ensure_status_column(detect_df, status_col, tenant_col)
+        fields = detect_argus_fields(detect_df)
+    except RentRollColumnError:
+        return rent_roll_data
+
+    detected_columns = {
+        'rent_col': rent_col, 'status_col': status_col, 'tenant_col': tenant_col,
+        **fields,
+    }
+    column_for_field = {
+        iu_name: detected_columns.get(lookup_key)
+        for iu_name, lookup_key in ROW_FIELD_WRITE_LOOKUP_KEYS.items()
+    }
+
+    new_rows = []
+    for i, edited_row in enumerate(clean_edited):
+        base_row = dict(original_rows[i]) if i < len(original_rows) else {}
+        for iu_name, column_name in column_for_field.items():
+            if not column_name or iu_name not in edited_row:
+                continue
+            base_row[column_name] = edited_row[iu_name]
+        new_rows.append(base_row)
+
+    return {**rent_roll_data, 'rows': new_rows}
+
+
+# ==========================================
 # WRITING
 # ==========================================
 def _write_scalars(workbook, resolved_names, metrics, debt_assumptions):
