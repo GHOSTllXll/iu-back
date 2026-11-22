@@ -1,4 +1,5 @@
 # backend/ai_service/models.py
+import math
 import secrets
 import uuid
 from django.conf import settings
@@ -7,6 +8,30 @@ from django.db import models
 from django.db.models.signals import post_delete
 from django.dispatch import receiver
 from django.utils import timezone
+
+
+def _sanitize_json_floats(value):
+    """
+    Recursively replaces NaN/Infinity/-Infinity floats with None.
+
+    MySQL's JSON column type (unlike Postgres' native json/jsonb) rejects
+    these outright -- they aren't valid per the JSON spec, Python's json
+    module just doesn't enforce that by default -- so a divide-by-zero or
+    0/0 anywhere upstream (a metrics ratio, a rent-roll calc over an empty
+    set, etc.) silently produces a NaN/inf that sails through every
+    Python-side check and only then blows up the actual INSERT/UPDATE with
+    MySQL error 3140 ("Invalid JSON text"), right at the very end of an
+    otherwise-successful analysis run. numpy.float64 (what pandas/financial
+    math actually hand back) is itself a float subclass, so this catches
+    those too, not just plain Python floats.
+    """
+    if isinstance(value, float):
+        return None if (math.isnan(value) or math.isinf(value)) else value
+    if isinstance(value, dict):
+        return {k: _sanitize_json_floats(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json_floats(v) for v in value]
+    return value
 
 
 class PrivateFileSystemStorage(FileSystemStorage):
@@ -476,6 +501,36 @@ class AnalysisReport(models.Model):
         indexes = [
             models.Index(fields=['organization', '-created_at']),
         ]
+
+    # Bug fix (Nov 2026): every JSONField on this model is the output of
+    # pandas/financial-math computations (metrics ratios, rent-roll/T12
+    # aggregation, the waterfall calculator) rather than hand-typed data,
+    # so any of them can carry a NaN/Infinity from some edge case (a zero
+    # denominator, an empty rent roll) upstream. Listed explicitly rather
+    # than discovered via introspection so adding a new JSONField to this
+    # model is a deliberate, visible decision about whether it needs the
+    # same protection -- not something that silently opts in or out.
+    _SANITIZED_JSON_FIELDS = (
+        'metrics', 'rent_roll_data', 't12_monthly_data',
+        'injected_values_snapshot', 'documents_provided', 'waterfall_scenario',
+    )
+
+    def save(self, *args, **kwargs):
+        """
+        Sanitizes NaN/Infinity out of every JSONField above before handing
+        off to the DB. Doing it here, once, at the model layer, means it's
+        enforced no matter which call site saves an AnalysisReport (a brand
+        new analysis via document_history.create_analysis_report, or the
+        Live Grid Editor's partial `update_fields=[...]` save in views.py)
+        and for any future call site too -- see _sanitize_json_floats'
+        own docstring above for why this is needed at all (MySQL's JSON
+        column type rejects NaN/Infinity outright, unlike Postgres).
+        """
+        for field_name in self._SANITIZED_JSON_FIELDS:
+            value = getattr(self, field_name, None)
+            if value is not None:
+                setattr(self, field_name, _sanitize_json_floats(value))
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.property_name or 'Untitled'} ({self.status}) — {self.organization.name}"

@@ -48,7 +48,46 @@ password_reset_token_generator = PasswordResetTokenGenerator()
 # Only the authentication logic changed — cookie-setting and activity
 # logging at the bottom are untouched.
 
+class LoginIPThrottle(AnonRateThrottle):
+    """
+    Security audit (Nov 2026): caps how many login ATTEMPTS a single IP can
+    make, win or lose — stops one source from brute-forcing passwords
+    across many accounts, or hammering one account from one IP. Mirrors
+    PasswordResetIPThrottle's own reasoning (see below, near the password
+    reset views).
+    """
+    scope = 'login_ip'
+
+
+class LoginEmailThrottle(SimpleRateThrottle):
+    """
+    Security audit (Nov 2026): caps how many login attempts can be made
+    FOR A GIVEN EMAIL, regardless of which IP they come from — the layer
+    that matters most against a distributed/botnet attempt rotating IPs
+    to target one specific account, same reasoning as
+    PasswordResetEmailThrottle below. Counts every attempt (successful or
+    failed) the same way DRF's throttles always do; the rate is generous
+    enough (10/hour) that no real user logging in normally will ever hit
+    it, while still killing a scripted guessing run against one account.
+    """
+    scope = 'login_email'
+
+    def get_cache_key(self, request, view):
+        email = (request.data.get('email') or '').strip().lower()
+        if not email:
+            # No email in the request — nothing to throttle on. The
+            # serializer's own validation (email is required) handles
+            # this case; this throttle just has nothing to key against.
+            return None
+        return self.cache_format % {
+            'scope': self.scope,
+            'ident': email,
+        }
+
+
 class LoginView(APIView):
+    throttle_classes = [LoginIPThrottle, LoginEmailThrottle]
+
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
         if not serializer.is_valid():

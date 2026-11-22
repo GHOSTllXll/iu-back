@@ -215,6 +215,8 @@ REST_FRAMEWORK = {
         'password_reset_ip': '5/hour',
         'password_reset_email': '3/hour',
         'password_reset_confirm_ip': '10/hour',
+        'login_ip': '20/hour',
+        'login_email': '10/hour',
     }
 }
 

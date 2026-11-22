@@ -16,6 +16,54 @@ class FileValidationError(Exception):
     pass
 
 
+# Security audit (Nov 2026): extension checks alone trust the client-supplied
+# filename, so a renamed .html/.php/.svg file could sail through as
+# "report.pdf". These are the real file-format signatures (magic bytes) for
+# every extension validate_uploaded_file() is ever asked to check, keyed by
+# extension since OOXML/OLE2 are shared container formats (.xlsx/.xlsm/.docx
+# are all Zip; .xls/.doc are both legacy OLE2) that can't be told apart by
+# signature alone — nor do they need to be, since the extension itself picks
+# which parser handles the file afterward. No new dependency (no
+# python-magic/libmagic) — deliberately, consistent with this project's
+# existing avoidance of extra native dependencies on this host.
+_OOXML_ZIP_SIGNATURE = b'PK\x03\x04'                    # .xlsx/.xlsm/.docx
+_OLE2_SIGNATURE = b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'    # .xls/.doc (legacy)
+_FILE_SIGNATURES = {
+    '.pdf': [b'%PDF-'],
+    '.xlsx': [_OOXML_ZIP_SIGNATURE],
+    '.xlsm': [_OOXML_ZIP_SIGNATURE],
+    '.docx': [_OOXML_ZIP_SIGNATURE],
+    '.xls': [_OLE2_SIGNATURE],
+    '.doc': [_OLE2_SIGNATURE],
+    '.png': [b'\x89PNG\r\n\x1a\n'],
+    '.jpg': [b'\xff\xd8\xff'],
+    '.jpeg': [b'\xff\xd8\xff'],
+    # .csv is deliberately absent: plain text has no reliable signature and
+    # isn't executable, so there's nothing unsafe to catch here.
+}
+_SIGNATURE_CHECK_BYTES = 8  # longest signature above (OLE2 / PNG) is 8 bytes
+
+
+def _looks_like_declared_type(uploaded_file, ext: str) -> bool:
+    """
+    Reads just the leading bytes of the uploaded file and checks them against
+    the real signature for the format `ext` claims. Always leaves the stream
+    position at 0 afterward — every caller of validate_uploaded_file() goes on
+    to actually parse the file from the start right after this check runs.
+    """
+    signatures = _FILE_SIGNATURES.get(ext)
+    if not signatures:
+        return True  # no known signature for this extension (e.g. .csv) — nothing to check
+
+    try:
+        uploaded_file.seek(0)
+        header = uploaded_file.read(_SIGNATURE_CHECK_BYTES)
+    finally:
+        uploaded_file.seek(0)
+
+    return any(header.startswith(sig) for sig in signatures)
+
+
 def validate_uploaded_file(uploaded_file, allowed_extensions, label="File", max_size_bytes: int = MAX_FILE_SIZE):
     """
     Basic guardrails every uploaded file should pass before any parser touches it.
@@ -43,6 +91,12 @@ def validate_uploaded_file(uploaded_file, allowed_extensions, label="File", max_
         raise FileValidationError(
             f"{label} has an unsupported extension '{ext}'. "
             f"Allowed: {', '.join(sorted(allowed_extensions))}"
+        )
+
+    if not _looks_like_declared_type(uploaded_file, ext):
+        raise FileValidationError(
+            f"{label} doesn't look like a real '{ext}' file (its content doesn't "
+            f"match that format) — please check you uploaded the right file."
         )
 
     return ext
