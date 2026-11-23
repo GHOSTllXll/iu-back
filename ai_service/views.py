@@ -25,7 +25,7 @@ from rest_framework.permissions import IsAuthenticated, AllowAny
 from celery.result import AsyncResult
 from .tasks import run_cre_underwriting_task, run_ppm_underwriting_task, run_inbound_email_underwriting_task
 
-from .llm_router import ai_client, AIRateLimitExhausted
+from .llm_router import ai_client, AIRateLimitExhausted, AIEmptyResponseError
 from .parsers import (
     extract_document_text,
     extract_t12_text,
@@ -1136,6 +1136,19 @@ def process_underwriting_files(om_file, t12_file, rent_roll_file, tier: str = TI
             'error': "We're experiencing high demand right now. Please try again in a minute or two.",
             'retryable': True
         }, status=status.HTTP_503_SERVICE_UNAVAILABLE), None
+    except AIEmptyResponseError:
+        # Same reasoning as AIRateLimitExhausted above: llm_router.py already
+        # retried this (adaptive thinking consuming the whole token budget is
+        # non-deterministic — a retry had a real shot) and every attempt still
+        # came back empty. That's an AI-side capacity/reliability issue, not
+        # a problem with the documents the analyst uploaded, so it gets the
+        # same transient/retryable treatment — never recorded as a failed
+        # analysis, never a 400 that wrongly blames the upload.
+        return None, None, Response({
+            'error': "The AI didn't return a usable response after a few attempts "
+                     "— this can happen under heavy load. Please try again in a minute.",
+            'retryable': True
+        }, status=status.HTTP_503_SERVICE_UNAVAILABLE), None
     except Exception as e:
         _safe_record_failure(organization, uploaded_by, om_file, t12_file, rent_roll_file)
         return None, None, Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR), None
@@ -1973,6 +1986,15 @@ def process_ppm_file(ppm_file, manual_pages, tier, organization=None, uploaded_b
     except AIRateLimitExhausted:
         return None, Response({
             'error': "We're experiencing high demand right now. Please try again in a minute or two.",
+            'retryable': True
+        }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+    except AIEmptyResponseError:
+        # See the matching except clause in process_underwriting_files above —
+        # same reasoning: already retried in llm_router.py, still empty, so
+        # treat as a transient AI-side issue, not a bad PPM document.
+        return None, Response({
+            'error': "The AI didn't return a usable response after a few attempts "
+                     "— this can happen under heavy load. Please try again in a minute.",
             'retryable': True
         }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
     except Exception as e:

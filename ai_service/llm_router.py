@@ -15,6 +15,16 @@ MAX_RETRIES = 5
 BASE_DELAY_SECONDS = 1.0   # first retry waits ~1s, then ~2s, ~4s, ~8s, ~16s (+ jitter)
 MAX_DELAY_SECONDS = 30.0
 
+# Bug fix (Nov 2026): was 16384. Sonnet 5's adaptive thinking (see the
+# temperature comment in _call_provider below — it can't be dialed down or
+# disabled per-request) occasionally burned through the ENTIRE max_tokens
+# budget reasoning about a dense OM/T12/rent-roll extraction, leaving zero
+# tokens for the actual JSON answer and surfacing as "The AI returned an
+# empty response" in production. Doubling the budget gives much more room
+# for both the reasoning and the (often large, 47+ field) final JSON to fit
+# in the same response.
+ANTHROPIC_MAX_TOKENS = 32768
+
 
 class AIServiceError(Exception):
     """Raised when the AI provider fails for a non-recoverable reason."""
@@ -30,6 +40,26 @@ class AIRateLimitExhausted(AIServiceError):
     pass
 
 
+class AIEmptyResponseError(AIServiceError):
+    """
+    Raised when the Anthropic response comes back with no usable text content
+    -- observed in production with Sonnet 5's adaptive thinking occasionally
+    consuming the entire max_tokens budget on reasoning (or, less commonly,
+    the request being refused outright), leaving nothing for the actual
+    answer. Kept distinct from a plain AIServiceError for two reasons: (1)
+    generate_completion's retry loop below treats it like a transient
+    condition worth retrying — how much the model chooses to "think" before
+    answering isn't fully deterministic, so a second attempt on the exact
+    same prompt often succeeds where the first didn't; (2) if every retry
+    still comes back empty, views.py can tell this apart from a genuine
+    "the AI gave us garbage" failure and respond the same way it already
+    does for AIRateLimitExhausted — a retryable 503, NOT a 400 that wrongly
+    blames the user's uploaded documents, and NOT recorded as a failed
+    analysis in History.
+    """
+    pass
+
+
 def _is_retryable_status(status_code: int) -> bool:
     """
     429 = rate limited. 500/502/503/504 = transient server-side issues.
@@ -38,10 +68,16 @@ def _is_retryable_status(status_code: int) -> bool:
     return status_code == 429 or status_code >= 500
 
 
-def _sleep_with_backoff(attempt, retry_after=None):
+def _sleep_with_backoff(attempt, retry_after=None, reason="rate-limited/transient error"):
     """
     Exponential backoff with jitter. If the provider tells us how long to wait
     (Retry-After header, surfaced via retry_after), respect that instead of guessing.
+
+    `reason` is purely cosmetic — it's folded into the log line below so a
+    retry triggered by something other than rate limiting (e.g.
+    AIEmptyResponseError) doesn't get mislabeled as one in the logs. Defaults
+    to the original wording so the existing rate-limit/APIStatusError call
+    sites below don't need to change.
     """
     if retry_after is not None:
         delay = min(retry_after, MAX_DELAY_SECONDS)
@@ -49,7 +85,7 @@ def _sleep_with_backoff(attempt, retry_after=None):
         delay = min(BASE_DELAY_SECONDS * (2 ** attempt), MAX_DELAY_SECONDS)
         delay += random.uniform(0, delay * 0.25)  # jitter, avoids thundering-herd retries
 
-    logger.warning(f"AI request rate-limited/transient error — retrying in {delay:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+    logger.warning(f"AI request {reason} — retrying in {delay:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
     time.sleep(delay)
 
 
@@ -125,6 +161,20 @@ class AIClient:
                 # Non-retryable (400, 401, 403, 404...) — fail immediately, no point retrying
                 raise AIServiceError(f"AI Service Error ({self.provider}): {str(e)}")
 
+            except AIEmptyResponseError as e:
+                # How much the model chooses to "think" before answering isn't
+                # fully deterministic for the same prompt — a retry genuinely
+                # has a real chance of succeeding where this attempt didn't,
+                # unlike a plain empty string we'd have no reason to retry.
+                last_error = e
+                if attempt < MAX_RETRIES - 1:
+                    _sleep_with_backoff(
+                        attempt,
+                        reason="returned no text content (adaptive thinking likely consumed the full token budget)"
+                    )
+                    continue
+                raise
+
             except Exception as e:
                 # Ollama and unexpected errors don't have structured status codes to
                 # check — these aren't retried, since we can't tell transient from permanent.
@@ -167,15 +217,27 @@ class AIClient:
             # Omit it entirely rather than pass any value.
             response = self.client.messages.create(
                 model=settings.ANTHROPIC_MODEL,
-                max_tokens=16384,
+                max_tokens=ANTHROPIC_MAX_TOKENS,
                 system=system_prompt,
                 messages=[
                     {"role": "user", "content": user_prompt}
                 ]
             )
-            return "".join(
+            text = "".join(
                 block.text for block in response.content if block.type == "text"
             )
+            if not text.strip():
+                # Nothing usable came back — most likely adaptive thinking
+                # consumed the entire max_tokens budget before it could write
+                # an answer, less commonly the request was refused outright.
+                # Raise rather than silently return "" so generate_completion's
+                # retry loop gets a chance to try again (see AIEmptyResponseError's
+                # own docstring for why a retry is actually worth it here).
+                raise AIEmptyResponseError(
+                    f"AI Service Error ({self.provider}): model returned no text "
+                    f"content (stop_reason={getattr(response, 'stop_reason', 'unknown')})."
+                )
+            return text
 
 
 # Instantiate a global client for easy importing
