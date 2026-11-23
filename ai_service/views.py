@@ -2132,7 +2132,24 @@ class TaskStatusView(APIView):
                 status=task_result.get('status_code', status.HTTP_500_INTERNAL_SERVER_ERROR)
             )
 
-        return Response(task_result)
+        # Bug fix (Nov 2026): the success path below used to hand `metrics`/
+        # `deal_scorecard` straight to Response() exactly as the AI/pandas
+        # pipeline produced them. AnalysisReport.save() (see models.py)
+        # already sanitizes NaN/Infinity out of what gets written to MySQL,
+        # but that sanitization never touched THIS copy — the one going
+        # straight back over HTTP to the browser. DRF's JSONRenderer (unlike
+        # Python's own json.dumps, which allows NaN by default) raises
+        # ValueError: "Out of range float values are not JSON compliant" the
+        # moment it hits one, which happens during response rendering
+        # (outside this view's own control flow), so it surfaced as a plain
+        # 500 on the task-status poll even though the analysis itself had
+        # completed successfully — confirmed in production: the Celery log
+        # showed 'succeeded' with real extracted metrics for the exact task
+        # the frontend was simultaneously seeing a 500 for. Reusing
+        # models.py's sanitizer here (rather than duplicating it) closes the
+        # same gap on the API-response path, not just the DB-write path.
+        from .models import _sanitize_json_floats
+        return Response(_sanitize_json_floats(task_result))
 
 
 class ExportPPMMasterGridView(APIView):
