@@ -215,14 +215,28 @@ class AIClient:
             # to any non-default value now returns a 400 error, since the model
             # uses adaptive thinking by default instead of manual sampling control.
             # Omit it entirely rather than pass any value.
-            response = self.client.messages.create(
+            #
+            # Bug fix (Nov 2026): a plain (non-streaming) .create() call with
+            # ANTHROPIC_MAX_TOKENS this large (raised from 16384 to fix the
+            # empty-response issue — see that constant's own comment) trips
+            # the Anthropic Python SDK's own client-side guard: "Streaming is
+            # required for operations that may take longer than 10 minutes."
+            # A long-held blocking HTTP request is exactly what times out on
+            # proxies/load balancers along the way, which is why the SDK
+            # refuses to even attempt it synchronously past that threshold.
+            # .stream()'s get_final_message() blocks until the full response
+            # arrives and hands back the same Message shape .create() would
+            # have, so nothing below (text extraction, stop_reason) changes —
+            # this only changes HOW the response is fetched, not what it is.
+            with self.client.messages.stream(
                 model=settings.ANTHROPIC_MODEL,
                 max_tokens=ANTHROPIC_MAX_TOKENS,
                 system=system_prompt,
                 messages=[
                     {"role": "user", "content": user_prompt}
                 ]
-            )
+            ) as stream:
+                response = stream.get_final_message()
             text = "".join(
                 block.text for block in response.content if block.type == "text"
             )
