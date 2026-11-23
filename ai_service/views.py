@@ -2140,16 +2140,46 @@ class TaskStatusView(APIView):
         # straight back over HTTP to the browser. DRF's JSONRenderer (unlike
         # Python's own json.dumps, which allows NaN by default) raises
         # ValueError: "Out of range float values are not JSON compliant" the
-        # moment it hits one, which happens during response rendering
-        # (outside this view's own control flow), so it surfaced as a plain
-        # 500 on the task-status poll even though the analysis itself had
-        # completed successfully — confirmed in production: the Celery log
-        # showed 'succeeded' with real extracted metrics for the exact task
-        # the frontend was simultaneously seeing a 500 for. Reusing
-        # models.py's sanitizer here (rather than duplicating it) closes the
-        # same gap on the API-response path, not just the DB-write path.
+        # moment it hits one.
+        #
+        # That render only actually happens later, lazily, once DRF's
+        # response-handling middleware gets to this Response object — NOT
+        # inside this view's own call stack — so a plain try/except around
+        # `return Response(...)` here would never catch it; the exception
+        # surfaces downstream as a bare, unexplained 500 with no traceback
+        # tied back to this view, which is exactly what was happening even
+        # after sanitizing NaN/Infinity (there may be a second, different
+        # not-JSON-serializable type involved — e.g. a numpy int/bool
+        # scalar from pandas that isn't a plain Python int, which
+        # _sanitize_json_floats (by design) only normalizes floats, not
+        # arbitrary numpy types). Forcing the render HERE, inside this
+        # view's own try/except, means any remaining serialization problem
+        # is (1) never shown to the user as a bare crash and (2) actually
+        # logged with a full traceback so it can be diagnosed precisely
+        # instead of guessed at again.
         from .models import _sanitize_json_floats
-        return Response(_sanitize_json_floats(task_result))
+        from rest_framework.renderers import JSONRenderer
+
+        sanitized = _sanitize_json_floats(task_result)
+        try:
+            JSONRenderer().render(sanitized)
+        except Exception:
+            logger.exception(
+                f"TaskStatusView: task {task_id} completed successfully but its "
+                f"result isn't JSON-serializable even after NaN/Infinity "
+                f"sanitization — likely a non-Python numeric type (e.g. a numpy "
+                f"scalar) slipping through somewhere in metrics/deal_scorecard."
+            )
+            return Response(
+                {
+                    'error': "Your analysis finished, but we hit a problem returning "
+                             "the result. Our team has been notified — please try again, "
+                             "and contact support if this keeps happening.",
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        return Response(sanitized)
 
 
 class ExportPPMMasterGridView(APIView):
